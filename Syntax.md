@@ -534,8 +534,9 @@ Set Status(dst, s, find: target)
 
 ## 10. When things happen
 
-- **Opening a vault never changes files.** The app checks every function in
-  memory. If one would change something, its wire shows ⚠ "out of date" with a
+- **Opening a vault never changes files.** The app checks functions in memory
+  in the background: the open graph first, then the rest of the vault a few at a
+  time. If one would change something, its wire shows ⚠ "out of date" with a
   **Run** button.
 - **Functions run after a file changes**: from the app, Obsidian, VS Code or a
   `git pull`. Only functions with an input in a changed file run.
