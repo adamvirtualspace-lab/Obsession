@@ -60,6 +60,7 @@ obsession/
   core/                 package "obsession-core": no UI, fully testable
     src/
       vault.rs          scan folders, index files, watch for changes
+      store.rs          file store: files in RAM, pinning, budget, disk counters
       doc.rs            a file's original text + line index + line patches
       parse/
         task.rs         - [c] text @people ^id
@@ -136,6 +137,8 @@ the generated test vault (see Measuring).
 |---|---|
 | CPU when idle | **0%**: no frames, no timers, no polling |
 | Disk when idle | **0 bytes** written |
+| Disk reads during a warmed-up function run | **0**: everything comes from RAM |
+| Writes per changed file per run | **1** |
 | Frame time while animating or dragging | **≤ 8.3 ms**, p99. That's enough for 120 fps, which leaves room to spare at 60 fps |
 | Graph with 500 nodes and 1,000 wires | No dropped frames while panning and zooming |
 | Background work (indexing, checks) | Below-normal thread priority, at most 2 threads |
@@ -211,8 +214,9 @@ the generated test vault (see Measuring).
 - **Only open files are fully in memory.** For every other file the app keeps a
   small index entry: path, modified time, size, task count, links, `@` mentions
   and status characters.
-- **A small cache of recent files** (budget about 16 MB) for function inputs.
-  Least-recently-used files are dropped first.
+- **The file store keeps function files in RAM** (see
+  [Disk](#disk)). Shot files are small, typically a few KB, so even 1,000 of
+  them are only a few MB.
 - **Spans, not copies.** Tasks, links and lines are stored as byte ranges into
   the file's text, not as separate strings.
 - **Interned names.** Paths, `@names` and status characters are stored once and
@@ -257,7 +261,39 @@ the generated test vault (see Measuring).
 
 ### Disk
 
-**Reads**
+**RAM first: read once, then work in memory**
+
+All file access goes through one **file store** in `obsession-core`. It holds
+one copy in RAM of every file the app is working with:
+
+| Kept in RAM | How long |
+|---|---|
+| Files open in the editor | While open |
+| Every file a function reads or writes | **Pinned** for as long as the function exists |
+| Other recently used files | Until a 16 MB budget is full, then least recently used first |
+
+- **A file is read from disk once.** After that, function runs, chains, live
+  pin values and out-of-date checks all read the copy in RAM. A warmed-up run
+  does **zero disk reads**.
+- **Disk is read again only when a file changed outside the app.** On a watcher
+  event the store first compares modified time and size, which costs no file
+  read. It re-reads only if they differ from what it last read or wrote.
+- **Changes happen in RAM first.** Edits, status clicks and function results
+  update the store's copy. Chains run entirely in RAM.
+- **The disk gets the result, once.** At the end of a run, each changed file is
+  written once. Runs happen at most once a second, so functions write any file
+  at most once a second.
+- **Editor and functions share one save.** If you're typing in a file that a
+  function also changes, both changes land in the same copy in RAM and go out
+  in a single write.
+- **Own writes don't cause re-reads.** After writing, the store records the new
+  modified time, size and content hash. When the watcher reports that write,
+  it's recognised and ignored.
+- **Writes can't be skipped entirely.** Files have to reach the disk so
+  Obsidian, git and teammates see them. What we avoid is writing the same file
+  repeatedly or writing when nothing changed.
+
+**Other reads**
 
 - The saved index means startup reads only files whose modified time or size
   changed.
@@ -304,6 +340,9 @@ measurably lowers memory or frame times.
 - **CPU and disk** come from the process's CPU time and Windows I/O counters
   (bytes read and written) over the same session, plus 5 idle minutes. Those
   idle minutes must show no CPU use and no bytes written.
+- **The file store counts its own disk reads and writes** per run, so
+  `obsession-bench` can check that a warmed-up run reads nothing from disk and
+  writes each changed file exactly once.
 - A milestone isn't done until its budgets pass.
 
 ## Milestones
