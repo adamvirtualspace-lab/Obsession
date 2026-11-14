@@ -37,19 +37,22 @@ is built and in what order.
 
 | Need | Choice | Why |
 |---|---|---|
-| UI | **iced** (pin the latest release when scaffolding) | Native, GPU-drawn, Elm-style state, built-in animation helpers, `Canvas` with dashed strokes, `text_editor` with highlighting |
-| Markdown rendering | **pulldown-cmark** | The parser iced's own markdown widget uses. Handles tables, footnotes, task lists, strikethrough |
+| UI | **iced 0.14** | Native, GPU-drawn, Elm-style state, built-in animation helpers, `Canvas` with dashed strokes, `text_editor` |
+| Editor highlighting | **Our own markdown tokenizer** (`core/src/syntax.rs`) | iced's `highlighter` feature loads a grammar database for hundreds of languages: about 30 MB of RAM just to colour markdown. Ours knows tasks, `@people`, `^ids` and links |
+| Markdown rendering | **iced's `markdown` widget** (pulldown-cmark) after our own pre-pass for Obsidian syntax | Tables, task lists, strikethrough. Footnotes need our own pass later. Code blocks in the preview aren't syntax-coloured, to stay off the grammar database |
 | Task, link and status parsing | **Our own line parser** | The syntax is line-based. Owning it lets the app patch single lines safely |
 | Frontmatter | A read-only YAML reader (`yaml-rust2` or `saphyr`) | The app reads frontmatter but never rewrites it |
 | File watching | **notify** with its debouncer | Picks up edits from Obsidian, VS Code and `git pull` |
 | Folder picker | **rfd** | Native Windows dialog |
+| Graphics backend | **DirectX 12 only, low-power GPU** on Windows | iced asks wgpu for every backend by default, which loads the Vulkan *and* DX12 drivers: about 100 MB extra. `WGPU_BACKEND` / `WGPU_POWER_PREF` still override it |
 | Errors | `thiserror` in core, `anyhow` in the app | Standard and small |
 | Async | iced's default thread-pool executor, **no tokio** | Fewer threads, smaller binary |
 | Profiling | `tracing` + Tracy, behind a `profile` feature | Zero cost in normal builds |
 
 Every dependency is added with `default-features = false` and only the
-features we use. iced gets only what we draw with: `wgpu`, `canvas`,
-`markdown`, `highlighter`, `image`, `lazy`.
+features we use. iced gets only what we draw with. Milestone 1 uses `wgpu`,
+`thread-pool`, `markdown`, `advanced`, `crisp` and `web-colors`. Later
+milestones add `canvas`, `image` and `lazy` as they need them.
 
 ## Layout
 
@@ -59,8 +62,11 @@ obsession/
   bench/                package "obsession-bench": test vault generator + timings
   core/                 package "obsession-core": no UI, fully testable
     src/
-      vault.rs          scan folders, index files, watch for changes
+      vault.rs          scan folders, index files, link resolution (shortest name)
       store.rs          file store: files in RAM, pinning, budget, disk counters
+      syntax.rs         line tokens for editor highlighting
+      preview.rs        Obsidian syntax -> plain markdown, for the preview only
+      fuzzy.rs          quick switcher matching
       doc.rs            a file's original text + line index + line patches
       parse/
         task.rs         - [c] text @people ^id
@@ -79,10 +85,15 @@ obsession/
       write.rs          atomic writes, retry on locked files
   app/                  package "obsession": the iced app
     src/
-      main.rs
+      main.rs           app state, messages, shortcuts, saving
       theme.rs          colors, spacing, animation timings
-      sidebar.rs        file tree, search, quick switcher
-      editor.rs         raw editor + preview, status chips
+      sidebar.rs        file tree (virtual list)
+      switcher.rs       quick switcher (Ctrl+P)
+      note.rs           raw editor + preview, autosave and preview timers
+      highlight.rs      iced highlighter on top of core's syntax.rs
+      timer.rs          one-shot delays without an async runtime
+      settings.rs       last opened vault (%APPDATA%\Obsession)
+      dev.rs            debug-only hooks: open a note, screenshot, quit
       graph/
         canvas.rs       pan, zoom, node cards, wires, hit testing
         wire.rs         dashed/solid drawing, hover "ƒ" button
@@ -142,16 +153,49 @@ the generated test vault (see Measuring).
 | Frame time while animating or dragging | **≤ 8.3 ms**, p99. That's enough for 120 fps, which leaves room to spare at 60 fps |
 | Graph with 500 nodes and 1,000 wires | No dropped frames while panning and zooming |
 | Background work (indexing, checks) | Below-normal thread priority, at most 2 threads |
-| Memory, empty vault | Target < 60 MB working set |
+| Memory, empty vault | < 90 MB working set (was a 60 MB target, before measuring the driver baseline) |
 | Memory, 10,000-file vault | Target < 120 MB working set |
 | First window on screen | < 300 ms |
 | Indexing 10,000 files | < 2 s, in the background, UI usable meanwhile |
 | Release binary | < 20 MB |
 
-> On Windows, any GPU-drawn app pays a baseline of roughly 40 MB or more for
-> the graphics driver and swap chain before drawing anything. Milestone 1
-> measures our real baseline, and the memory budgets get adjusted to it once.
-> After that they only go down.
+> On Windows, any GPU-drawn app pays a baseline for the graphics driver
+> before drawing anything. Milestone 1 measured ours (see below), and the
+> empty-vault budget was adjusted to it once. From here on budgets only go
+> down.
+
+### Milestone 1 measurements
+
+Release build, AMD Radeon 760M laptop (integrated GPU), 2880×1800 at 225%,
+2026-11-14.
+
+| What | Budget | Measured |
+|---|---|---|
+| CPU when idle | 0% | **0 ms** of CPU over 15 s |
+| Disk when idle | 0 bytes | **0 bytes** read or written over 15 s |
+| Memory, small vault, no note open | < 90 MB | **83–85 MB** |
+| Memory, note open (edit / preview / split) | | **97 / 93 / 106 MB** |
+| Memory, 10,000-note vault | < 120 MB | **85 MB**, 93 MB with a note and the switcher open |
+| Scanning 10,000 notes | < 2 s | **28 ms** (tree index ≈ 420 KB) |
+| Reading 10,000 notes through the store | | 2 s cold, then **3 ms with 0 disk reads** |
+| First window on screen | < 300 ms | **47 ms** warm, 650 ms on a cold first start |
+| Release binary | < 20 MB | **7.7 MB** |
+| Opening a note changes the file | never | Verified: checksums unchanged |
+| Saving preserves the file | byte-for-byte | Verified: only typed text differs, CRLF kept |
+
+Where the memory goes:
+
+- **About 84 MB is fixed**: the DirectX 12 driver plus iced's renderer setup.
+  It doesn't change with window size (tested 400×300 to 1600×1000) or vault
+  size.
+- Before the fixes it was 198 MB. Defaulting to DX12 alone saved about 100 MB,
+  and replacing iced's highlighter saved another 25 MB per open note.
+- The cold start (650 ms) is mostly the driver compiling shaders the first
+  time. Windows caches them after that.
+
+How to measure: `cargo build -p obsession --profile measure` builds a release
+binary that keeps the debug-only hooks in `app/src/dev.rs`, then read the
+process's working set, CPU time and I/O counters (see the README).
 
 ### Drawing: only when something changes
 
@@ -352,7 +396,7 @@ performance budgets checked.
 
 | # | Milestone | Done when |
 |---|---|---|
-| 1 | **Vault and editor** | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
+| 1 | **Vault and editor** ✅ | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
 | 2 | **Tasks and statuses** | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
 | 3 | **Links** | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["core", "app", "bench"]
+default-members = ["app"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+obsession-core = { path = "core" }
+iced = { version = "0.14.0", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
+rfd = { version = "0.18.0", default-features = false }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Fast enough to iterate on, without the heavy debug build of wgpu.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Release speed and memory, plus the debug-only dev hooks, for measuring.
+# `cargo build -p obsession --profile measure`
+[profile.measure]
+inherits = "release"
+debug-assertions = true
+lto = "thin"
+codegen-units = 16
