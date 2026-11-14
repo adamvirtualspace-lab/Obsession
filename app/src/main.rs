@@ -6,8 +6,10 @@ mod dev;
 mod highlight;
 mod new_note;
 mod note;
+mod right_click;
 mod settings;
 mod sidebar;
+mod status_menu;
 mod switcher;
 mod theme;
 mod timer;
@@ -18,14 +20,16 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
     Space, button, column, container, markdown, operation, row, rule, stack, text, text_editor,
 };
-use iced::{Element, Fill, Subscription, Task, event, window};
+use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 
+use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
 use obsession_core::vault::{self, Kind, Resolved, Vault};
 
 use new_note::NewNote;
 use note::{Mode, Note, Timer};
 use sidebar::Tree;
+use status_menu::StatusMenu;
 use switcher::Switcher;
 
 pub fn main() -> iced::Result {
@@ -58,6 +62,10 @@ enum Message {
     SetMode(Mode),
     Shortcut(Shortcut),
     Switcher(switcher::Message),
+    /// Right-click in the editor: (editor-local point, window point).
+    EditorRightClick(Point, Point),
+    StatusMenu(status_menu::Message),
+    Resized(Size),
     CloseRequested(window::Id),
     #[cfg(debug_assertions)]
     Dev(dev::Step),
@@ -80,6 +88,30 @@ struct Workspace {
     store: Store,
     tree: Tree,
     note: Option<Note>,
+    /// `statuses:` from `_settings.md`, the team default.
+    team: Option<Format>,
+}
+
+/// The vault-root settings note.
+const SETTINGS_NOTE: &str = "_settings.md";
+
+impl Workspace {
+    /// Reads the team format from `_settings.md` (through the store, so the
+    /// file is read at most once). Returns its warnings.
+    fn load_team(&mut self) -> Vec<String> {
+        let has_settings = self.vault.notes().any(|e| &*e.rel == SETTINGS_NOTE);
+        let lookup = if has_settings {
+            self.store
+                .get(SETTINGS_NOTE)
+                .ok()
+                .and_then(|text| status::from_frontmatter(text.lines()))
+        } else {
+            None
+        };
+        let lookup = lookup.unwrap_or_default();
+        self.team = lookup.format;
+        lookup.warnings
+    }
 }
 
 struct App {
@@ -87,6 +119,8 @@ struct App {
     mode: Mode,
     switcher: Option<Switcher>,
     new_note: Option<NewNote>,
+    menu: Option<StatusMenu>,
+    window: Size,
     status: Option<String>,
     scanning: bool,
     next_note_id: u64,
@@ -99,6 +133,8 @@ impl App {
             mode: Mode::default(),
             switcher: None,
             new_note: None,
+            menu: None,
+            window: Size::new(window_size().0, window_size().1),
             status: None,
             scanning: false,
             next_note_id: 0,
@@ -160,12 +196,18 @@ impl App {
                 let store = Store::new(&vault.root);
                 let tree = Tree::new(&vault);
                 self.status = Some(format!("{} notes", vault.notes().count()));
-                self.workspace = Some(Workspace {
+                let mut ws = Workspace {
                     vault,
                     store,
                     tree,
                     note: None,
-                });
+                    team: None,
+                };
+                if let Some(warning) = ws.load_team().into_iter().next() {
+                    self.status = Some(format!("_settings.md: {warning}"));
+                }
+                self.workspace = Some(ws);
+                self.menu = None;
                 self.switcher = None;
                 self.new_note = None;
                 #[cfg(debug_assertions)]
@@ -214,14 +256,51 @@ impl App {
                 }
             }
             Message::Edit(action) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                let Some(note) = &mut ws.note else {
+                    return Task::none();
+                };
+                let performed = note.perform(action, ws.team.as_ref());
+                let id = note.id;
+                if performed.message.is_some() {
+                    self.status = performed.message;
+                }
+                start_timers(id, performed.timers)
+            }
+            Message::EditorRightClick(local, window) => {
                 let Some(note) = self.note_mut() else {
                     return Task::none();
                 };
-                let id = note.id;
-                let timers = note.perform(action);
-                Task::batch(timers.into_iter().map(|(timer, delay)| {
-                    Task::perform(timer::after(delay), move |()| Message::Timer(id, timer))
-                }))
+                self.menu = note
+                    .task_at_point(local)
+                    .map(|task| StatusMenu { task, at: window });
+                Task::none()
+            }
+            Message::StatusMenu(message) => {
+                let Some(menu) = self.menu.take() else {
+                    return Task::none();
+                };
+                match message {
+                    status_menu::Message::Close => Task::none(),
+                    status_menu::Message::Pick(ch) => {
+                        let Some(note) = self.note_mut() else {
+                            return Task::none();
+                        };
+                        // The line may have changed since the menu opened.
+                        if note.task_at_line(menu.task.line) != Some(menu.task) {
+                            return Task::none();
+                        }
+                        let id = note.id;
+                        let timers = note.set_status(menu.task, ch);
+                        start_timers(id, timers)
+                    }
+                }
+            }
+            Message::Resized(size) => {
+                self.window = size;
+                Task::none()
             }
             Message::Timer(id, timer) => {
                 let mode = self.mode;
@@ -264,6 +343,8 @@ impl App {
                 window::close(id)
             }
             #[cfg(debug_assertions)]
+            Message::Dev(dev::Step::Later(message)) => self.update(*message),
+            #[cfg(debug_assertions)]
             Message::Dev(step) => dev::update(step),
         }
     }
@@ -281,6 +362,9 @@ impl App {
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
+        if self.menu.take().is_some() && matches!(shortcut, Shortcut::Escape) {
+            return Task::none();
+        }
         if self.new_note.is_some() {
             if matches!(shortcut, Shortcut::Escape | Shortcut::NewNote) {
                 self.new_note = None;
@@ -447,8 +531,10 @@ impl App {
         match ws.store.pin(&rel).and_then(|()| ws.store.get(&rel).map(str::to_owned)) {
             Ok(text) => {
                 ws.tree.reveal(&ws.vault, &rel);
-                ws.note = Some(Note::new(id, rel, &text, mode));
-                self.status = None;
+                let note = Note::new(id, rel, &text, mode, ws.team.as_ref());
+                self.status = note.warnings.first().cloned();
+                ws.note = Some(note);
+                self.menu = None;
             }
             Err(error) => {
                 self.status = Some(format!("Couldn't open {rel}: {error}"));
@@ -467,9 +553,20 @@ impl App {
             return Task::none();
         };
         if note.unsynced {
-            ws.store.set(&note.rel, note.text());
+            let text = note.text();
+            note.analyze(&text);
+            ws.store.set(&note.rel, text);
             note.unsynced = false;
+            if &*note.rel == SETTINGS_NOTE {
+                ws.load_team();
+                if let Some(note) = &mut ws.note {
+                    note.refresh_format(ws.team.as_ref());
+                }
+            }
         }
+        let Some(note) = &ws.note else {
+            return Task::none();
+        };
         match ws.store.take_save(&note.rel) {
             Some(job) => Task::perform(async move { job.run() }, Message::Saved),
             None => Task::none(),
@@ -491,6 +588,9 @@ impl App {
     }
 
     fn follow_link(&mut self, uri: &str) -> Task<Message> {
+        if let Some(line) = uri.strip_prefix(obsession_core::preview::STATUS_SCHEME) {
+            return self.click_status_chip(line.parse().ok());
+        }
         let Some(ws) = &self.workspace else {
             return Task::none();
         };
@@ -537,10 +637,29 @@ impl App {
         }
     }
 
+    /// A status chip was clicked in the preview.
+    fn click_status_chip(&mut self, line: Option<usize>) -> Task<Message> {
+        let Some(note) = self.note_mut() else {
+            return Task::none();
+        };
+        let Some(task) = line.and_then(|line| note.task_at_line(line)) else {
+            return Task::none();
+        };
+        let performed = note.advance(task);
+        let id = note.id;
+        // Show the change right away rather than after the preview delay.
+        note.refresh_preview_if_stale();
+        if performed.message.is_some() {
+            self.status = performed.message;
+        }
+        start_timers(id, performed.timers)
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
         ])
     }
 
@@ -564,7 +683,13 @@ impl App {
                     .center(Fill)
                     .into(),
                     Some(note) => {
-                        let editor = || note.view_editor().map(Message::Edit);
+                        let editor = || -> Element<'_, Message> {
+                            right_click::right_click(
+                                note.view_editor().map(Message::Edit),
+                                Message::EditorRightClick,
+                            )
+                            .into()
+                        };
                         let preview = || note.view_preview().map(Message::Link);
                         match self.mode {
                             Mode::Edit => editor(),
@@ -584,6 +709,13 @@ impl App {
             }
         };
 
+        if let (Some(menu), Some(note)) = (
+            &self.menu,
+            self.workspace.as_ref().and_then(|ws| ws.note.as_ref()),
+        ) {
+            return stack![main, menu.view(&note.format, self.window).map(Message::StatusMenu)]
+                .into();
+        }
         if let Some(form) = &self.new_note {
             return stack![main, form.view().map(Message::NewNote)].into();
         }
@@ -637,6 +769,20 @@ impl App {
             Some(_) => "Saved",
             None => "",
         };
+        let statuses = match &ws.note {
+            Some(note) => {
+                let source = match note.source {
+                    Source::Note => "this note",
+                    Source::Settings => "_settings.md",
+                    Source::Default => "default",
+                };
+                match note.unknown {
+                    0 => format!("Statuses: {source}"),
+                    n => format!("Statuses: {source} · ⚠ {n} unknown"),
+                }
+            }
+            None => String::new(),
+        };
         let stats = ws.store.stats();
         let info = format!(
             "{} KB in RAM · {} reads · {} writes · {} skipped",
@@ -651,6 +797,7 @@ impl App {
             row![
                 text(message).size(theme::SMALL),
                 Space::new().width(Fill),
+                text(statuses).size(theme::SMALL).color(theme::MUTED),
                 text(info).size(theme::SMALL).color(theme::FAINT),
                 text(saved).size(theme::SMALL),
             ]
@@ -685,6 +832,12 @@ impl App {
             .style(theme::page)
             .into()
     }
+}
+
+fn start_timers(id: u64, timers: Vec<(Timer, std::time::Duration)>) -> Task<Message> {
+    Task::batch(timers.into_iter().map(|(timer, delay)| {
+        Task::perform(timer::after(delay), move |()| Message::Timer(id, timer))
+    }))
 }
 
 fn window_size() -> (f32, f32) {

@@ -67,10 +67,10 @@ obsession/
       syntax.rs         line tokens for editor highlighting
       preview.rs        Obsidian syntax -> plain markdown, for the preview only
       fuzzy.rs          quick switcher matching
+      status.rs         tasks (task_box), status formats, next status
       doc.rs            a file's original text + line index + line patches
       parse/
-        task.rs         - [c] text @people ^id
-        status.rs       status formats (frontmatter + _settings.md)
+        task.rs         - [c] text @people ^id (parsing beyond the status box)
         link.rs         [[links]], shortest-name resolution, renames
         nodes.rs        _nodes.md: node list, wires, functions, layout
         func.rs         obsession code blocks (the function text format)
@@ -90,7 +90,10 @@ obsession/
       sidebar.rs        file tree (virtual list)
       switcher.rs       quick switcher (Ctrl+P)
       note.rs           raw editor + preview, autosave and preview timers
-      highlight.rs      iced highlighter on top of core's syntax.rs
+      highlight.rs      iced highlighter on top of core's syntax.rs, status colours
+      status_menu.rs    right-click status menu
+      right_click.rs    wrapper that reports where a right-click landed
+      new_note.rs       new-note box (Ctrl+N)
       timer.rs          one-shot delays without an async runtime
       settings.rs       last opened vault (%APPDATA%\Obsession)
       dev.rs            debug-only hooks: open a note, screenshot, quit
@@ -192,6 +195,36 @@ Where the memory goes:
   and replacing iced's highlighter saved another 25 MB per open note.
 - The cold start (650 ms) is mostly the driver compiling shaders the first
   time. Windows caches them after that.
+
+### Milestone 2 measurements
+
+Same machine, 2026-11-14.
+
+| What | Budget | Measured |
+|---|---|---|
+| CPU when idle, status note open in split view | 0% | **0 ms** over 10 s |
+| Memory, status note open in split view (colour emoji in the preview) | | **97 MB** |
+| Opening a note with tasks changes the file | never | Verified: checksum unchanged |
+| A status change touches only its character | one character | Verified on LF and CRLF notes; CRLF kept |
+| Two status changes within a second | 1 write | **1 write** |
+
+How milestone 2 works, in short:
+
+- `core/src/status.rs` reads `statuses:` (block or flow list) from the note,
+  then `_settings.md`, then the default. `task_box` is the one definition of
+  a task, shared by highlighting, the preview, clicks and the menu.
+- **Editor:** task boxes are coloured by status (blue open, green finished,
+  red unknown). A click on the box advances it; a right-click anywhere on a
+  task line opens the menu. The change selects the one character, replaces
+  it and puts the caret back.
+- **Preview:** each `[c]` becomes its symbol as a `status:<line>` link, so a
+  click advances that line. ⚠ marks unknown characters.
+- **Right-click in the preview** isn't there yet: iced's markdown links only
+  report left clicks. Planned for milestone 8 (or earlier, with a custom
+  preview for task lines). Until then the editor has the menu.
+- `statuses:` is re-read when you type in the frontmatter, and the team
+  format when `_settings.md` is saved from the app. Edits made in other apps
+  are picked up when the file watcher arrives in milestone 6.
 
 How to measure: `cargo build -p obsession --profile measure` builds a release
 binary that keeps the debug-only hooks in `app/src/dev.rs`, then read the
@@ -397,7 +430,7 @@ performance budgets checked.
 | # | Milestone | Done when |
 |---|---|---|
 | 1 | **Vault and editor** ✅ | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
-| 2 | **Tasks and statuses** | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
+| 2 | **Tasks and statuses** ✅ | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
 | 3 | **Links** | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |

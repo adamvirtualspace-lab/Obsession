@@ -8,29 +8,58 @@ use std::ops::Range;
 use iced::advanced::text::highlighter::{self, Format};
 use iced::{Font, Theme};
 
+use obsession_core::status;
 use obsession_core::syntax::{Kind, LineState, scan_line};
 
 use crate::theme;
+
+/// What the highlighter needs from the note's status format. When it
+/// changes (someone edits `statuses:`), the whole note is re-coloured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Statuses {
+    format: status::Format,
+}
+
+impl Statuses {
+    pub fn new(format: &status::Format) -> Self {
+        Self {
+            format: format.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Mark {
+    Syntax(Kind),
+    Open,
+    Finished,
+    Unknown,
+}
 
 pub struct Markdown {
     /// `states[n]` is the state at the start of line `n`.
     states: Vec<LineState>,
     current: usize,
+    statuses: Statuses,
 }
 
 impl highlighter::Highlighter for Markdown {
-    type Settings = ();
-    type Highlight = Kind;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Kind)>;
+    type Settings = Statuses;
+    type Highlight = Mark;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Mark)>;
 
-    fn new(_: &Self::Settings) -> Self {
+    fn new(settings: &Self::Settings) -> Self {
         Self {
             states: vec![LineState::Start],
             current: 0,
+            statuses: settings.clone(),
         }
     }
 
-    fn update(&mut self, _: &Self::Settings) {}
+    fn update(&mut self, settings: &Self::Settings) {
+        self.statuses = settings.clone();
+        self.change_line(0);
+    }
 
     fn change_line(&mut self, line: usize) {
         let line = line.min(self.states.len() - 1);
@@ -47,7 +76,25 @@ impl highlighter::Highlighter for Markdown {
         } else {
             self.states[self.current] = next;
         }
-        spans.into_iter()
+        let format = &self.statuses.format;
+        spans
+            .into_iter()
+            .map(|(range, kind)| {
+                let mark = match kind {
+                    Kind::TaskBox => {
+                        let ch = line[range.start + 1..].chars().next().unwrap_or(' ');
+                        match format.index_of(ch) {
+                            None => Mark::Unknown,
+                            Some(_) if format.is_finished(ch) => Mark::Finished,
+                            Some(_) => Mark::Open,
+                        }
+                    }
+                    kind => Mark::Syntax(kind),
+                };
+                (range, mark)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     fn current_line(&self) -> usize {
@@ -57,16 +104,21 @@ impl highlighter::Highlighter for Markdown {
 
 /// Colour only: a bold face isn't guaranteed for the editor font, and a
 /// fallback font would break the monospace grid (`[ ]` turned into `[]`).
-pub fn format(kind: &Kind, _: &Theme) -> Format<Font> {
-    let color = match kind {
-        Kind::Heading => theme::HEADING,
-        Kind::ListMarker | Kind::Quote | Kind::Frontmatter => theme::MUTED,
-        Kind::TaskBox => theme::ACCENT,
-        Kind::Link => theme::LINK,
-        Kind::Mention => theme::MENTION,
-        Kind::BlockId | Kind::Comment => theme::FAINT,
-        Kind::Tag => theme::TAG,
-        Kind::Code => theme::CODE,
+pub fn format(mark: &Mark, _: &Theme) -> Format<Font> {
+    let color = match mark {
+        Mark::Open => theme::ACCENT,
+        Mark::Finished => theme::SUCCESS,
+        Mark::Unknown => theme::DANGER,
+        Mark::Syntax(kind) => match kind {
+            Kind::Heading => theme::HEADING,
+            Kind::ListMarker | Kind::Quote | Kind::Frontmatter => theme::MUTED,
+            Kind::TaskBox => theme::ACCENT,
+            Kind::Link => theme::LINK,
+            Kind::Mention => theme::MENTION,
+            Kind::BlockId | Kind::Comment => theme::FAINT,
+            Kind::Tag => theme::TAG,
+            Kind::Code => theme::CODE,
+        },
     };
     Format {
         color: Some(color),

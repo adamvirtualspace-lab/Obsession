@@ -26,6 +26,11 @@ The app remembers the last vault in `%APPDATA%\Obsession\last_vault.txt`.
 | Ctrl+E | Cycle Edit / Split / Preview |
 | Ctrl+S | Save now (autosave runs 1 s after you stop typing) |
 
+**Tasks:** click a task's box (in the editor or the preview) to move it to the
+next status. Right-click a task line in the editor to pick any status. Status
+formats come from `statuses:` in the note's frontmatter, then `_settings.md`
+at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
+
 ## Workspace
 
 | Package | What |

@@ -7,6 +7,10 @@
 //! - `OBSESSION_DEV_FIND=query`  open the quick switcher with a query
 //! - `OBSESSION_DEV_NEW=name`  open the new-note box and type `name` after the folder
 //! - `OBSESSION_DEV_NEW_SUBMIT=1`  then press Enter in it
+//! - `OBSESSION_DEV_CLICK=x,y`  left-click the editor text area at this point
+//! - `OBSESSION_DEV_RIGHT=x,y[,wx,wy]`  right-click the editor (widget point, window point)
+//! - `OBSESSION_DEV_PICK=c`  pick status `c` in the open status menu
+//! - `OBSESSION_DEV_CHIP=line`  click the status chip of a 0-based line in the preview
 //! - `OBSESSION_DEV_TYPE=text`  type text at the start of the open note
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
@@ -22,6 +26,15 @@ use crate::{App, Message};
 #[derive(Debug, Clone)]
 pub enum Step {
     Shot(window::Screenshot),
+    /// A message sent after a delay, once the window has been laid out
+    /// (editor clicks need real text positions).
+    Later(Box<Message>),
+}
+
+fn later(ms: u64, message: Message) -> Task<Message> {
+    Task::perform(crate::timer::after(Duration::from_millis(ms)), move |()| {
+        Message::Dev(Step::Later(Box::new(message.clone())))
+    })
 }
 
 pub fn after_scan(app: &mut App) -> Task<Message> {
@@ -50,6 +63,27 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
             tasks.push(app.new_note_message(crate::new_note::Message::Submit));
         }
     }
+    let point = |name: &str| {
+        var(name).and_then(|v| {
+            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (n.len() >= 2).then_some(n)
+        })
+    };
+    if let Some(p) = point("OBSESSION_DEV_CLICK") {
+        let action = iced::widget::text_editor::Action::Click(iced::Point::new(p[0], p[1]));
+        tasks.push(later(400, Message::Edit(action)));
+    }
+    if let Some(p) = point("OBSESSION_DEV_RIGHT") {
+        let local = iced::Point::new(p[0], p[1]);
+        let window = iced::Point::new(p.get(2).copied().unwrap_or(p[0]), p.get(3).copied().unwrap_or(p[1]));
+        tasks.push(later(400, Message::EditorRightClick(local, window)));
+    }
+    if let Some(ch) = var("OBSESSION_DEV_PICK").and_then(|v| v.chars().next()) {
+        tasks.push(later(700, Message::StatusMenu(crate::status_menu::Message::Pick(ch))));
+    }
+    if let Some(line) = var("OBSESSION_DEV_CHIP") {
+        tasks.push(app.click_status_chip(line.parse().ok()));
+    }
     if let Some(typed) = var("OBSESSION_DEV_TYPE") {
         for ch in typed.chars() {
             let action = iced::widget::text_editor::Action::Edit(
@@ -74,6 +108,7 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
 
 pub fn update(step: Step) -> Task<Message> {
     match step {
+        Step::Later(_) => Task::none(),
         Step::Shot(shot) => {
             if let Ok(path) = std::env::var("OBSESSION_DEV_SHOT")
                 && let Err(error) = write_bmp(&path, &shot) {

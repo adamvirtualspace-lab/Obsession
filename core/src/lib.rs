@@ -7,9 +7,11 @@
 //!   plain markdown for the preview. It never touches the file.
 //! - [`fuzzy`]: matching for the quick switcher.
 //! - [`syntax`]: line-by-line markdown tokens for editor highlighting.
+//! - [`status`]: tasks, status formats and what a click changes.
 
 pub mod fuzzy;
 pub mod preview;
+pub mod status;
 pub mod store;
 pub mod syntax;
 pub mod vault;

@@ -173,6 +173,23 @@ pub fn scan_line(state: LineState, line: &str) -> (Vec<Span>, LineState) {
     (spans, next)
 }
 
+/// The state at the start of line `index`, found by scanning from the top.
+/// Used for one-off questions ("is this line inside a code fence?"), not
+/// per frame.
+pub fn state_at<S: AsRef<str>>(lines: impl IntoIterator<Item = S>, index: usize) -> LineState {
+    let mut state = LineState::Start;
+    for line in lines.into_iter().take(index) {
+        state = scan_line(state, line.as_ref().trim_end_matches(['\r', '\n'])).1;
+    }
+    state
+}
+
+/// Whether a line in this state can hold a task (not code, frontmatter or a
+/// `%%` comment).
+pub fn can_hold_task(state: LineState) -> bool {
+    matches!(state, LineState::Start | LineState::Normal)
+}
+
 fn opens_fence(line: &str) -> Option<(u8, u8)> {
     let trimmed = line.trim_start_matches(' ');
     if line.len() - trimmed.len() > 3 {
@@ -218,18 +235,16 @@ fn line_prefix(line: &str, spans: &mut Vec<Span>) -> usize {
         return i;
     }
     spans.push((i..end, Kind::ListMarker));
-    let mut i = end + 1;
 
-    // `[c]` right after the marker: one character, then `]`.
-    if bytes.get(i.min(bytes.len())..).is_some_and(|rest| rest.starts_with(b"["))
-        && let Some(ch) = line[i + 1..].chars().next() {
-            let close = i + 1 + ch.len_utf8();
-            if bytes.get(close) == Some(&b']') {
-                spans.push((i..close + 1, Kind::TaskBox));
-                i = close + 1;
-            }
-        }
-    i.min(bytes.len())
+    // A task box, by the same rules the rest of the app uses.
+    if let Some((at, ch)) = crate::status::task_box(line)
+        && at > end
+    {
+        let close = at + 2 + ch.len_utf8();
+        spans.push((at..close, Kind::TaskBox));
+        return close;
+    }
+    (end + 1).min(bytes.len())
 }
 
 /// Where a trailing ` ^id` starts, if the line ends with one.
@@ -319,6 +334,23 @@ mod tests {
         assert_eq!(kinds("issue #42 only"), []);
         assert_eq!(kinds("`[[x]] @y`"), [("`[[x]] @y`", Kind::Code)]);
         assert_eq!(kinds("[site](http://a.b)"), [("[site](http://a.b)", Kind::Link)]);
+    }
+
+    #[test]
+    fn numbered_items_are_not_tasks() {
+        assert_eq!(
+            kinds("1. [ ] step"),
+            [("1.", Kind::ListMarker)]
+        );
+        assert_eq!(kinds("- [x]done"), [("-", Kind::ListMarker)]);
+    }
+
+    #[test]
+    fn state_at_lines() {
+        let lines = ["# a", "```", "- [ ] code", "```", "- [ ] real"];
+        assert!(!can_hold_task(state_at(lines, 2)));
+        assert!(can_hold_task(state_at(lines, 4)));
+        assert!(can_hold_task(state_at(lines, 0)));
     }
 
     #[test]
