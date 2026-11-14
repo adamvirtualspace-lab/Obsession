@@ -1,0 +1,152 @@
+//! Undo and redo for the editor.
+//!
+//! Each undo step is a snapshot of the note's text from just before a group
+//! of edits, plus where the cursor was. Typing on one line without a pause
+//! is one group; a pause of a second, moving to another line, or a
+//! structural edit (Enter, joining lines, paste, a status click) starts a
+//! new one. A snapshot is taken once per group, not per keystroke.
+//!
+//! Total snapshot size is capped; the oldest steps go first.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+/// Typing pauses longer than this start a new undo step.
+pub const GROUP_PAUSE: Duration = Duration::from_secs(1);
+/// Undo history is trimmed beyond this many bytes of snapshots.
+pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STEPS: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub text: String,
+    /// (line, byte column) of the cursor.
+    pub cursor: (usize, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    /// Inserting or deleting characters within a line.
+    Typing,
+    /// Anything that changes line structure or jumps: Enter, joins, paste,
+    /// status changes.
+    Other,
+}
+
+#[derive(Debug, Default)]
+pub struct History {
+    undo: VecDeque<Snapshot>,
+    redo: Vec<Snapshot>,
+    bytes: usize,
+    last: Option<(Instant, usize, EditKind)>,
+}
+
+impl History {
+    /// Call before applying an edit. Returns `true` when this edit starts a
+    /// new undo step: then [`History::push`] the text as it is now.
+    pub fn before_edit(&mut self, kind: EditKind, line: usize, now: Instant) -> bool {
+        let continues = match self.last {
+            Some((at, last_line, last_kind)) => {
+                kind == EditKind::Typing
+                    && last_kind == EditKind::Typing
+                    && last_line == line
+                    && now.duration_since(at) < GROUP_PAUSE
+            }
+            None => false,
+        };
+        self.last = Some((now, line, kind));
+        self.redo.clear();
+        !continues
+    }
+
+    /// Stores the state from before a new undo step.
+    pub fn push(&mut self, snapshot: Snapshot) {
+        self.bytes += snapshot.text.len();
+        self.undo.push_back(snapshot);
+        while self.undo.len() > MAX_STEPS || (self.bytes > MAX_BYTES && self.undo.len() > 1) {
+            if let Some(old) = self.undo.pop_front() {
+                self.bytes -= old.text.len();
+            }
+        }
+    }
+
+    /// Ends the current group, so the next edit starts a new undo step.
+    pub fn break_group(&mut self) {
+        self.last = None;
+    }
+
+    /// Returns the state to restore, given the state now.
+    pub fn undo(&mut self, now: Snapshot) -> Option<Snapshot> {
+        let previous = self.undo.pop_back()?;
+        self.bytes -= previous.text.len();
+        self.redo.push(now);
+        self.last = None;
+        Some(previous)
+    }
+
+    pub fn redo(&mut self, now: Snapshot) -> Option<Snapshot> {
+        let next = self.redo.pop()?;
+        self.bytes += now.text.len();
+        self.undo.push_back(now);
+        self.last = None;
+        Some(next)
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(text: &str) -> Snapshot {
+        Snapshot {
+            text: text.into(),
+            cursor: (0, 0),
+        }
+    }
+
+    #[test]
+    fn groups_typing_on_one_line() {
+        let mut h = History::default();
+        let t = Instant::now();
+        let mut calls = 0;
+        let mut step = |h: &mut History, kind, line, at: Duration, text: &str| {
+            if h.before_edit(kind, line, t + at) {
+                calls += 1;
+                h.push(snap(text));
+            }
+        };
+        for (i, text) in ["", "a", "ab"].iter().enumerate() {
+            step(&mut h, EditKind::Typing, 0, Duration::from_millis(i as u64 * 100), text);
+        }
+        // A pause starts a new step.
+        step(&mut h, EditKind::Typing, 0, Duration::from_secs(5), "abc");
+        // Another line starts a new step.
+        step(&mut h, EditKind::Typing, 1, Duration::from_secs(5), "abcd");
+        // Enter is always its own step.
+        step(&mut h, EditKind::Other, 1, Duration::from_secs(5), "abcde");
+        assert_eq!(calls, 4);
+
+        assert_eq!(h.undo(snap("now")).unwrap().text, "abcde");
+        assert_eq!(h.undo(snap("abcde")).unwrap().text, "abcd");
+        assert_eq!(h.redo(snap("abcd")).unwrap().text, "abcde");
+        assert_eq!(h.undo(snap("abcde")).unwrap().text, "abcd");
+        assert_eq!(h.undo(snap("abcd")).unwrap().text, "abc");
+        assert_eq!(h.undo(snap("abc")).unwrap().text, "");
+        assert!(h.undo(snap("")).is_none());
+    }
+
+    #[test]
+    fn new_edit_clears_redo() {
+        let mut h = History::default();
+        assert!(h.before_edit(EditKind::Other, 0, Instant::now()));
+        h.push(snap("a"));
+        h.undo(snap("b")).unwrap();
+        assert!(h.before_edit(EditKind::Other, 0, Instant::now()));
+        h.push(snap("a"));
+        assert!(h.redo(snap("c")).is_none());
+    }
+}

@@ -11,6 +11,9 @@
 //!   scheme and the 0-based source line (`status:12`), so clicking it in the
 //!   preview can change that one character. A character the format doesn't
 //!   know shows as `⚠ [c]`.
+//! - Single line breaks are kept, as Obsidian does by default ("strict line
+//!   breaks" off): each text line ends in a markdown hard break.
+//! - `> [!type] Title` callouts get their icon and a bold title.
 
 use crate::status::{Format, task_box};
 
@@ -56,6 +59,24 @@ pub fn to_markdown(source: &str, format: &Format) -> String {
             }
         }
 
+        // Keep single line breaks: end non-blank text lines with a hard
+        // break (two spaces) before the line ending.
+        let with_break;
+        let line = if !in_comment && line.len() > trimmed.len() && keeps_break(trimmed) {
+            let ending = &line[trimmed.len()..];
+            with_break = format!("{trimmed}  {ending}");
+            with_break.as_str()
+        } else {
+            line
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+
+        if !in_comment && let Some(callout) = callout_title(trimmed) {
+            let ending = &line[trimmed.len()..];
+            convert_line(&format!("{callout}{ending}"), &mut in_comment, &mut out);
+            continue;
+        }
+
         if !in_comment && let Some((at, ch)) = task_box(trimmed) {
             let chip = match format.get(ch) {
                 Some(status) => escape(&status.symbol),
@@ -74,6 +95,35 @@ pub fn to_markdown(source: &str, format: &Format) -> String {
         convert_line(line, &mut in_comment, &mut out);
     }
     out
+}
+
+/// Whether a line should keep its line break: any non-blank line except
+/// table rows (a break there would end the table) and headings.
+fn keeps_break(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && !t.starts_with('|') && !t.starts_with('#') && !line.ends_with("  ")
+}
+
+/// `> [!warning] Render farm` becomes `> **⚠ Render farm**` (quotes kept).
+fn callout_title(line: &str) -> Option<String> {
+    let lead = line.len() - line.trim_start().len();
+    let rest = &line[lead..];
+    if !rest.starts_with('>') {
+        return None;
+    }
+    let quotes = rest.len() - rest.trim_start_matches(['>', ' ']).len();
+    let body = &rest[quotes..];
+    let inner = body.strip_prefix("[!")?;
+    let close = inner.find(']')?;
+    let kind = inner[..close].to_ascii_lowercase();
+    let title = inner[close + 1..].trim_start_matches(['+', '-']).trim();
+    let title = if title.is_empty() {
+        crate::live::capitalize(&kind)
+    } else {
+        title.to_owned()
+    };
+    let icon = crate::live::callout_icon(&kind);
+    Some(format!("{}**{icon} {title}**  ", &line[..lead + quotes]))
 }
 
 /// Escapes characters that would change how a link label renders.
@@ -215,11 +265,14 @@ mod tests {
     fn status_chips() {
         assert_eq!(
             to_markdown_default("# T\n- [ ] a [[b]]\n  - [x] c\n- [?] d\n"),
-            "# T\n- [🔳](<status:1>) a [b](<wiki:b>)\n  - [✅](<status:2>) c\n- [⚠ \\[?\\]](<status:3>) d\n"
+            "# T\n- [🔳](<status:1>) a [b](<wiki:b>)  \n  - [✅](<status:2>) c  \n- [⚠ \\[?\\]](<status:3>) d  \n"
         );
         // Not in code, and not numbered items.
         let src = "```\n- [ ] code\n```\n1. [ ] step\n";
-        assert_eq!(to_markdown_default(src), src);
+        assert_eq!(
+            to_markdown_default(src),
+            "```\n- [ ] code\n```\n1. [ ] step  \n"
+        );
     }
 
     #[test]
@@ -240,24 +293,43 @@ mod tests {
         let src = "```\n[[not a link]]\n```\n`[[inline]]` and [[real]]\n";
         assert_eq!(
             to_markdown(src, &Format::builtin()),
-            "```\n[[not a link]]\n```\n`[[inline]]` and [real](<wiki:real>)\n"
+            "```\n[[not a link]]\n```\n`[[inline]]` and [real](<wiki:real>)  \n"
         );
     }
 
     #[test]
     fn removes_comments_across_lines() {
         let src = "a %%hidden%% b\nstart %%\nlayout 1,2\n%% end\n";
-        assert_eq!(to_markdown(src, &Format::builtin()), "a  b\nstart \n\n end\n");
+        assert_eq!(to_markdown(src, &Format::builtin()), "a  b  \nstart \n\n end\n");
     }
 
     #[test]
     fn keeps_embeds_and_frontmatter() {
         let src = "---\ntags: [[x]]\n---\n![[image.png]]\n";
-        assert_eq!(to_markdown(src, &Format::builtin()), src);
+        assert_eq!(
+            to_markdown(src, &Format::builtin()),
+            "---\ntags: [[x]]\n---\n![[image.png]]  \n"
+        );
     }
 
     #[test]
     fn keeps_crlf() {
-        assert_eq!(to_markdown_default("a\r\n[[b]]\r\n"), "a\r\n[b](<wiki:b>)\r\n");
+        assert_eq!(
+            to_markdown_default("a\r\n[[b]]\r\n"),
+            "a  \r\n[b](<wiki:b>)  \r\n"
+        );
+    }
+
+    #[test]
+    fn line_breaks_and_callouts() {
+        assert_eq!(
+            to_markdown_default("Warm regards,\nAdams\n\n| a |\n|---|\n# H\n"),
+            "Warm regards,  \nAdams  \n\n| a |\n|---|\n# H\n"
+        );
+        assert_eq!(
+            to_markdown_default("> [!warning] Render farm\n> Book it.\n"),
+            "> **⚠ Render farm**  \n> Book it.  \n"
+        );
+        assert_eq!(to_markdown_default("> [!tip]\n"), "> **💡 Tip**  \n");
     }
 }

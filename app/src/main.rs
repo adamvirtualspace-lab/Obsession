@@ -4,6 +4,8 @@
 #[cfg(debug_assertions)]
 mod dev;
 mod highlight;
+mod live;
+mod live_text;
 mod new_note;
 mod note;
 mod right_click;
@@ -18,7 +20,7 @@ use std::path::PathBuf;
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
-    Space, button, column, container, markdown, operation, row, rule, stack, text, text_editor,
+    Space, button, column, container, markdown, operation, row, stack, text, text_editor,
 };
 use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 
@@ -62,6 +64,7 @@ enum Message {
     SetMode(Mode),
     Shortcut(Shortcut),
     Switcher(switcher::Message),
+    Live(live::Message),
     /// Right-click in the editor: (editor-local point, window point).
     EditorRightClick(Point, Point),
     StatusMenu(status_menu::Message),
@@ -78,6 +81,8 @@ enum Shortcut {
     QuickSwitch,
     CycleMode,
     Save,
+    Undo,
+    Redo,
     Up,
     Down,
     Escape,
@@ -332,9 +337,36 @@ impl App {
                 Task::none()
             }
             Message::Link(uri) => self.follow_link(&uri),
-            Message::SetMode(mode) => {
-                self.set_mode(mode);
-                Task::none()
+            Message::SetMode(mode) => self.set_mode(mode),
+            Message::Live(message) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                let Some(note) = &mut ws.note else {
+                    return Task::none();
+                };
+                let outcome = note.live_message(message, ws.team.as_ref());
+                let id = note.id;
+                if outcome.performed.message.is_some() {
+                    self.status = outcome.performed.message;
+                }
+                let mut tasks = vec![start_timers(id, outcome.performed.timers)];
+                if outcome.focus {
+                    tasks.push(operation::focus(live::editor_id()));
+                }
+                if let Some(dy) = outcome.scroll {
+                    tasks.push(operation::scroll_by(
+                        live::scroll_id(),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy },
+                    ));
+                }
+                if let Some((task, at)) = outcome.menu {
+                    self.menu = Some(StatusMenu { task, at });
+                }
+                if let Some(uri) = outcome.open {
+                    tasks.push(self.follow_link(&uri));
+                }
+                Task::batch(tasks)
             }
             Message::Shortcut(shortcut) => self.shortcut(shortcut),
             Message::Switcher(message) => self.switcher_message(message),
@@ -353,12 +385,39 @@ impl App {
         self.workspace.as_mut()?.note.as_mut()
     }
 
-    fn set_mode(&mut self, mode: Mode) {
+    fn set_mode(&mut self, mode: Mode) -> Task<Message> {
         self.mode = mode;
-        if mode.shows_preview()
-            && let Some(note) = self.note_mut() {
-                note.refresh_preview_if_stale();
-            }
+        let Some(note) = self.note_mut() else {
+            return Task::none();
+        };
+        note.set_mode(mode);
+        if mode == Mode::Live && note.is_live_editing() {
+            operation::focus(live::editor_id())
+        } else {
+            Task::none()
+        }
+    }
+
+    fn undo(&mut self, redo: bool) -> Task<Message> {
+        let mode = self.mode;
+        let Some(note) = self.note_mut() else {
+            return Task::none();
+        };
+        let performed = note.undo(redo);
+        let id = note.id;
+        let focus = mode == Mode::Live && note.is_live_editing();
+        if mode.shows_preview() {
+            note.refresh_preview_if_stale();
+        }
+        if performed.message.is_some() {
+            self.status = performed.message;
+        }
+        let timers = start_timers(id, performed.timers);
+        if focus {
+            Task::batch([timers, operation::focus(live::editor_id())])
+        } else {
+            timers
+        }
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
@@ -404,10 +463,9 @@ impl App {
                     operation::move_cursor_to_end(new_note::input_id()),
                 ])
             }
-            Shortcut::CycleMode => {
-                self.set_mode(self.mode.next());
-                Task::none()
-            }
+            Shortcut::CycleMode => self.set_mode(self.mode.next()),
+            Shortcut::Undo => self.undo(false),
+            Shortcut::Redo => self.undo(true),
             Shortcut::Save => self.save_now(),
             Shortcut::OpenFolder => self.update(Message::PickFolder),
             Shortcut::Up | Shortcut::Down | Shortcut::Escape => Task::none(),
@@ -683,18 +741,20 @@ impl App {
                     .center(Fill)
                     .into(),
                     Some(note) => {
-                        let editor = || -> Element<'_, Message> {
-                            right_click::right_click(
-                                note.view_editor().map(Message::Edit),
-                                Message::EditorRightClick,
-                            )
-                            .into()
-                        };
                         let preview = || note.view_preview().map(Message::Link);
                         match self.mode {
-                            Mode::Edit => editor(),
-                            Mode::Preview => preview(),
-                            Mode::Split => row![editor(), rule::vertical(1), preview()].into(),
+                            Mode::Live => note
+                                .view_live()
+                                .map_or_else(preview, |view| view.map(Message::Live)),
+                            Mode::Source => match note.view_editor() {
+                                Some(editor) => right_click::right_click(
+                                    editor.map(Message::Edit),
+                                    Message::EditorRightClick,
+                                )
+                                .into(),
+                                None => preview(),
+                            },
+                            Mode::Reading => preview(),
                         }
                     }
                 };
@@ -751,9 +811,9 @@ impl App {
                     .style(theme::tool(false)),
                 text(path).size(theme::SMALL).color(theme::MUTED),
                 Space::new().width(Fill),
-                mode_button("Edit", Mode::Edit),
-                mode_button("Split", Mode::Split),
-                mode_button("Preview", Mode::Preview),
+                mode_button("Live", Mode::Live),
+                mode_button("Source", Mode::Source),
+                mode_button("Reading", Mode::Reading),
             ]
             .spacing(10)
             .align_y(iced::Center),
@@ -888,6 +948,9 @@ fn shortcut_from_event(
             Key::Character("p") => Some(Shortcut::QuickSwitch),
             Key::Character("e") => Some(Shortcut::CycleMode),
             Key::Character("s") => Some(Shortcut::Save),
+            Key::Character("z") if modifiers.shift() => Some(Shortcut::Redo),
+            Key::Character("z") => Some(Shortcut::Undo),
+            Key::Character("y") => Some(Shortcut::Redo),
             _ => None,
         };
     }

@@ -68,7 +68,9 @@ obsession/
       preview.rs        Obsidian syntax -> plain markdown, for the preview only
       fuzzy.rs          quick switcher matching
       status.rs         tasks (task_box), status formats, next status
-      doc.rs            a file's original text + line index + line patches
+      doc.rs            a note as lines, each with its own line ending (byte-exact)
+      history.rs        undo/redo: one snapshot per group of edits, capped at 8 MB
+      live.rs           Live Preview model: blocks, drawn lines, click-to-raw mapping
       parse/
         task.rs         - [c] text @people ^id (parsing beyond the status box)
         link.rs         [[links]], shortest-name resolution, renames
@@ -94,6 +96,8 @@ obsession/
       status_menu.rs    right-click status menu
       right_click.rs    wrapper that reports where a right-click landed
       new_note.rs       new-note box (Ctrl+N)
+      live.rs           Live Preview: drawn blocks + the active block's editor
+      live_text.rs      a drawn line: styled spans, click → character offset
       timer.rs          one-shot delays without an async runtime
       settings.rs       last opened vault (%APPDATA%\Obsession)
       dev.rs            debug-only hooks: open a note, screenshot, quit
@@ -225,6 +229,44 @@ How milestone 2 works, in short:
 - `statuses:` is re-read when you type in the frontmatter, and the team
   format when `_settings.md` is saved from the app. Edits made in other apps
   are picked up when the file watcher arrives in milestone 6.
+
+### Live Preview (milestone 2½) measurements
+
+Same machine, 2026-11-14. A 3,000-line note (the showcase note repeated).
+
+| What | Before culling | Now |
+|---|---|---|
+| CPU for 50 keystrokes | 860 ms (≈ 17 ms each) | **≈ 310 ms (≈ 6 ms each)** |
+| Memory with the note open | 130 MB | **102 MB** (84.5 MB with no note) |
+| Idle CPU, reading or with a line being edited | | **0 ms** over 10 s |
+| Opening a note changes the file | never | Verified |
+
+How Live Preview works:
+
+- `core/src/doc.rs` holds the note as lines with their own endings, so mixed
+  or missing line endings survive. `core/src/live.rs` splits it into blocks
+  (a line, a code fence, a table, the frontmatter, a `%%` comment) and turns
+  each line into styled pieces with the markup hidden. Every piece knows its
+  raw bytes, so a click lands on the matching raw character.
+- `app/src/live.rs` draws every block except the one being edited, which is
+  a small `text_editor` holding just that block. Each edit is written back
+  into the doc at once, so autosave and undo always see the current text.
+  Only lines touched by an edit (or whose block changed) are re-drawn.
+- **Culling:** only blocks within ~900 px of the visible area are built.
+  `app/src/live_text.rs` records each line's real height when it's laid out;
+  lines not seen yet use an estimate. The edited block is always built, and
+  scrolls itself into view after a change.
+- **Undo** (`core/src/history.rs`) stores a snapshot of the text once per
+  group of edits (typing on one line without a 1 s pause is one group).
+  It works in Live and Source, and across switching between them.
+
+Known limits, for later:
+
+- Selecting text across several blocks isn't possible in Live; use Source.
+- Up/Down through a blank line forgets the column.
+- The scrollbar can shift slightly while scrolling a long note for the first
+  time, as estimated heights are replaced by measured ones.
+- Images and embeds show as a placeholder (📎, 🖼), not the picture.
 
 How to measure: `cargo build -p obsession --profile measure` builds a release
 binary that keeps the debug-only hooks in `app/src/dev.rs`, then read the
@@ -431,6 +473,7 @@ performance budgets checked.
 |---|---|---|
 | 1 | **Vault and editor** ✅ | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
 | 2 | **Tasks and statuses** ✅ | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
+| 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source and Reading views, undo/redo |
 | 3 | **Links** | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |

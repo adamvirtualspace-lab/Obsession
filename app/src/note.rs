@@ -1,43 +1,50 @@
-//! The open note: raw editor, preview, status format, and the timers behind
-//! autosave and the debounced preview.
+//! The open note: Live Preview, Source (raw editor) or Reading (preview),
+//! its status format, undo history, and the timers behind autosave and the
+//! debounced preview.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
 use iced::widget::{markdown, scrollable};
 use iced::{Element, Fill, Length, Point};
 
+use obsession_core::history::{EditKind, History, Snapshot};
 use obsession_core::status::{self, Format, Next, Source};
 use obsession_core::{preview, syntax};
 
 use crate::highlight::Statuses;
+use crate::live::{self, Live};
 use crate::theme;
 
 /// The preview re-renders this long after typing stops.
 pub const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 /// Autosave runs this long after typing stops.
 pub const SAVE_DELAY: Duration = Duration::from_secs(1);
-/// Editor padding: top/bottom, left/right.
+/// Source editor padding: top/bottom, left/right.
 pub const EDITOR_PADDING: (f32, f32) = (24.0, 32.0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    Edit,
-    Preview,
+    /// Formatted, with the line being edited shown raw.
     #[default]
-    Split,
+    Live,
+    /// The raw markdown.
+    Source,
+    /// The preview, read-only (status chips still click).
+    Reading,
 }
 
 impl Mode {
     pub fn shows_preview(self) -> bool {
-        matches!(self, Mode::Preview | Mode::Split)
+        self == Mode::Reading
     }
 
     pub fn next(self) -> Self {
         match self {
-            Mode::Edit => Mode::Split,
-            Mode::Split => Mode::Preview,
-            Mode::Preview => Mode::Edit,
+            Mode::Live => Mode::Source,
+            Mode::Source => Mode::Reading,
+            Mode::Reading => Mode::Live,
         }
     }
 }
@@ -48,7 +55,7 @@ pub enum Timer {
     Save,
 }
 
-/// What an editor action asks of the app.
+/// What an edit asks of the app.
 #[derive(Default)]
 pub struct Performed {
     pub timers: Vec<(Timer, Duration)>,
@@ -65,11 +72,30 @@ pub struct Task {
     pub ch: char,
 }
 
+/// What a Live Preview message led to, beyond the edit itself.
+#[derive(Default)]
+pub struct LiveOutcome {
+    pub performed: Performed,
+    /// A `[[link]]` or URL to open.
+    pub open: Option<String>,
+    /// A task to show the status menu for, at a window point.
+    pub menu: Option<(Task, Point)>,
+    /// The editor should get the keyboard focus.
+    pub focus: bool,
+    /// Scroll the page by this much.
+    pub scroll: Option<f32>,
+}
+
+enum Body {
+    Live(Live),
+    Source(text_editor::Content),
+}
+
 pub struct Note {
     /// Unique per opened note, so a timer from a previous note is ignored.
     pub id: u64,
     pub rel: Box<str>,
-    pub editor: text_editor::Content,
+    body: Body,
     preview: markdown::Content,
     preview_stale: bool,
     /// Edits not yet handed to the store.
@@ -77,6 +103,7 @@ pub struct Note {
     last_edit: Instant,
     preview_timer: bool,
     save_timer: bool,
+    history: History,
 
     pub format: Format,
     pub source: Source,
@@ -94,16 +121,21 @@ pub struct Note {
 impl Note {
     pub fn new(id: u64, rel: Box<str>, text: &str, mode: Mode, team: Option<&Format>) -> Self {
         let format = Format::builtin();
+        let body = match mode {
+            Mode::Source => Body::Source(text_editor::Content::with_text(text)),
+            Mode::Live | Mode::Reading => Body::Live(Live::new(text, &format)),
+        };
         let mut note = Self {
             id,
             rel,
-            editor: text_editor::Content::with_text(text),
+            body,
             preview: markdown::Content::new(),
             preview_stale: true,
             unsynced: false,
             last_edit: Instant::now(),
             preview_timer: false,
             save_timer: false,
+            history: History::default(),
             statuses: Statuses::new(&format),
             format,
             source: Source::Default,
@@ -116,6 +148,12 @@ impl Note {
         if mode.shows_preview() {
             note.render_preview(text);
         }
+        // An empty note starts ready to type.
+        if let Body::Live(live) = &mut note.body
+            && text.trim().is_empty()
+        {
+            live.activate(0, 0);
+        }
         note
     }
 
@@ -124,10 +162,86 @@ impl Note {
         name.strip_suffix(".md").unwrap_or(name)
     }
 
+    /// Switches between Live and Source bodies when the mode needs it.
+    pub fn set_mode(&mut self, mode: Mode) {
+        match (&self.body, mode) {
+            (Body::Source(content), Mode::Live | Mode::Reading) => {
+                let cursor = content.cursor().position;
+                let mut live = Live::new(&content.text(), &self.format);
+                if mode == Mode::Live {
+                    live.activate(cursor.line, cursor.column);
+                }
+                self.body = Body::Live(live);
+            }
+            (Body::Live(live), Mode::Source) => {
+                let cursor = live.active.as_ref().map(|_| live.cursor());
+                let mut content = text_editor::Content::with_text(&live.text());
+                if let Some((line, column)) = cursor {
+                    content.move_to(Cursor {
+                        position: Position { line, column },
+                        selection: None,
+                    });
+                }
+                self.body = Body::Source(content);
+            }
+            _ => {}
+        }
+        if mode.shows_preview() {
+            self.refresh_preview_if_stale();
+        }
+    }
+
+    pub fn is_live_editing(&self) -> bool {
+        matches!(&self.body, Body::Live(live) if live.active.is_some())
+    }
+
+    // ---- Lines, whichever body holds them ----
+
+    fn line_count(&self) -> usize {
+        match &self.body {
+            Body::Live(live) => live.doc.len(),
+            Body::Source(content) => content.line_count(),
+        }
+    }
+
+    fn line(&self, index: usize) -> Option<Cow<'_, str>> {
+        match &self.body {
+            Body::Live(live) => (index < live.doc.len()).then(|| Cow::Borrowed(live.doc.line(index))),
+            Body::Source(content) => content.line(index).map(|l| l.text),
+        }
+    }
+
+    fn lines(&self) -> impl Iterator<Item = Cow<'_, str>> {
+        (0..self.line_count()).map_while(|i| self.line(i))
+    }
+
+    pub fn text(&self) -> String {
+        match &self.body {
+            Body::Live(live) => live.text(),
+            Body::Source(content) => content.text(),
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let cursor = match &self.body {
+            Body::Live(live) => live.cursor(),
+            Body::Source(content) => {
+                let p = content.cursor().position;
+                (p.line, p.column)
+            }
+        };
+        Snapshot {
+            text: self.text(),
+            cursor,
+        }
+    }
+
+    // ---- Status format ----
+
     /// Re-reads `statuses:` from the frontmatter (only the frontmatter lines
     /// are touched). Returns whether the format changed.
     pub fn refresh_format(&mut self, team: Option<&Format>) -> bool {
-        let lookup = status::from_frontmatter(self.editor.lines().map(|line| line.text));
+        let lookup = status::from_frontmatter(self.lines());
         let (format, source) = status::resolve(lookup.as_ref(), team);
         self.warnings = lookup.map(|l| l.warnings).unwrap_or_default();
         self.source = source;
@@ -138,22 +252,25 @@ impl Note {
         self.statuses = Statuses::new(&format);
         self.format = format;
         self.preview_stale = true;
+        if let Body::Live(live) = &mut self.body {
+            live.rebuild(&self.format);
+        }
         true
     }
 
     fn find_frontmatter_end(&self) -> usize {
         let is_fence = |i: usize, closing: bool| {
-            self.editor.line(i).is_some_and(|line| {
-                let t = line.text.trim_start_matches('\u{feff}').trim_end();
+            self.line(i).is_some_and(|line| {
+                let t = line.trim_start_matches('\u{feff}').trim_end();
                 t == "---" || (closing && t == "...")
             })
         };
         if !is_fence(0, false) {
             return 0;
         }
-        (1..self.editor.line_count())
+        (1..self.line_count())
             .find(|&i| is_fence(i, true))
-            .unwrap_or(self.editor.line_count())
+            .unwrap_or(self.line_count())
     }
 
     /// Counts tasks whose character isn't in the format.
@@ -164,12 +281,20 @@ impl Note {
             .count();
     }
 
-    /// Applies an editor action. A plain click on a task box moves the task
-    /// to its next status.
+    // ---- Source editor ----
+
+    /// Applies a Source-editor action. A plain click on a task box moves
+    /// the task to its next status.
     pub fn perform(&mut self, action: Action, team: Option<&Format>) -> Performed {
         let is_edit = action.is_edit();
         let is_click = matches!(action, Action::Click(_));
-        self.editor.perform(action);
+        if is_edit {
+            self.record(edit_kind(&action));
+        }
+        let Body::Source(content) = &mut self.body else {
+            return Performed::default();
+        };
+        content.perform(action);
 
         if is_click {
             return self.click_status();
@@ -178,7 +303,7 @@ impl Note {
             return Performed::default();
         }
         // Typing in (or just below) the frontmatter may change `statuses:`.
-        if self.editor.cursor().position.line <= self.frontmatter_end + 1 {
+        if self.cursor_line() <= self.frontmatter_end + 1 {
             self.refresh_format(team);
         }
         Performed {
@@ -187,8 +312,18 @@ impl Note {
         }
     }
 
+    fn cursor_line(&self) -> usize {
+        match &self.body {
+            Body::Live(live) => live.cursor().0,
+            Body::Source(content) => content.cursor().position.line,
+        }
+    }
+
     fn click_status(&mut self) -> Performed {
-        let cursor = self.editor.cursor();
+        let Body::Source(content) = &self.body else {
+            return Performed::default();
+        };
+        let cursor = content.cursor();
         if cursor.selection.is_some() {
             return Performed::default();
         }
@@ -202,6 +337,157 @@ impl Note {
         }
         self.advance(task)
     }
+
+    /// Moves the caret to `point` (Source editor coordinates, as a
+    /// right-click would) and returns the task on that line, if any.
+    pub fn task_at_point(&mut self, point: Point) -> Option<Task> {
+        let Body::Source(content) = &mut self.body else {
+            return None;
+        };
+        let point = Point::new(point.x - EDITOR_PADDING.1, point.y - EDITOR_PADDING.0);
+        content.perform(Action::Click(point));
+        let line = content.cursor().position.line;
+        self.task_at_line(line)
+    }
+
+    // ---- Live Preview ----
+
+    pub fn live_message(&mut self, message: live::Message, team: Option<&Format>) -> LiveOutcome {
+        let mut outcome = LiveOutcome::default();
+        let format = self.format.clone();
+        match message {
+            live::Message::Edit(action) => {
+                if action.is_edit() {
+                    let kind = edit_kind(&action);
+                    self.record(kind);
+                }
+                let Body::Live(live) = &mut self.body else {
+                    return outcome;
+                };
+                if live.perform(action, &format) {
+                    if live.cursor().0 <= self.frontmatter_end + 1 {
+                        self.refresh_format(team);
+                    }
+                    outcome.performed.timers = self.edited();
+                }
+            }
+            live::Message::Key(intent) => {
+                let edits = matches!(&self.body, Body::Live(live) if live.edits(intent));
+                if edits {
+                    self.record(EditKind::Other);
+                }
+                let Body::Live(live) = &mut self.body else {
+                    return outcome;
+                };
+                let changed = live.key(intent, &format);
+                outcome.focus = live.active.is_some();
+                if changed {
+                    if live.cursor().0 <= self.frontmatter_end + 2 {
+                        self.refresh_format(team);
+                    }
+                    outcome.performed.timers = self.edited();
+                }
+            }
+            live::Message::Press { line, cell, press } => {
+                let Body::Live(live) = &mut self.body else {
+                    return outcome;
+                };
+                match live.press(line, cell, press) {
+                    Some(obsession_core::live::Action::Status) => {
+                        if let Some(task) = self.task_at_line(line) {
+                            if press.right {
+                                outcome.menu = Some((task, press.window));
+                            } else {
+                                outcome.performed = self.advance(task);
+                            }
+                        }
+                    }
+                    Some(obsession_core::live::Action::Wiki(target)) if !press.right => {
+                        outcome.open = Some(format!("{}{target}", preview::WIKI_SCHEME));
+                    }
+                    Some(obsession_core::live::Action::Url(url)) if !press.right => {
+                        outcome.open = Some(url);
+                    }
+                    _ if press.right => {
+                        if let Some(task) = self.task_at_line(line) {
+                            outcome.menu = Some((task, press.window));
+                        }
+                    }
+                    _ => outcome.focus = true,
+                }
+            }
+            live::Message::EditorRight(local, window) => {
+                let Body::Live(live) = &mut self.body else {
+                    return outcome;
+                };
+                let line = live.click_editor(local);
+                if let Some(task) = self.task_at_line(line) {
+                    outcome.menu = Some((task, window));
+                }
+            }
+            live::Message::Reveal(dy) => outcome.scroll = Some(dy),
+            live::Message::Scrolled(viewport) => {
+                if let Body::Live(live) = &mut self.body {
+                    live.scrolled(viewport);
+                }
+            }
+            live::Message::Background => {
+                let Body::Live(live) = &mut self.body else {
+                    return outcome;
+                };
+                let last = live.doc.len().saturating_sub(1);
+                let end = live.doc.line(last).len();
+                live.activate(last, end);
+                outcome.focus = true;
+            }
+        }
+        outcome
+    }
+
+    /// Takes an undo snapshot if this edit starts a new step.
+    fn record(&mut self, kind: EditKind) {
+        let line = self.cursor_line();
+        if self.history.before_edit(kind, line, Instant::now()) {
+            let snapshot = self.snapshot();
+            self.history.push(snapshot);
+        }
+    }
+
+    // ---- Undo ----
+
+    pub fn undo(&mut self, redo: bool) -> Performed {
+        let now = self.snapshot();
+        let target = if redo {
+            self.history.redo(now)
+        } else {
+            self.history.undo(now)
+        };
+        let Some(target) = target else {
+            return Performed {
+                timers: Vec::new(),
+                message: Some(if redo { "Nothing to redo" } else { "Nothing to undo" }.into()),
+            };
+        };
+        match &mut self.body {
+            Body::Live(live) => live.restore(&target.text, target.cursor, &self.format),
+            Body::Source(content) => {
+                *content = text_editor::Content::with_text(&target.text);
+                content.move_to(Cursor {
+                    position: Position {
+                        line: target.cursor.0,
+                        column: target.cursor.1,
+                    },
+                    selection: None,
+                });
+            }
+        }
+        Performed {
+            timers: self.edited(),
+            message: None,
+        }
+    }
+
+    // ---- Tasks ----
 
     /// Moves `task` to the next status in the format.
     pub fn advance(&mut self, task: Task) -> Performed {
@@ -227,18 +513,10 @@ impl Note {
     /// The task on `line`, if that line is a task outside code, frontmatter
     /// and comments.
     pub fn task_at_line(&self, line: usize) -> Option<Task> {
-        let text = self.editor.line(line)?.text;
+        let text = self.line(line)?;
         let (at, ch) = status::task_box(&text)?;
-        let state = syntax::state_at(self.editor.lines().map(|l| l.text), line);
+        let state = syntax::state_at(self.lines(), line);
         syntax::can_hold_task(state).then_some(Task { line, at, ch })
-    }
-
-    /// Moves the caret to `point` (editor coordinates, as a right-click
-    /// would) and returns the task on that line, if any.
-    pub fn task_at_point(&mut self, point: Point) -> Option<Task> {
-        let point = Point::new(point.x - EDITOR_PADDING.1, point.y - EDITOR_PADDING.0);
-        self.editor.perform(Action::Click(point));
-        self.task_at_line(self.editor.cursor().position.line)
     }
 
     /// Replaces the one character between the brackets. The caret and any
@@ -247,37 +525,52 @@ impl Note {
         if task.ch == ch {
             return Vec::new();
         }
-        let saved = self.editor.cursor();
+        self.record(EditKind::Other);
         let start = task.at + 1;
-        self.editor.move_to(Cursor {
-            position: Position {
-                line: task.line,
-                column: start + task.ch.len_utf8(),
-            },
-            selection: Some(Position {
-                line: task.line,
-                column: start,
-            }),
-        });
-        self.editor.perform(Action::Edit(Edit::Insert(ch)));
-
-        let shift = |p: Position| {
-            if p.line == task.line && p.column > start {
-                let column = p.column + ch.len_utf8();
-                Position {
-                    column: column.saturating_sub(task.ch.len_utf8()),
-                    ..p
-                }
-            } else {
-                p
+        match &mut self.body {
+            Body::Live(live) => {
+                let raw = live.doc.line(task.line);
+                let mut new = String::with_capacity(raw.len() + 4);
+                new.push_str(&raw[..start]);
+                new.push(ch);
+                new.push_str(&raw[start + task.ch.len_utf8()..]);
+                live.set_line(task.line, new, &self.format);
             }
-        };
-        self.editor.move_to(Cursor {
-            position: shift(saved.position),
-            selection: saved.selection.map(shift),
-        });
+            Body::Source(content) => {
+                let saved = content.cursor();
+                content.move_to(Cursor {
+                    position: Position {
+                        line: task.line,
+                        column: start + task.ch.len_utf8(),
+                    },
+                    selection: Some(Position {
+                        line: task.line,
+                        column: start,
+                    }),
+                });
+                content.perform(Action::Edit(Edit::Insert(ch)));
+                let shift = |p: Position| {
+                    if p.line == task.line && p.column > start {
+                        let column = p.column + ch.len_utf8();
+                        Position {
+                            column: column.saturating_sub(task.ch.len_utf8()),
+                            ..p
+                        }
+                    } else {
+                        p
+                    }
+                };
+                content.move_to(Cursor {
+                    position: shift(saved.position),
+                    selection: saved.selection.map(shift),
+                });
+            }
+        }
+        self.history.break_group();
         self.edited()
     }
+
+    // ---- Timers and preview ----
 
     /// Bookkeeping after any change to the text.
     fn edited(&mut self) -> Vec<(Timer, Duration)> {
@@ -315,13 +608,9 @@ impl Note {
         Ok(())
     }
 
-    pub fn text(&self) -> String {
-        self.editor.text()
-    }
-
     pub fn refresh_preview_if_stale(&mut self) {
         if self.preview_stale {
-            let text = self.editor.text();
+            let text = self.text();
             self.analyze(&text);
             self.render_preview(&text);
         }
@@ -332,26 +621,50 @@ impl Note {
         self.preview_stale = false;
     }
 
-    pub fn view_editor(&self) -> Element<'_, Action> {
-        iced::widget::text_editor(&self.editor)
-            .on_action(|action| action)
-            .highlight_with::<crate::highlight::Markdown>(
-                self.statuses.clone(),
-                crate::highlight::format,
-            )
-            .font(theme::MONO_FONT)
-            .size(theme::TEXT_SIZE)
-            .padding([EDITOR_PADDING.0, EDITOR_PADDING.1])
-            .height(Fill)
-            .style(theme::editor)
-            .into()
+    // ---- Views ----
+
+    pub fn view_live(&self) -> Option<Element<'_, live::Message>> {
+        match &self.body {
+            Body::Live(live) => Some(live.view(&self.statuses)),
+            Body::Source(_) => None,
+        }
+    }
+
+    pub fn view_editor(&self) -> Option<Element<'_, Action>> {
+        let Body::Source(content) = &self.body else {
+            return None;
+        };
+        Some(
+            iced::widget::text_editor(content)
+                .on_action(|action| action)
+                .highlight_with::<crate::highlight::Markdown>(
+                    self.statuses.clone(),
+                    crate::highlight::format,
+                )
+                .font(theme::MONO_FONT)
+                .size(theme::TEXT_SIZE)
+                .padding([EDITOR_PADDING.0, EDITOR_PADDING.1])
+                .height(Fill)
+                .style(theme::editor)
+                .into(),
+        )
     }
 
     pub fn view_preview(&self) -> Element<'_, markdown::Uri> {
-        let style = markdown::Style::from_palette(theme::theme().palette());
-        let settings = markdown::Settings::with_text_size(15, style);
+        // iced's default code font is the system "monospace", which on
+        // Windows lacks block and box-drawing characters (█ ░ ╔ ═), so ASCII
+        // art falls apart. Cascadia Mono has them all.
+        let mut style = markdown::Style::from_palette(theme::theme().palette());
+        style.inline_code_font = theme::MONO_FONT;
+        style.code_block_font = theme::MONO_FONT;
+        let mut settings = markdown::Settings::with_text_size(15, style);
+        settings.code_size = iced::Pixels(13.0);
         scrollable(
-            iced::widget::container(markdown::view(self.preview.items(), settings))
+            iced::widget::container(markdown::view_with(
+                self.preview.items(),
+                settings,
+                &PreviewViewer,
+            ))
                 .padding([24, 32])
                 .max_width(860)
                 .width(Length::Fill),
@@ -359,5 +672,63 @@ impl Note {
         .height(Fill)
         .width(Fill)
         .into()
+    }
+}
+
+/// The Reading view's look. Only code blocks differ from iced's default:
+/// iced gives every piece of a code block the body font (overriding the
+/// code font), so box-drawing art like `█ ╔═╗` falls apart. Here code is
+/// drawn as plain lines in Cascadia Mono, tightly spaced and unwrapped, with
+/// a horizontal scrollbar for long lines.
+struct PreviewViewer;
+
+impl<'a> markdown::Viewer<'a, markdown::Uri> for PreviewViewer {
+    fn on_link_click(url: markdown::Uri) -> markdown::Uri {
+        url
+    }
+
+    fn code_block(
+        &self,
+        settings: markdown::Settings,
+        _language: Option<&'a str>,
+        code: &'a str,
+        _lines: &'a [markdown::Text],
+    ) -> Element<'a, markdown::Uri> {
+        use iced::widget::{column, container, text};
+        let lines = code
+            .strip_suffix('\n')
+            .unwrap_or(code)
+            .split('\n')
+            .map(|line| {
+                text(line.strip_suffix('\r').unwrap_or(line))
+                    .font(theme::MONO_FONT)
+                    .size(settings.code_size)
+                    .line_height(iced::widget::text::LineHeight::Relative(1.25))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(theme::TEXT)
+                    .into()
+            });
+        container(
+            scrollable(container(column(lines)).padding(settings.code_size)).direction(
+                scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default()
+                        .width(settings.code_size / 2)
+                        .scroller_width(settings.code_size / 2),
+                ),
+            ),
+        )
+        .width(Fill)
+        .padding(settings.code_size / 4)
+        .style(theme::boxed(theme::PANEL))
+        .into()
+    }
+}
+
+/// Typing within a line groups into one undo step; anything else is its own.
+fn edit_kind(action: &Action) -> EditKind {
+    match action {
+        Action::Edit(Edit::Insert(c)) if *c != '\n' => EditKind::Typing,
+        Action::Edit(Edit::Backspace | Edit::Delete) => EditKind::Typing,
+        _ => EditKind::Other,
     }
 }

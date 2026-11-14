@@ -9,7 +9,10 @@
 //! - [`syntax`]: line-by-line markdown tokens for editor highlighting.
 //! - [`status`]: tasks, status formats and what a click changes.
 
+pub mod doc;
 pub mod fuzzy;
+pub mod history;
+pub mod live;
 pub mod preview;
 pub mod status;
 pub mod store;

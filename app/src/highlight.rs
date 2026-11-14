@@ -18,13 +18,22 @@ use crate::theme;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statuses {
     format: status::Format,
+    /// The state of the editor's first line: `Start` for a whole note, and
+    /// `Normal` for a Live Preview block in the middle of one.
+    first: LineState,
 }
 
 impl Statuses {
     pub fn new(format: &status::Format) -> Self {
         Self {
             format: format.clone(),
+            first: LineState::Start,
         }
+    }
+
+    pub fn starting(mut self, first: LineState) -> Self {
+        self.first = first;
+        self
     }
 }
 
@@ -50,7 +59,7 @@ impl highlighter::Highlighter for Markdown {
 
     fn new(settings: &Self::Settings) -> Self {
         Self {
-            states: vec![LineState::Start],
+            states: vec![settings.first],
             current: 0,
             statuses: settings.clone(),
         }
@@ -58,7 +67,8 @@ impl highlighter::Highlighter for Markdown {
 
     fn update(&mut self, settings: &Self::Settings) {
         self.statuses = settings.clone();
-        self.change_line(0);
+        self.states = vec![settings.first];
+        self.current = 0;
     }
 
     fn change_line(&mut self, line: usize) {

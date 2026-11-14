@@ -23,11 +23,19 @@ The app remembers the last vault in `%APPDATA%\Obsession\last_vault.txt`.
 | Ctrl+O | Open a vault folder |
 | Ctrl+N | New note (starts in the open note's folder; `/` makes subfolders) |
 | Ctrl+P | Quick switcher |
-| Ctrl+E | Cycle Edit / Split / Preview |
+| Ctrl+E | Cycle Live / Source / Reading |
 | Ctrl+S | Save now (autosave runs 1 s after you stop typing) |
+| Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
 
-**Tasks:** click a task's box (in the editor or the preview) to move it to the
-next status. Right-click a task line in the editor to pick any status. Status
+**Views:** **Live** (the default) shows the note formatted and turns the line
+you click into raw markdown, like Obsidian's Live Preview. Arrow keys move
+between lines, Enter continues lists, Backspace at the start of a line joins
+it to the one above, Esc stops editing. A code block, table or the
+frontmatter is edited as a whole. **Source** is the raw markdown, for big
+edits and selecting across many lines. **Reading** is the read-only preview.
+
+**Tasks:** click a task's status (in any view) to move it to the next status.
+Right-click a task in Live or Source to pick any status. Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`
 at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
 

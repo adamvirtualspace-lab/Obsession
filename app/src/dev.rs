@@ -3,7 +3,7 @@
 //!
 //! Environment variables, read after a vault is opened:
 //! - `OBSESSION_DEV_OPEN=anim/sh040.md`  open a note
-//! - `OBSESSION_DEV_MODE=edit|split|preview`
+//! - `OBSESSION_DEV_MODE=live|source|reading`
 //! - `OBSESSION_DEV_FIND=query`  open the quick switcher with a query
 //! - `OBSESSION_DEV_NEW=name`  open the new-note box and type `name` after the folder
 //! - `OBSESSION_DEV_NEW_SUBMIT=1`  then press Enter in it
@@ -11,6 +11,8 @@
 //! - `OBSESSION_DEV_RIGHT=x,y[,wx,wy]`  right-click the editor (widget point, window point)
 //! - `OBSESSION_DEV_PICK=c`  pick status `c` in the open status menu
 //! - `OBSESSION_DEV_CHIP=line`  click the status chip of a 0-based line in the preview
+//! - `OBSESSION_DEV_LPRESS=line,offset[,link]`  press a drawn Live Preview line
+//! - `OBSESSION_DEV_LTYPE=text{enter}…`  type into the Live Preview editor
 //! - `OBSESSION_DEV_TYPE=text`  type text at the start of the open note
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
@@ -42,11 +44,11 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
     let mut tasks = Vec::new();
 
     if let Some(mode) = var("OBSESSION_DEV_MODE") {
-        app.set_mode(match mode.as_str() {
-            "edit" => Mode::Edit,
-            "preview" => Mode::Preview,
-            _ => Mode::Split,
-        });
+        tasks.push(app.set_mode(match mode.as_str() {
+            "source" | "edit" => Mode::Source,
+            "reading" | "preview" => Mode::Reading,
+            _ => Mode::Live,
+        }));
     }
     if let Some(rel) = var("OBSESSION_DEV_OPEN") {
         tasks.push(app.open(rel.into_boxed_str()));
@@ -81,6 +83,32 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
     if let Some(ch) = var("OBSESSION_DEV_PICK").and_then(|v| v.chars().next()) {
         tasks.push(later(700, Message::StatusMenu(crate::status_menu::Message::Pick(ch))));
     }
+    // Live Preview: press a drawn line at a drawn-text byte offset.
+    if let Some(p) = point("OBSESSION_DEV_LPRESS") {
+        let press = crate::live_text::Press {
+            offset: p[1] as usize,
+            link: p.get(2).map(|l| *l as usize),
+            right: false,
+            window: iced::Point::new(300.0, 300.0),
+        };
+        tasks.push(later(
+            400,
+            Message::Live(crate::live::Message::Press {
+                line: p[0] as usize,
+                cell: None,
+                press,
+            }),
+        ));
+    }
+    // Live Preview: type into the active editor. `{enter}`, `{bs}`, `{del}`,
+    // `{up}`, `{down}`, `{left}`, `{right}`, `{esc}`, `{undo}`, `{redo}` are keys.
+    if let Some(script) = var("OBSESSION_DEV_LTYPE") {
+        let mut delay = 600;
+        for step in live_script(&script) {
+            tasks.push(later(delay, step));
+            delay += 30;
+        }
+    }
     if let Some(line) = var("OBSESSION_DEV_CHIP") {
         tasks.push(app.click_status_chip(line.parse().ok()));
     }
@@ -104,6 +132,47 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
         );
     }
     Task::batch(tasks)
+}
+
+fn live_script(script: &str) -> Vec<Message> {
+    use crate::live::{Intent, Message as L};
+    use iced::widget::text_editor::{Action, Edit};
+    let mut out = Vec::new();
+    let mut rest = script;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('{')
+            && let Some(close) = after.find('}')
+        {
+            let key = &after[..close];
+            rest = &after[close + 1..];
+            let message = match key {
+                "enter" => L::Key(Intent::Enter),
+                "bs" => L::Key(Intent::JoinPrev),
+                "del" => L::Key(Intent::JoinNext),
+                "up" => L::Key(Intent::Up),
+                "down" => L::Key(Intent::Down),
+                "left" => L::Key(Intent::Left),
+                "right" => L::Key(Intent::Right),
+                "esc" => L::Key(Intent::Escape),
+                "back" => L::Edit(Action::Edit(Edit::Backspace)),
+                "undo" => {
+                    out.push(Message::Shortcut(crate::Shortcut::Undo));
+                    continue;
+                }
+                "redo" => {
+                    out.push(Message::Shortcut(crate::Shortcut::Redo));
+                    continue;
+                }
+                _ => continue,
+            };
+            out.push(Message::Live(message));
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or(' ');
+        rest = &rest[ch.len_utf8()..];
+        out.push(Message::Live(L::Edit(Action::Edit(Edit::Insert(ch)))));
+    }
+    out
 }
 
 pub fn update(step: Step) -> Task<Message> {

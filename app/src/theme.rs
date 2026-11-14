@@ -170,3 +170,51 @@ pub fn search(_: &Theme, _: text_input::Status) -> text_input::Style {
         selection: Color { a: 0.35, ..ACCENT },
     }
 }
+
+/// The line being edited in Live Preview: no box, so it sits in the page
+/// like the drawn lines around it.
+pub fn live_editor(_: &Theme, _: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        placeholder: FAINT,
+        value: TEXT,
+        selection: Color { a: 0.35, ..ACCENT },
+    }
+}
+
+/// A rounded box: code fences, properties, callouts.
+pub fn boxed(fill: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(fill)),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A table cell.
+pub fn cell(header: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: header.then_some(Background::Color(RAISED)),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The bar beside a quote.
+pub fn quote_bar(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(FAINT)),
+        ..container::Style::default()
+    }
+}
+
+pub const HIGHLIGHT_BG: Color = color!(0x5a4a12);
