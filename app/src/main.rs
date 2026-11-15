@@ -4,6 +4,7 @@
 mod backlinks;
 #[cfg(debug_assertions)]
 mod dev;
+mod graph;
 mod source_scroll;
 mod highlight;
 mod live;
@@ -30,6 +31,7 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
 use obsession_core::links::{self, Backlink, LinkIndex};
+use obsession_core::nodes::{self, Section};
 
 use crate::highlight::LinkStates;
 use obsession_core::vault::{self, Kind, Resolved, Vault};
@@ -62,6 +64,12 @@ enum Message {
     Indexed(PathBuf, Arc<LinkIndex>),
     Backlinks(backlinks::Message),
     ToggleBacklinks,
+    Graph(graph::Message),
+    /// Show the open `_nodes.md` as a graph (or as text).
+    ToggleGraph,
+    ToggleLinkWires,
+    /// Pick a note to add to the open graph.
+    AddNode,
     /// Nothing to do; just lays the window out again.
     Settle,
     /// The vault was scanned again after a note was created; open `rel`.
@@ -147,6 +155,14 @@ struct App {
     scanning: bool,
     next_note_id: u64,
     show_backlinks: bool,
+    /// The open `_nodes.md`, as a graph.
+    graph: Option<graph::Graph>,
+    show_graph: bool,
+    show_link_wires: bool,
+    /// The quick switcher is picking a note for the graph, not opening one.
+    adding_node: bool,
+    /// Bumped when a different graph opens, so the view fits it.
+    graph_fit: u64,
 }
 
 impl App {
@@ -162,6 +178,11 @@ impl App {
             scanning: false,
             next_note_id: 0,
             show_backlinks: true,
+            graph: None,
+            show_graph: true,
+            show_link_wires: true,
+            adding_node: false,
+            graph_fit: 0,
         };
         let start = std::env::args_os()
             .nth(1)
@@ -282,12 +303,37 @@ impl App {
                 ws.links = index;
                 ws.indexed = true;
                 self.refresh_links();
+                self.rebuild_graph();
                 Task::none()
             }
             Message::Backlinks(backlinks::Message::Open(rel, line)) => {
                 self.open_at(rel, Some(Jump::Line(line)))
             }
             Message::Settle => Task::none(),
+            Message::Graph(message) => self.graph_message(message),
+            Message::ToggleGraph => {
+                self.show_graph = !self.show_graph;
+                if self.show_graph {
+                    self.rebuild_graph();
+                }
+                Task::none()
+            }
+            Message::ToggleLinkWires => {
+                self.show_link_wires = !self.show_link_wires;
+                if let Some(graph) = &mut self.graph {
+                    graph.show_links = self.show_link_wires;
+                    graph.touch();
+                }
+                Task::none()
+            }
+            Message::AddNode => {
+                let Some(ws) = &self.workspace else {
+                    return Task::none();
+                };
+                self.adding_node = true;
+                self.switcher = Some(Switcher::new(&ws.vault));
+                operation::focus(switcher::input_id())
+            }
             Message::ToggleBacklinks => {
                 self.show_backlinks = !self.show_backlinks;
                 Task::none()
@@ -424,7 +470,10 @@ impl App {
                 }
                 Task::none()
             }
-            Message::SetMode(mode) => self.set_mode(mode),
+            Message::SetMode(mode) => {
+                self.show_graph = false;
+                self.set_mode(mode)
+            }
             Message::Live(message) => {
                 let Some(ws) = &mut self.workspace else {
                     return Task::none();
@@ -475,6 +524,19 @@ impl App {
             #[cfg(debug_assertions)]
             Message::Dev(dev::Step::Follow(uri)) => self.follow_link(&uri),
             #[cfg(debug_assertions)]
+            Message::Dev(dev::Step::AddNode(name)) => {
+                let index = self.workspace.as_ref().and_then(|ws| {
+                    ws.vault.entries.iter().position(|e| e.kind == Kind::Note && e.title() == name)
+                });
+                match index {
+                    Some(index) => {
+                        self.adding_node = true;
+                        self.picked(index as u32)
+                    }
+                    None => Task::none(),
+                }
+            }
+            #[cfg(debug_assertions)]
             Message::Dev(step) => dev::update(step),
         }
     }
@@ -503,12 +565,16 @@ impl App {
         };
         let performed = note.undo(redo);
         let id = note.id;
+        let graph = nodes::is_graph(&note.rel);
         let focus = mode == Mode::Live && note.is_live_editing();
         if mode.shows_preview() {
             note.refresh_preview_if_stale();
         }
         if performed.message.is_some() {
             self.status = performed.message;
+        }
+        if graph {
+            self.rebuild_graph();
         }
         let timers = start_timers(id, performed.timers);
         if focus {
@@ -561,7 +627,10 @@ impl App {
                     operation::move_cursor_to_end(new_note::input_id()),
                 ])
             }
-            Shortcut::CycleMode => self.set_mode(self.mode.next()),
+            Shortcut::CycleMode => {
+                self.show_graph = false;
+                self.set_mode(self.mode.next())
+            }
             Shortcut::Rename => {
                 match self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).map(|n| n.rel.clone()) {
                     Some(rel) => self.start_rename(&rel),
@@ -588,16 +657,17 @@ impl App {
             switcher::Message::Submit => match switcher.selected() {
                 Some(index) => {
                     self.switcher = None;
-                    self.open_index(index)
+                    self.picked(index)
                 }
                 None => Task::none(),
             },
             switcher::Message::Pick(index) => {
                 self.switcher = None;
-                self.open_index(index)
+                self.picked(index)
             }
             switcher::Message::Close => {
                 self.switcher = None;
+                self.adding_node = false;
                 Task::none()
             }
         }
@@ -682,6 +752,172 @@ impl App {
         }
     }
 
+    /// The quick switcher picked a note: open it, or add it to the graph.
+    fn picked(&mut self, index: u32) -> Task<Message> {
+        if !std::mem::take(&mut self.adding_node) {
+            return self.open_index(index);
+        }
+        let Some(ws) = &self.workspace else {
+            return Task::none();
+        };
+        let Some(entry) = ws.vault.entries.get(index as usize).filter(|e| e.kind == Kind::Note) else {
+            return Task::none();
+        };
+        if self.graph.as_ref().is_some_and(|g| g.cards.iter().any(|c| c.rel.as_deref() == Some(&*entry.rel))) {
+            self.status = Some(format!("{} is already in this graph", entry.title()));
+            return Task::none();
+        }
+        // The shortest link that still finds it.
+        let name = entry.title();
+        let key = if ws.vault.count_named(name) == 1 {
+            name.to_owned()
+        } else {
+            entry.rel.trim_end_matches(".md").to_owned()
+        };
+        self.show_graph = true;
+        self.edit_graph(|text| nodes::add_item(text, Section::Nodes, &format!("[[{key}]]")), true)
+    }
+
+    /// (Re)reads the open `_nodes.md` into the graph view.
+    fn rebuild_graph(&mut self) {
+        let Some(ws) = &mut self.workspace else {
+            self.graph = None;
+            return;
+        };
+        let Some(note) = ws.note.as_ref().filter(|n| nodes::is_graph(&n.rel)) else {
+            self.graph = None;
+            return;
+        };
+        let text = note.text();
+        let rel = note.rel.clone();
+        let mut graph = graph::Graph::build(
+            &text,
+            &rel,
+            &ws.vault,
+            &mut ws.store,
+            ws.team.as_ref(),
+            &ws.links,
+            self.show_link_wires,
+        );
+        graph.fit = self.graph_fit;
+        self.graph = Some(graph);
+    }
+
+    /// Changes the open graph's text (undoable, autosaved), then redraws
+    /// the graph if `rebuild`.
+    fn edit_graph(&mut self, change: impl FnOnce(&str) -> String, rebuild: bool) -> Task<Message> {
+        let Some(note) = self.note_mut() else {
+            return Task::none();
+        };
+        let text = note.text();
+        let new = change(&text);
+        if new == text {
+            return Task::none();
+        }
+        let id = note.id;
+        let timers = note.apply_text(&new);
+        if rebuild {
+            self.rebuild_graph();
+        }
+        start_timers(id, timers)
+    }
+
+    fn graph_message(&mut self, message: graph::Message) -> Task<Message> {
+        let Some(graph) = &mut self.graph else {
+            return Task::none();
+        };
+        match message {
+            graph::Message::Moved(card, at) => {
+                if let Some(c) = graph.cards.get_mut(card) {
+                    c.pos = at;
+                }
+                graph.touch();
+                let layout: Vec<(String, f32, f32)> =
+                    graph.layout().into_iter().map(|(k, x, y)| (k.to_owned(), x, y)).collect();
+                self.edit_graph(
+                    |text| {
+                        let refs: Vec<(&str, f32, f32)> = layout.iter().map(|(k, x, y)| (k.as_str(), *x, *y)).collect();
+                        nodes::set_layout(text, &refs)
+                    },
+                    false,
+                )
+            }
+            graph::Message::Open(card) => {
+                let Some(c) = graph.cards.get(card) else {
+                    return Task::none();
+                };
+                if c.kind == graph::CardKind::Function {
+                    self.status = Some("Function nodes open in milestone 5".into());
+                    return Task::none();
+                }
+                let key = c.key.clone();
+                self.follow_note(&key, None, true)
+            }
+            graph::Message::Connect(from, to) => {
+                let (Some(a), Some(b)) = (graph.cards.get(from), graph.cards.get(to)) else {
+                    return Task::none();
+                };
+                if a.kind == graph::CardKind::Function || b.kind == graph::CardKind::Function {
+                    self.status = Some("Wiring function pins comes in milestone 5".into());
+                    return Task::none();
+                }
+                if graph.wires.iter().any(|w| w.from == from && w.to == to && !w.link) {
+                    return Task::none();
+                }
+                let item = format!("[[{}]] → [[{}]]", a.key, b.key);
+                self.edit_graph(|text| nodes::add_item(text, Section::Wires, &item), true)
+            }
+            graph::Message::Delete(graph::Selected::Card(card)) => {
+                let Some(c) = graph.cards.get(card) else {
+                    return Task::none();
+                };
+                let key = c.key.clone();
+                let wires: Vec<usize> = graph
+                    .wires
+                    .iter()
+                    .filter(|w| (w.from == card || w.to == card) && !w.link)
+                    .filter_map(|w| w.line)
+                    .collect();
+                let layout: Vec<(String, f32, f32)> = graph
+                    .layout()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != card)
+                    .map(|(_, (k, x, y))| (k.to_owned(), x, y))
+                    .collect();
+                self.status = Some(format!("Removed {key} from the graph (the note itself is untouched)"));
+                self.edit_graph(
+                    |text| {
+                        let parsed = nodes::parse(text);
+                        let mut lines = wires;
+                        if let Some(node) = parsed.nodes.iter().find(|n| n.key == key) {
+                            lines.push(node.line);
+                        }
+                        let without = nodes::remove_lines(text, &lines);
+                        let refs: Vec<(&str, f32, f32)> = layout.iter().map(|(k, x, y)| (k.as_str(), *x, *y)).collect();
+                        nodes::set_layout(&without, &refs)
+                    },
+                    true,
+                )
+            }
+            graph::Message::Delete(graph::Selected::Wire(wire)) => {
+                let Some(w) = graph.wires.get(wire) else {
+                    return Task::none();
+                };
+                match w.line {
+                    Some(line) => self.edit_graph(|text| nodes::remove_lines(text, &[line]), true),
+                    None => {
+                        let note = graph.cards[w.to].title.clone();
+                        self.status = Some(format!(
+                            "That wire is a [[link]] in {note}; remove the link there, or hide link wires"
+                        ));
+                        Task::none()
+                    }
+                }
+            }
+        }
+    }
+
     fn open_index(&mut self, index: u32) -> Task<Message> {
         let Some(ws) = &self.workspace else {
             return Task::none();
@@ -730,6 +966,11 @@ impl App {
             }
         }
         self.refresh_links();
+        if self.note_mut().is_some_and(|n| nodes::is_graph(&n.rel)) {
+            self.show_graph = true;
+            self.graph_fit += 1;
+        }
+        self.rebuild_graph();
         save
     }
 
@@ -1062,7 +1303,13 @@ impl App {
                                 .into()
                             })
                         };
+                        let graph = self
+                            .graph
+                            .as_ref()
+                            .filter(|_| self.show_graph)
+                            .map(|g| g.view().map(Message::Graph));
                         let body = match self.mode {
+                            _ if graph.is_some() => graph,
                             Mode::Live | Mode::Reading => {
                                 note.view_live().map(|view| view.map(Message::Live))
                             }
@@ -1139,6 +1386,26 @@ impl App {
                     .style(theme::tool(false)),
                 text(path).size(theme::SMALL).color(theme::MUTED),
                 Space::new().width(Fill),
+                row![]
+                    .push(self.graph.is_some().then(|| {
+                        button(text("Graph").size(theme::SMALL))
+                            .on_press(Message::ToggleGraph)
+                            .padding([4, 12])
+                            .style(theme::tool(self.show_graph))
+                    }))
+                    .push((self.graph.is_some() && self.show_graph).then(|| {
+                        button(text("+ Node").size(theme::SMALL))
+                            .on_press(Message::AddNode)
+                            .padding([4, 12])
+                            .style(theme::tool(false))
+                    }))
+                    .push((self.graph.is_some() && self.show_graph).then(|| {
+                        button(text("Link wires").size(theme::SMALL))
+                            .on_press(Message::ToggleLinkWires)
+                            .padding([4, 12])
+                            .style(theme::tool(self.show_link_wires))
+                    }))
+                    .spacing(10),
                 button(text("Backlinks").size(theme::SMALL))
                     .on_press(Message::ToggleBacklinks)
                     .padding([4, 12])

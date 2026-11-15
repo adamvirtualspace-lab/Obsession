@@ -319,7 +319,9 @@ both files are nodes in the open graph.
 Node positions live in an Obsidian comment (`%% ... %%`) at the end of the file,
 so Obsidian hides them in reading view. The first line is `obsession-layout`,
 then one line per node: the node as written in `## Nodes` (without `[[ ]]`)
-and its `x,y`. Nodes without a position are placed automatically.
+and its `x,y`. Nodes without a position are placed automatically, in columns
+along the `## Wires`. Moving a card rewrites this comment with every node's
+position, in whole pixels; nothing else in the file changes.
 
 ### Housekeeping
 

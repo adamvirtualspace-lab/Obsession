@@ -9,12 +9,14 @@
 //! - [`syntax`]: line-by-line markdown tokens for editor highlighting.
 //! - [`status`]: tasks, status formats and what a click changes.
 //! - [`links`]: links in a note, the vault's link index, renames.
+//! - [`nodes`]: graph files (`_nodes.md`): nodes, wires, layout.
 
 pub mod doc;
 pub mod fuzzy;
 pub mod history;
 pub mod links;
 pub mod live;
+pub mod nodes;
 pub mod preview;
 pub mod status;
 pub mod store;

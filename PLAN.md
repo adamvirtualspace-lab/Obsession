@@ -104,10 +104,9 @@ obsession/
       timer.rs          one-shot delays without an async runtime
       settings.rs       last opened vault (%APPDATA%\Obsession)
       dev.rs            debug-only hooks: open a note, screenshot, quit
+      graph.rs          graph view: cards, wires, pan, zoom, drag, hit testing
       graph/
-        canvas.rs       pan, zoom, node cards, wires, hit testing
-        wire.rs         dashed/solid drawing, hover "ƒ" button
-        func_editor.rs  inner canvas for a function (reuses canvas.rs)
+        func_editor.rs  inner canvas for a function (milestone 5)
       crew_hand.rs      the card hand
 ```
 
@@ -323,6 +322,47 @@ Known limits, for later:
 - Edits made by other apps reach the index when the file watcher arrives
   (milestone 6).
 
+### Graph (milestone 4)
+
+10,000-note vault, release build with the dev hooks (`--profile measure`):
+
+| What | Measured |
+|---|---|
+| Idle CPU, 300-card graph open | **0 ms** over 6 s |
+| Memory, 300-card graph open | **101 MB** (102 MB with an ordinary note) |
+| Startup CPU including reading every note's links | **2.0 s** (1.7 s with an ordinary note) |
+
+How it works:
+
+- **The file** (`core/src/nodes.rs`) is read into nodes, wires and the
+  layout comment. Edits change only what they must: one list item added or
+  removed, or the layout comment rewritten; every other byte (line endings
+  included) stays. A missing `## Nodes` or `## Wires` is added before the
+  layout comment.
+- **The view** (`app/src/graph.rs`) is one iced `canvas`. The grid, cards and
+  wires are drawn into a cache that's kept until the view pans or zooms or
+  the graph changes; the card being dragged (and its wires), the hovered or
+  selected wire and the selection outline are drawn in a small overlay every
+  frame. Cards and wires off screen are skipped; below 50% zoom cards are
+  blocks with a title. Only the hovered or selected wire animates, and only
+  while it is.
+- **Cards** read each note through the store once (tasks with the note's own
+  status format, done count). **Link wires** come from the link index: a
+  `[[link]]` from note B to note A, both on the graph, draws A → B.
+- **Placement:** cards without a saved position go in columns along the
+  `## Wires` (link wires don't move cards), below anything already placed.
+  Dragging a card saves every card's position.
+
+Known limits, for later:
+
+- Function nodes are placeholders until milestone 5: no pins yet, wires to
+  them attach to the card, and wiring or opening them says so.
+- A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the row.
+- The view isn't saved: a graph opens fitted to the window.
+- Link wires can't be removed from the graph yet (Syntax.md wants it to ask
+  whether to remove the link from the note); Delete says where the link is.
+- The card look is a first pass, to be matched to the Possess mockup.
+
 ### Drawing: only when something changes
 
 - **Reactive rendering.** iced redraws only after an event. When nothing moves,
@@ -526,7 +566,7 @@ performance budgets checked.
 | 2 | **Tasks and statuses** ✅ | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
 | 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source, Split and Reading views, undo/redo |
 | 3 | **Links** ✅ | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
-| 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
+| 4 | **Graph** ✅ | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
 | 6 | **Running functions** | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |

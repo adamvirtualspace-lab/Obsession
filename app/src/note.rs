@@ -470,6 +470,13 @@ impl Note {
         }
     }
 
+    /// Puts in text the app changed (a graph's nodes, wires or layout):
+    /// undoable, and saved like typing.
+    pub fn apply_text(&mut self, text: &str) -> Vec<(Timer, Duration)> {
+        self.replace_text(text);
+        self.edited()
+    }
+
     /// Puts new text in (another note was renamed and this note's links to
     /// it were rewritten). Undo can bring the old text back.
     pub fn replace_text(&mut self, text: &str) {

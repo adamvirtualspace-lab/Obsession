@@ -475,7 +475,7 @@ pub(crate) fn capitalize(s: &str) -> String {
 }
 
 /// Where a trailing ` ^id` starts (including the space before it).
-pub(crate) fn trailing_block_id(line: &str) -> Option<usize> {
+pub fn trailing_block_id(line: &str) -> Option<usize> {
     let trimmed = line.trim_end();
     let caret = trimmed.rfind('^')?;
     let id = &trimmed[caret + 1..];

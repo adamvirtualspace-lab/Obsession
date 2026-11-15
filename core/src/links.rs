@@ -423,6 +423,14 @@ impl LinkIndex {
         }
     }
 
+    /// The link targets in `rel`, as written.
+    pub fn targets(&self, rel: &str) -> impl Iterator<Item = &str> {
+        self.notes
+            .get(rel)
+            .into_iter()
+            .flat_map(|n| n.links.iter().map(|l| &*l.target))
+    }
+
     pub fn outline(&self, rel: &str) -> Option<&Outline> {
         self.notes.get(rel).map(|n| &n.outline)
     }

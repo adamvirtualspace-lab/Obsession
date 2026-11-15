@@ -47,6 +47,17 @@ Right-click a task (in any view) to pick any status. Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`
 at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
 
+**Graphs:** a folder's `_nodes.md` opens as a graph (the **Graph** button
+switches between the graph and its text). Each node is a card with the note's
+name, folder, tasks and progress; amber when several notes share the name,
+dashed when the note doesn't exist yet. Drag the background (or hold the middle
+button) to pan, scroll to zoom, drag a card to move it, double-click a card to
+open its note. Drag from the dot on a card's right edge to another card to add
+a wire; select a card or wire and press Delete to remove it from the graph
+(the note itself stays). **+ Node** adds a note. `[[links]]` between cards show
+as fainter wires (**Link wires** hides them). Everything is written back into
+`_nodes.md` as Syntax.md section 7 describes, and Ctrl+Z undoes it.
+
 **Links** resolve as in Obsidian: `[[sh040]]` finds the note by name wherever
 it is, `[[anim/sh040]]` narrows it by folder, `./` and `../` are relative, and
 `#Heading`, `#^block` and `|alias` work. A link is blue when it's fine, dim

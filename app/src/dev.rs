@@ -17,6 +17,7 @@
 //! - `OBSESSION_DEV_VSCROLL=y`  scroll the Live view (Split's right pane) to `y`
 //! - `OBSESSION_DEV_RENAME=new/name`  rename the open note
 //! - `OBSESSION_DEV_FOLLOW=wiki:target#sub`  follow a link from the open note
+//! - `OBSESSION_DEV_GRAPH=move,0,10,20;connect,0,1`  graph actions on the open `_nodes.md`
 //! - `OBSESSION_DEV_TYPE=text`  type text at the start of the open note
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
@@ -40,6 +41,8 @@ pub enum Step {
     ScrollView(f32),
     /// Follow a link, as a click on it would.
     Follow(String),
+    /// Add the note with this name to the open graph.
+    AddNode(String),
 }
 
 fn later(ms: u64, message: Message) -> Task<Message> {
@@ -144,6 +147,27 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
     if let Some(uri) = var("OBSESSION_DEV_FOLLOW") {
         tasks.push(later(800, Message::Dev(Step::Follow(uri))));
     }
+    // Graph actions, `;`-separated: `move,card,x,y` `connect,a,b`
+    // `delcard,card` `delwire,wire` `open,card` `add,name`.
+    if let Some(script) = var("OBSESSION_DEV_GRAPH") {
+        use crate::graph::{Message as G, Selected};
+        let mut delay = 900;
+        for step in script.split(';') {
+            let parts: Vec<&str> = step.split(',').map(str::trim).collect();
+            let n = |i: usize| parts.get(i).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            let message = match parts.first().copied() {
+                Some("move") => Message::Graph(G::Moved(n(1) as usize, iced::Point::new(n(2), n(3)))),
+                Some("connect") => Message::Graph(G::Connect(n(1) as usize, n(2) as usize)),
+                Some("delcard") => Message::Graph(G::Delete(Selected::Card(n(1) as usize))),
+                Some("delwire") => Message::Graph(G::Delete(Selected::Wire(n(1) as usize))),
+                Some("open") => Message::Graph(G::Open(n(1) as usize)),
+                Some("add") => Message::Dev(Step::AddNode(parts.get(1).unwrap_or(&"").to_string())),
+                _ => continue,
+            };
+            tasks.push(later(delay, message));
+            delay += 150;
+        }
+    }
     // Wheel the Source editor: `lines` per step, `steps` times.
     if let Some(spec) = var("OBSESSION_DEV_SCROLL") {
         let mut parts = spec.split(',').filter_map(|v| v.trim().parse::<i32>().ok());
@@ -226,7 +250,7 @@ fn live_script(script: &str) -> Vec<Message> {
 
 pub fn update(step: Step) -> Task<Message> {
     match step {
-        Step::Later(_) | Step::Follow(_) => Task::none(),
+        Step::Later(_) | Step::Follow(_) | Step::AddNode(_) => Task::none(),
         Step::ScrollView(y) => iced::widget::operation::scroll_to(
             crate::live::scroll_id(),
             iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
