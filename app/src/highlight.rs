@@ -112,6 +112,25 @@ impl highlighter::Highlighter for Markdown {
     }
 }
 
+/// Markup that Live Preview's edited line shows in the mono font, so it
+/// looks as it does in Source mode (`[ ]` keeps its width instead of
+/// collapsing to `[]` in a proportional font).
+pub fn is_markup(kind: Kind) -> bool {
+    matches!(kind, Kind::TaskBox | Kind::ListMarker | Kind::Quote | Kind::Code)
+}
+
+/// [`format`] plus the mono font for markup, for Live Preview's edited line.
+pub fn live_format(mark: &Mark, theme: &Theme) -> Format<Font> {
+    let markup = match mark {
+        Mark::Open | Mark::Finished | Mark::Unknown => true,
+        Mark::Syntax(kind) => is_markup(*kind),
+    };
+    Format {
+        font: markup.then_some(theme::MONO_FONT),
+        ..format(mark, theme)
+    }
+}
+
 /// Colour only: a bold face isn't guaranteed for the editor font, and a
 /// fallback font would break the monospace grid (`[ ]` turned into `[]`).
 pub fn format(mark: &Mark, _: &Theme) -> Format<Font> {

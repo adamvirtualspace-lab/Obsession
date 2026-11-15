@@ -171,7 +171,8 @@ pub struct Line {
     pub heading: u8,
     /// `>` depth.
     pub quote: u8,
-    /// List nesting, from the leading whitespace (tab or 2+ spaces = 1).
+    /// List nesting as columns of leading whitespace (a space is 1, a tab
+    /// 4), so the drawn list lines up with the raw text in Source mode.
     pub indent: u8,
     /// A `---`, `***` or `___` rule.
     pub rule: bool,
@@ -310,7 +311,7 @@ pub fn line(raw: &str, format: &Format) -> Line {
         let ws = &raw[i..marker_at];
         let tabs = ws.matches('\t').count();
         let spaces = ws.matches(' ').count();
-        out.indent = (tabs + spaces / 2).min(12) as u8;
+        out.indent = (tabs * 4 + spaces).min(48) as u8;
 
         if bullet && let Some((at, ch)) = task_box(raw) {
             let close = at + 2 + ch.len_utf8();
@@ -807,7 +808,8 @@ mod tests {
     #[test]
     fn lists_and_tasks() {
         let l = line("  - [ ] Polish @ika", &fmt());
-        assert_eq!(l.indent, 1);
+        assert_eq!(l.indent, 2);
+        assert_eq!(line("	- b", &fmt()).indent, 4);
         assert_eq!(l.text(), "🔳 Polish @ika");
         assert_eq!(l.segs[0].action, Some(Action::Status));
         assert_eq!(l.segs[0].raw, 4..7);

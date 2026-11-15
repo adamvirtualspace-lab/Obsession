@@ -33,20 +33,33 @@ use crate::live_text::{LiveText, Press};
 use crate::right_click::right_click;
 use crate::theme;
 
-pub const TEXT_SIZE: f32 = 15.0;
-const LINE_HEIGHT: LineHeight = LineHeight::Relative(1.55);
-const LINE_PX: f32 = TEXT_SIZE * 1.55;
+pub const TEXT_SIZE: f32 = 16.0;
+const LINE_HEIGHT: LineHeight = LineHeight::Relative(1.5);
+/// One line of body text, in pixels. Source mode uses the same pitch so
+/// switching modes doesn't change how many lines fit on screen.
+pub const LINE_PX: f32 = TEXT_SIZE * 1.5;
 /// Code, frontmatter and comments: tighter, so box-drawing art and aligned
 /// text stay joined up, as in a terminal.
 const CODE_LINE_HEIGHT: LineHeight = LineHeight::Relative(1.25);
 const CODE_SIZE: f32 = TEXT_SIZE - 1.0;
 /// Space between blocks.
-const SPACING: f32 = 2.0;
+const SPACING: f32 = 0.0;
 /// Page padding: top/bottom, left/right.
 const PAGE_PADDING: (f32, f32) = (28.0, 40.0);
+/// The page's widest, padding included. All three modes centre a page this
+/// wide so the text sits in the same column whichever mode is on.
+pub const PAGE_WIDTH: f32 = 880.0;
+/// The widest the text itself gets (the page minus its side padding).
+pub const TEXT_WIDTH: f32 = PAGE_WIDTH - 2.0 * PAGE_PADDING.1;
 /// How far above and below the visible part blocks are still built.
 const OVERSCAN: f32 = 900.0;
-const INDENT: f32 = 22.0;
+/// Left inset of a list line `columns` of whitespace deep: the width those
+/// spaces take in Source mode, so nesting looks the same in both modes.
+fn indent_px(columns: u8) -> f32 {
+    static SPACE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let space = *SPACE.get_or_init(|| text_width(" ", theme::MONO_FONT, theme::TEXT_SIZE));
+    f32::from(columns) * space
+}
 /// Text inset per `>` level of a quote.
 const QUOTE_INDENT: f32 = 16.0;
 
@@ -473,7 +486,7 @@ impl Live {
             .push(below)
             .spacing(SPACING)
             .padding([PAGE_PADDING.0, PAGE_PADDING.1])
-            .max_width(880)
+            .max_width(PAGE_WIDTH)
             .width(Fill);
 
         scrollable(container(page).center_x(Fill))
@@ -607,7 +620,7 @@ impl Live {
                 let widget: Element<'_, Message> = widget.into();
                 let top = if drawn.heading > 0 { 10.0 } else { 0.0 };
                 let mut element: Element<'_, Message> = container(widget)
-                    .padding(iced::Padding::new(0.0).top(top).left(f32::from(drawn.indent) * INDENT))
+                    .padding(iced::Padding::new(0.0).top(top).left(indent_px(drawn.indent)))
                     .width(Fill)
                     .clip(mono)
                     .into();
@@ -693,7 +706,7 @@ impl Live {
             })
             .highlight_with::<highlight::Markdown>(
                 statuses.clone().starting(first_state),
-                highlight::format,
+                highlight::live_format,
             )
             .font(if mono {
                 theme::MONO_FONT
@@ -727,7 +740,7 @@ impl Live {
             } else {
                 theme::UI_FONT
             };
-            self.align_offset(range.start, font, heading_size(heading))
+            self.align_offset(range.start, first_state, font, heading_size(heading))
         } else {
             0.0
         };
@@ -749,7 +762,7 @@ impl Live {
     /// How far right the raw line must start so that its text begins where
     /// the drawn line's text begins (never negative: a heading's `## ` just
     /// pushes its text right, as in Obsidian).
-    fn align_offset(&self, line: usize, font: Font, size: f32) -> f32 {
+    fn align_offset(&self, line: usize, state: LineState, font: Font, size: f32) -> f32 {
         let Some(Rendered::Line(drawn)) = self.rendered.get(line) else {
             return 0.0;
         };
@@ -766,10 +779,28 @@ impl Live {
             ),
             None => (drawn.text(), raw.len()),
         };
-        let drawn_x = f32::from(drawn.indent) * INDENT
+        let drawn_x = indent_px(drawn.indent)
             + f32::from(drawn.quote) * QUOTE_INDENT
             + text_width(&before, font, size);
-        let raw_x = text_width(&raw[..raw_at.min(raw.len())], font, size);
+        // The raw prefix is drawn in two fonts: markup (`- [ ] `, `> `) in
+        // mono, as the editor's highlighter sets it, and the rest in `font`.
+        let raw_at = raw_at.min(raw.len());
+        let (spans, _) = obsession_core::syntax::scan_line(state, raw);
+        let mut raw_x = 0.0;
+        let mut at = 0;
+        for (range, kind) in spans {
+            if range.start >= raw_at {
+                break;
+            }
+            if !highlight::is_markup(kind) {
+                continue;
+            }
+            let end = range.end.min(raw_at);
+            raw_x += text_width(&raw[at..range.start], font, size);
+            raw_x += text_width(&raw[range.start..end], theme::MONO_FONT, size);
+            at = end;
+        }
+        raw_x += text_width(&raw[at..raw_at], font, size);
         (drawn_x - raw_x).max(0.0)
     }
 }

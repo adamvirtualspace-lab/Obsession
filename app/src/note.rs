@@ -3,6 +3,7 @@
 //! debounced preview.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
@@ -110,6 +111,9 @@ pub struct Note {
     /// Problems in this note's own `statuses:`.
     pub warnings: Vec<String>,
     statuses: Statuses,
+    /// The Source editor's side padding as last drawn: it grows with the
+    /// window to centre the text column.
+    source_inset: Cell<f32>,
     /// Index of the line that closes the frontmatter (0 if there is none).
     /// Edits at or above it re-read `statuses:`.
     frontmatter_end: usize,
@@ -137,6 +141,7 @@ impl Note {
             save_timer: false,
             history: History::default(),
             statuses: Statuses::new(&format),
+            source_inset: Cell::new(EDITOR_PADDING.1),
             format,
             source: Source::Default,
             warnings: Vec::new(),
@@ -344,7 +349,7 @@ impl Note {
         let Body::Source(content) = &mut self.body else {
             return None;
         };
-        let point = Point::new(point.x - EDITOR_PADDING.1, point.y - EDITOR_PADDING.0);
+        let point = Point::new(point.x - self.source_inset.get(), point.y - EDITOR_PADDING.0);
         content.perform(Action::Click(point));
         let line = content.cursor().position.line;
         self.task_at_line(line)
@@ -634,19 +639,35 @@ impl Note {
         let Body::Source(content) = &self.body else {
             return None;
         };
+        let statuses = &self.statuses;
+        let inset = &self.source_inset;
+        // The editor spans the whole pane (so the wheel and the scrollbar
+        // work everywhere), with side padding that centres the text in the
+        // same column as Live Preview and Reading.
         Some(
-            iced::widget::text_editor(content)
-                .on_action(|action| action)
-                .highlight_with::<crate::highlight::Markdown>(
-                    self.statuses.clone(),
-                    crate::highlight::format,
-                )
-                .font(theme::MONO_FONT)
-                .size(theme::TEXT_SIZE)
-                .padding([EDITOR_PADDING.0, EDITOR_PADDING.1])
-                .height(Fill)
-                .style(theme::editor)
-                .into(),
+            iced::widget::responsive(move |size| {
+                let side = ((size.width - live::TEXT_WIDTH) / 2.0).max(EDITOR_PADDING.1);
+                inset.set(side);
+                iced::widget::text_editor(content)
+                    .on_action(|action| action)
+                    .highlight_with::<crate::highlight::Markdown>(
+                        statuses.clone(),
+                        crate::highlight::format,
+                    )
+                    .font(theme::MONO_FONT)
+                    .size(theme::TEXT_SIZE)
+                    .line_height(iced::Pixels(live::LINE_PX))
+                    .padding(iced::Padding {
+                        top: EDITOR_PADDING.0,
+                        bottom: EDITOR_PADDING.0,
+                        left: side,
+                        right: side,
+                    })
+                    .height(Fill)
+                    .style(theme::editor)
+                    .into()
+            })
+            .into(),
         )
     }
 
@@ -657,17 +678,20 @@ impl Note {
         let mut style = markdown::Style::from_palette(theme::theme().palette());
         style.inline_code_font = theme::MONO_FONT;
         style.code_block_font = theme::MONO_FONT;
-        let mut settings = markdown::Settings::with_text_size(15, style);
+        let mut settings = markdown::Settings::with_text_size(crate::live::TEXT_SIZE, style);
         settings.code_size = iced::Pixels(13.0);
         scrollable(
-            iced::widget::container(markdown::view_with(
-                self.preview.items(),
-                settings,
-                &PreviewViewer,
-            ))
-                .padding([24, 32])
-                .max_width(860)
+            iced::widget::container(
+                iced::widget::container(markdown::view_with(
+                    self.preview.items(),
+                    settings,
+                    &PreviewViewer,
+                ))
+                .padding([24.0, 40.0])
+                .max_width(live::PAGE_WIDTH)
                 .width(Length::Fill),
+            )
+            .center_x(Fill),
         )
         .height(Fill)
         .width(Fill)
