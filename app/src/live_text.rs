@@ -36,6 +36,8 @@ pub struct LiveText<'a, Message> {
     font: Font,
     color: Color,
     wrapping: Wrapping,
+    /// Plain text shows the arrow, not the text caret (Reading mode).
+    read_only: bool,
     on_press: Box<dyn Fn(Press) -> Message + 'a>,
 }
 
@@ -52,6 +54,7 @@ impl<'a, Message> LiveText<'a, Message> {
             font: Font::DEFAULT,
             color: Color::WHITE,
             wrapping: Wrapping::WordOrGlyph,
+            read_only: false,
             on_press: Box::new(on_press),
         }
     }
@@ -86,6 +89,11 @@ impl<'a, Message> LiveText<'a, Message> {
 
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 }
@@ -288,6 +296,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         }
         if tree.state.downcast_ref::<State>().hovered_link.is_some() {
             mouse::Interaction::Pointer
+        } else if self.read_only {
+            mouse::Interaction::None
         } else {
             mouse::Interaction::Text
         }

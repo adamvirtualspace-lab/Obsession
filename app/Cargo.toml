@@ -6,6 +6,6 @@ version.workspace = true
 
 [dependencies]
 obsession-core.workspace = true
-iced = { workspace = true, features = ["wgpu", "thread-pool", "markdown", "advanced", "crisp", "web-colors"] }
+iced = { workspace = true, features = ["wgpu", "thread-pool", "advanced", "crisp", "web-colors"] }
 rfd.workspace = true
 anyhow.workspace = true

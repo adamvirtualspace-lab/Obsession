@@ -3,16 +3,17 @@
 //!
 //! Environment variables, read after a vault is opened:
 //! - `OBSESSION_DEV_OPEN=anim/sh040.md`  open a note
-//! - `OBSESSION_DEV_MODE=live|source|reading`
+//! - `OBSESSION_DEV_MODE=live|source|split|reading`
 //! - `OBSESSION_DEV_FIND=query`  open the quick switcher with a query
 //! - `OBSESSION_DEV_NEW=name`  open the new-note box and type `name` after the folder
 //! - `OBSESSION_DEV_NEW_SUBMIT=1`  then press Enter in it
 //! - `OBSESSION_DEV_CLICK=x,y`  left-click the editor text area at this point
 //! - `OBSESSION_DEV_RIGHT=x,y[,wx,wy]`  right-click the editor (widget point, window point)
 //! - `OBSESSION_DEV_PICK=c`  pick status `c` in the open status menu
-//! - `OBSESSION_DEV_CHIP=line`  click the status chip of a 0-based line in the preview
 //! - `OBSESSION_DEV_LPRESS=line,offset[,link]`  press a drawn Live Preview line
 //! - `OBSESSION_DEV_LTYPE=text{enter}…`  type into the Live Preview editor
+//! - `OBSESSION_DEV_SCROLL=lines[,steps]`  wheel the Source editor
+//! - `OBSESSION_DEV_VSCROLL=y`  scroll the Live view (Split's right pane) to `y`
 //! - `OBSESSION_DEV_TYPE=text`  type text at the start of the open note
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
@@ -31,6 +32,9 @@ pub enum Step {
     /// A message sent after a delay, once the window has been laid out
     /// (editor clicks need real text positions).
     Later(Box<Message>),
+    /// Scroll the Live view (Split's right pane) to this offset, as the user
+    /// dragging its scrollbar would.
+    ScrollView(f32),
 }
 
 fn later(ms: u64, message: Message) -> Task<Message> {
@@ -46,6 +50,7 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
     if let Some(mode) = var("OBSESSION_DEV_MODE") {
         tasks.push(app.set_mode(match mode.as_str() {
             "source" | "edit" => Mode::Source,
+            "split" => Mode::Split,
             "reading" | "preview" => Mode::Reading,
             _ => Mode::Live,
         }));
@@ -109,8 +114,22 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
             delay += 30;
         }
     }
-    if let Some(line) = var("OBSESSION_DEV_CHIP") {
-        tasks.push(app.click_status_chip(line.parse().ok()));
+    // Wheel the Source editor: `lines` per step, `steps` times.
+    if let Some(spec) = var("OBSESSION_DEV_SCROLL") {
+        let mut parts = spec.split(',').filter_map(|v| v.trim().parse::<i32>().ok());
+        let lines = parts.next().unwrap_or(3);
+        let steps = parts.next().unwrap_or(1);
+        for i in 0..steps {
+            let action = iced::widget::text_editor::Action::Scroll { lines };
+            tasks.push(later(700 + 40 * i as u64, Message::Edit(action)));
+        }
+    }
+    // Scroll Split's right pane to an offset.
+    if let Some(y) = var("OBSESSION_DEV_VSCROLL").and_then(|v| v.parse().ok()) {
+        tasks.push(Task::perform(
+            crate::timer::after(Duration::from_millis(900)),
+            move |()| Message::Dev(Step::ScrollView(y)),
+        ));
     }
     if let Some(typed) = var("OBSESSION_DEV_TYPE") {
         for ch in typed.chars() {
@@ -178,6 +197,10 @@ fn live_script(script: &str) -> Vec<Message> {
 pub fn update(step: Step) -> Task<Message> {
     match step {
         Step::Later(_) => Task::none(),
+        Step::ScrollView(y) => iced::widget::operation::scroll_to(
+            crate::live::scroll_id(),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+        ),
         Step::Shot(shot) => {
             if let Ok(path) = std::env::var("OBSESSION_DEV_SHOT")
                 && let Err(error) = write_bmp(&path, &shot) {

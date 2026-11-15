@@ -7,15 +7,15 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use iced::widget::text_editor::{self, Action, Cursor, Edit, Position};
-use iced::widget::{markdown, scrollable};
-use iced::{Element, Fill, Length, Point};
+use iced::{Element, Fill, Point, Size};
 
 use obsession_core::history::{EditKind, History, Snapshot};
 use obsession_core::status::{self, Format, Next, Source};
 use obsession_core::{preview, syntax};
 
 use crate::highlight::Statuses;
-use crate::live::{self, Live};
+use crate::live::{self, LINE_PX, Live};
+use crate::source_scroll::SourceScroll;
 use crate::theme;
 
 /// The preview re-renders this long after typing stops.
@@ -32,19 +32,28 @@ pub enum Mode {
     Live,
     /// The raw markdown.
     Source,
-    /// The preview, read-only (status chips still click).
+    /// The raw markdown beside a read-only Live view of it.
+    Split,
+    /// Live Preview with editing off (links and status chips still click).
     Reading,
 }
 
 impl Mode {
+    /// Split keeps a second, read-only Live view that follows the editor.
     pub fn shows_preview(self) -> bool {
-        self == Mode::Reading
+        self == Mode::Split
+    }
+
+    /// Whether the note is edited as raw text (otherwise it's a Live view).
+    fn raw(self) -> bool {
+        matches!(self, Mode::Source | Mode::Split)
     }
 
     pub fn next(self) -> Self {
         match self {
             Mode::Live => Mode::Source,
-            Mode::Source => Mode::Reading,
+            Mode::Source => Mode::Split,
+            Mode::Split => Mode::Reading,
             Mode::Reading => Mode::Live,
         }
     }
@@ -92,12 +101,38 @@ enum Body {
     Source(text_editor::Content),
 }
 
+/// A point of the note both Split panes should show at the same height:
+/// `frac` of the way down `line`, `screen` pixels below the pane's top.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    line: usize,
+    frac: f32,
+    screen: f32,
+}
+
+/// Keeps Split's read-only view in step with the editor.
+#[derive(Debug, Default)]
+struct Sync {
+    /// What the view should line up with.
+    anchor: Option<Anchor>,
+    /// A scroll for the app to send to the view.
+    pending: Option<f32>,
+    /// The offset we last sent, so its echo isn't taken for the user
+    /// scrolling the view.
+    expect: Option<f32>,
+    /// Corrections made after a scroll (heights of lines that hadn't been
+    /// drawn are estimates until they are).
+    tries: u8,
+}
+
 pub struct Note {
     /// Unique per opened note, so a timer from a previous note is ignored.
     pub id: u64,
     pub rel: Box<str>,
     body: Body,
-    preview: markdown::Content,
+    /// Split mode's read-only Live view of the Source text, refreshed a
+    /// moment after typing stops.
+    mirror: Option<Live>,
     preview_stale: bool,
     /// Edits not yet handed to the store.
     pub unsynced: bool,
@@ -114,6 +149,11 @@ pub struct Note {
     /// The Source editor's side padding as last drawn: it grows with the
     /// window to centre the text column.
     source_inset: Cell<f32>,
+    /// The Source editor's size as last drawn.
+    source_size: Cell<Size>,
+    /// Where the Source editor is scrolled to.
+    scroll: SourceScroll,
+    sync: Sync,
     /// Index of the line that closes the frontmatter (0 if there is none).
     /// Edits at or above it re-read `statuses:`.
     frontmatter_end: usize,
@@ -125,15 +165,18 @@ pub struct Note {
 impl Note {
     pub fn new(id: u64, rel: Box<str>, text: &str, mode: Mode, team: Option<&Format>) -> Self {
         let format = Format::builtin();
-        let body = match mode {
-            Mode::Source => Body::Source(text_editor::Content::with_text(text)),
-            Mode::Live | Mode::Reading => Body::Live(Live::new(text, &format)),
+        let body = if mode.raw() {
+            Body::Source(text_editor::Content::with_text(text))
+        } else {
+            let mut live = Live::new(text, &format);
+            live.read_only = mode == Mode::Reading;
+            Body::Live(live)
         };
         let mut note = Self {
             id,
             rel,
             body,
-            preview: markdown::Content::new(),
+            mirror: None,
             preview_stale: true,
             unsynced: false,
             last_edit: Instant::now(),
@@ -142,6 +185,9 @@ impl Note {
             history: History::default(),
             statuses: Statuses::new(&format),
             source_inset: Cell::new(EDITOR_PADDING.1),
+            source_size: Cell::new(Size::ZERO),
+            scroll: SourceScroll::default(),
+            sync: Sync::default(),
             format,
             source: Source::Default,
             warnings: Vec::new(),
@@ -151,10 +197,11 @@ impl Note {
         note.refresh_format(team);
         note.analyze(text);
         if mode.shows_preview() {
-            note.render_preview(text);
+            note.refresh_preview_if_stale();
         }
         // An empty note starts ready to type.
         if let Body::Live(live) = &mut note.body
+            && !live.read_only
             && text.trim().is_empty()
         {
             live.activate(0, 0);
@@ -169,8 +216,8 @@ impl Note {
 
     /// Switches between Live and Source bodies when the mode needs it.
     pub fn set_mode(&mut self, mode: Mode) {
-        match (&self.body, mode) {
-            (Body::Source(content), Mode::Live | Mode::Reading) => {
+        match (&self.body, mode.raw()) {
+            (Body::Source(content), false) => {
                 let cursor = content.cursor().position;
                 let mut live = Live::new(&content.text(), &self.format);
                 if mode == Mode::Live {
@@ -178,21 +225,36 @@ impl Note {
                 }
                 self.body = Body::Live(live);
             }
-            (Body::Live(live), Mode::Source) => {
+            (Body::Live(live), true) => {
                 let cursor = live.active.as_ref().map(|_| live.cursor());
                 let mut content = text_editor::Content::with_text(&live.text());
+                self.scroll.reset();
                 if let Some((line, column)) = cursor {
                     content.move_to(Cursor {
                         position: Position { line, column },
                         selection: None,
                     });
+                    if self.scroll.resize(self.text_area(), &content) {
+                        self.scroll.reveal(&content, line, column);
+                    }
                 }
                 self.body = Body::Source(content);
             }
             _ => {}
         }
+        if let Body::Live(live) = &mut self.body {
+            live.read_only = mode == Mode::Reading;
+            if live.read_only {
+                live.deactivate();
+            }
+        }
         if mode.shows_preview() {
+            self.preview_stale = true;
             self.refresh_preview_if_stale();
+            self.anchor_at_middle();
+        } else {
+            self.mirror = None;
+            self.sync = Sync::default();
         }
     }
 
@@ -296,10 +358,16 @@ impl Note {
         if is_edit {
             self.record(edit_kind(&action));
         }
+        let wheel = match action {
+            Action::Scroll { lines } => Some(lines as f32 * LINE_PX),
+            _ => None,
+        };
         let Body::Source(content) = &mut self.body else {
             return Performed::default();
         };
+        let before = (content.cursor(), content.line_count());
         content.perform(action);
+        self.track_source(before, is_edit, wheel);
 
         if is_click {
             return self.click_status();
@@ -350,9 +418,157 @@ impl Note {
             return None;
         };
         let point = Point::new(point.x - self.source_inset.get(), point.y - EDITOR_PADDING.0);
+        let before = (content.cursor(), content.line_count());
         content.perform(Action::Click(point));
         let line = content.cursor().position.line;
+        self.track_source(before, false, None);
         self.task_at_line(line)
+    }
+
+    // ---- Split: keeping both panes at the same place ----
+
+    /// The Source editor's text area (its size minus padding).
+    fn text_area(&self) -> Size {
+        let size = self.source_size.get();
+        Size::new(
+            size.width - 2.0 * self.source_inset.get(),
+            size.height - 2.0 * EDITOR_PADDING.0,
+        )
+    }
+
+    /// Follows what a Source action did to the editor's scroll, and lines
+    /// the Split view up: with the caret if it moved, else with the middle.
+    fn track_source(&mut self, before: (Cursor, usize), edited: bool, wheel: Option<f32>) {
+        let area = self.text_area();
+        let Body::Source(content) = &self.body else {
+            return;
+        };
+        if !self.scroll.resize(area, content) {
+            return;
+        }
+        if let Some(pixels) = wheel {
+            self.scroll.scroll(pixels, content);
+            self.anchor_at_middle();
+            return;
+        }
+        let (old, old_count) = before;
+        let now = content.cursor();
+        if edited {
+            let lines = [Some(old.position.line), old.selection.map(|p| p.line), Some(now.position.line)];
+            let from = lines.iter().flatten().min().copied().unwrap_or(0);
+            let to = lines.iter().flatten().max().copied().unwrap_or(0);
+            self.scroll.edited(from, to, content.line_count() != old_count);
+        } else if now == old {
+            return;
+        }
+        let (line, column) = (now.position.line, now.position.column);
+        self.scroll.reveal(content, line, column);
+        self.anchor_at(line, column);
+    }
+
+    /// Lines the Split view up with the caret at (`line`, `column`).
+    fn anchor_at(&mut self, line: usize, column: usize) {
+        let Body::Source(content) = &self.body else {
+            return;
+        };
+        let row = self.scroll.row_top(content, line, column);
+        let height = self.scroll.line_height(content, line);
+        let y = self.scroll.y_of(content, line, 0.0) + row;
+        self.sync.anchor = Some(Anchor {
+            line,
+            frac: row / height.max(1.0),
+            screen: EDITOR_PADDING.0 + y,
+        });
+        self.sync_mirror();
+    }
+
+    /// Lines the Split view up with the middle of the editor.
+    fn anchor_at_middle(&mut self) {
+        let area = self.text_area();
+        let Body::Source(content) = &self.body else {
+            return;
+        };
+        if !self.scroll.resize(area, content) {
+            return;
+        }
+        let middle = self.scroll.height() / 2.0;
+        let (line, frac) = self.scroll.at(content, middle);
+        self.sync.anchor = Some(Anchor {
+            line,
+            frac,
+            screen: EDITOR_PADDING.0 + middle,
+        });
+        self.sync_mirror();
+    }
+
+    /// Asks for the Split view to be scrolled to its anchor.
+    fn sync_mirror(&mut self) {
+        let (Some(mirror), Some(anchor)) = (&self.mirror, self.sync.anchor) else {
+            return;
+        };
+        let target = (mirror.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
+        self.sync.pending = Some(target);
+        self.sync.expect = Some(target);
+        self.sync.tries = 0;
+    }
+
+    /// A scroll the app should send to Split's view, if one is due.
+    pub fn take_mirror_scroll(&mut self) -> Option<f32> {
+        self.sync.pending.take()
+    }
+
+    /// Split's view scrolled: either our own scroll arriving (corrected if
+    /// lines measured on the way changed the target), or the user scrolling
+    /// it, which scrolls the editor to match.
+    fn mirror_scrolled(&mut self, viewport: iced::widget::scrollable::Viewport) {
+        let Some(mirror) = &mut self.mirror else {
+            return;
+        };
+        let previous = mirror.viewport().0;
+        mirror.scrolled(viewport);
+        let y = viewport.absolute_offset().y;
+        let max = (viewport.content_bounds().height - viewport.bounds().height).max(0.0);
+
+        if let Some(expect) = self.sync.expect {
+            let ours = (y - expect).abs() < 1.5 || (expect >= max - 1.0 && y >= max - 1.0);
+            if ours {
+                // Lines drawn on the way may have changed the target.
+                if let Some(anchor) = self.sync.anchor
+                    && self.sync.tries < 3
+                {
+                    let target = (mirror.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
+                    if (target.min(max) - y).abs() > 2.0 {
+                        self.sync.tries += 1;
+                        self.sync.pending = Some(target);
+                        self.sync.expect = Some(target);
+                    }
+                }
+                return;
+            }
+        }
+        if (y - previous).abs() < 0.5 {
+            // Only the content or size changed, not the offset.
+            return;
+        }
+
+        // The user scrolled the view: bring the editor's middle to match.
+        self.sync.expect = None;
+        self.sync.anchor = None;
+        let (line, frac) = mirror.at(y + viewport.bounds().height / 2.0);
+        let area = self.text_area();
+        let Body::Source(content) = &mut self.body else {
+            return;
+        };
+        if !self.scroll.resize(area, content) {
+            return;
+        }
+        let screen = viewport.bounds().height / 2.0 - EDITOR_PADDING.0;
+        let delta = self.scroll.y_of(content, line, frac) - screen;
+        let lines = (delta / LINE_PX).round() as i32;
+        if lines != 0 {
+            content.perform(Action::Scroll { lines });
+            self.scroll.scroll(lines as f32 * LINE_PX, content);
+        }
     }
 
     // ---- Live Preview ----
@@ -394,9 +610,10 @@ impl Note {
                 }
             }
             live::Message::Press { line, cell, press } => {
-                let Body::Live(live) = &mut self.body else {
+                let Some(live) = self.shown_live() else {
                     return outcome;
                 };
+                let read_only = live.read_only;
                 match live.press(line, cell, press) {
                     Some(obsession_core::live::Action::Status) => {
                         if let Some(task) = self.task_at_line(line) {
@@ -418,7 +635,7 @@ impl Note {
                             outcome.menu = Some((task, press.window));
                         }
                     }
-                    _ => outcome.focus = true,
+                    _ => outcome.focus = !read_only,
                 }
             }
             live::Message::EditorRight(local, window) => {
@@ -431,15 +648,17 @@ impl Note {
                 }
             }
             live::Message::Reveal(dy) => outcome.scroll = Some(dy),
-            live::Message::Scrolled(viewport) => {
-                if let Body::Live(live) = &mut self.body {
-                    live.scrolled(viewport);
-                }
-            }
+            live::Message::Scrolled(viewport) => match &mut self.body {
+                Body::Live(live) => live.scrolled(viewport),
+                Body::Source(_) => self.mirror_scrolled(viewport),
+            },
             live::Message::Background => {
                 let Body::Live(live) = &mut self.body else {
                     return outcome;
                 };
+                if live.read_only {
+                    return outcome;
+                }
                 let last = live.doc.len().saturating_sub(1);
                 let end = live.doc.line(last).len();
                 live.activate(last, end);
@@ -447,6 +666,14 @@ impl Note {
             }
         }
         outcome
+    }
+
+    /// The Live view on screen: the note itself, or Split's mirror.
+    fn shown_live(&mut self) -> Option<&mut Live> {
+        match &mut self.body {
+            Body::Live(live) => Some(live),
+            Body::Source(_) => self.mirror.as_mut(),
+        }
     }
 
     /// Takes an undo snapshot if this edit starts a new step.
@@ -484,6 +711,14 @@ impl Note {
                     },
                     selection: None,
                 });
+                self.scroll.reset();
+                let area = self.text_area();
+                if let Body::Source(content) = &self.body
+                    && self.scroll.resize(area, content)
+                {
+                    self.scroll.reveal(content, target.cursor.0, target.cursor.1);
+                    self.anchor_at(target.cursor.0, target.cursor.1);
+                }
             }
         }
         Performed {
@@ -565,14 +800,27 @@ impl Note {
                         p
                     }
                 };
+                let restored = shift(saved.position);
                 content.move_to(Cursor {
-                    position: shift(saved.position),
+                    position: restored,
                     selection: saved.selection.map(shift),
                 });
+                let area = self.text_area();
+                if let Body::Source(content) = &self.body
+                    && self.scroll.resize(area, content)
+                {
+                    self.scroll.edited(task.line, task.line, false);
+                    self.scroll.reveal(content, restored.line, restored.column);
+                }
             }
         }
         self.history.break_group();
-        self.edited()
+        let timers = self.edited();
+        // A click in Split's mirror should show its result right away.
+        if self.mirror.is_some() {
+            self.refresh_preview_if_stale();
+        }
+        timers
     }
 
     // ---- Timers and preview ----
@@ -613,17 +861,24 @@ impl Note {
         Ok(())
     }
 
+    /// Brings Split's mirror up to date with the Source text.
     pub fn refresh_preview_if_stale(&mut self) {
-        if self.preview_stale {
-            let text = self.text();
-            self.analyze(&text);
-            self.render_preview(&text);
+        if !self.preview_stale || !matches!(self.body, Body::Source(_)) {
+            return;
         }
-    }
-
-    fn render_preview(&mut self, text: &str) {
-        self.preview = markdown::Content::parse(&preview::to_markdown(text, &self.format));
+        let text = self.text();
+        self.analyze(&text);
+        match &mut self.mirror {
+            // Reusing it keeps its scroll position.
+            Some(mirror) => mirror.reload(&text, &self.format),
+            None => {
+                let mut mirror = Live::new(&text, &self.format);
+                mirror.read_only = true;
+                self.mirror = Some(mirror);
+            }
+        }
         self.preview_stale = false;
+        self.sync_mirror();
     }
 
     // ---- Views ----
@@ -635,12 +890,18 @@ impl Note {
         }
     }
 
+    /// Split mode's read-only view of the Source text.
+    pub fn view_mirror(&self) -> Option<Element<'_, live::Message>> {
+        self.mirror.as_ref().map(|mirror| mirror.view(&self.statuses))
+    }
+
     pub fn view_editor(&self) -> Option<Element<'_, Action>> {
         let Body::Source(content) = &self.body else {
             return None;
         };
         let statuses = &self.statuses;
         let inset = &self.source_inset;
+        let editor_size = &self.source_size;
         // The editor spans the whole pane (so the wheel and the scrollbar
         // work everywhere), with side padding that centres the text in the
         // same column as Live Preview and Reading.
@@ -648,6 +909,7 @@ impl Note {
             iced::widget::responsive(move |size| {
                 let side = ((size.width - live::TEXT_WIDTH) / 2.0).max(EDITOR_PADDING.1);
                 inset.set(side);
+                editor_size.set(size);
                 iced::widget::text_editor(content)
                     .on_action(|action| action)
                     .highlight_with::<crate::highlight::Markdown>(
@@ -669,150 +931,6 @@ impl Note {
             })
             .into(),
         )
-    }
-
-    pub fn view_preview(&self) -> Element<'_, markdown::Uri> {
-        // iced's default code font is the system "monospace", which on
-        // Windows lacks block and box-drawing characters (█ ░ ╔ ═), so ASCII
-        // art falls apart. Cascadia Mono has them all.
-        let mut style = markdown::Style::from_palette(theme::theme().palette());
-        style.inline_code_font = theme::MONO_FONT;
-        style.code_block_font = theme::MONO_FONT;
-        let mut settings = markdown::Settings::with_text_size(crate::live::TEXT_SIZE, style);
-        settings.code_size = iced::Pixels(13.0);
-        scrollable(
-            iced::widget::container(
-                iced::widget::container(markdown::view_with(
-                    self.preview.items(),
-                    settings,
-                    &PreviewViewer,
-                ))
-                .padding([24.0, 40.0])
-                .max_width(live::PAGE_WIDTH)
-                .width(Length::Fill),
-            )
-            .center_x(Fill),
-        )
-        .height(Fill)
-        .width(Fill)
-        .into()
-    }
-}
-
-/// The Reading view's look. Only code blocks differ from iced's default:
-/// iced gives every piece of a code block the body font (overriding the
-/// code font), so box-drawing art like `█ ╔═╗` falls apart. Here code is
-/// drawn as plain lines in Cascadia Mono, tightly spaced and unwrapped, with
-/// a horizontal scrollbar for long lines.
-struct PreviewViewer;
-
-/// Turns the preview step's private links (`hl:`, `at:`, `tag:`) back into
-/// plain text with a highlight or a colour.
-fn restyle(
-    spans: &[iced::advanced::text::Span<'static, markdown::Uri>],
-) -> Vec<iced::advanced::text::Span<'static, markdown::Uri>> {
-    use obsession_core::preview::{HIGHLIGHT_SCHEME, MENTION_SCHEME, TAG_SCHEME};
-    spans
-        .iter()
-        .cloned()
-        .map(|mut span| {
-            let Some(link) = span.link.as_deref() else {
-                return span;
-            };
-            if link.starts_with(HIGHLIGHT_SCHEME) {
-                span.link = None;
-                span.color(theme::TEXT)
-                    .background(iced::Background::Color(theme::HIGHLIGHT_BG))
-                    .padding([0, 2])
-            } else if link.starts_with(MENTION_SCHEME) {
-                span.link = None;
-                span.color(theme::MENTION)
-            } else if link.starts_with(TAG_SCHEME) {
-                span.link = None;
-                span.color(theme::TAG)
-            } else {
-                span
-            }
-        })
-        .collect()
-}
-
-impl<'a> markdown::Viewer<'a, markdown::Uri> for PreviewViewer {
-    fn on_link_click(url: markdown::Uri) -> markdown::Uri {
-        url
-    }
-
-    fn paragraph(
-        &self,
-        settings: markdown::Settings,
-        text: &markdown::Text,
-    ) -> Element<'a, markdown::Uri> {
-        iced::widget::rich_text(restyle(&text.spans(settings.style)))
-            .size(settings.text_size)
-            .on_link_click(Self::on_link_click)
-            .into()
-    }
-
-    fn heading(
-        &self,
-        settings: markdown::Settings,
-        level: &'a markdown::HeadingLevel,
-        text: &'a markdown::Text,
-        index: usize,
-    ) -> Element<'a, markdown::Uri> {
-        use markdown::HeadingLevel as H;
-        let size = match level {
-            H::H1 => settings.h1_size,
-            H::H2 => settings.h2_size,
-            H::H3 => settings.h3_size,
-            H::H4 => settings.h4_size,
-            H::H5 => settings.h5_size,
-            H::H6 => settings.h6_size,
-        };
-        let top = if index > 0 { settings.text_size.0 / 2.0 } else { 0.0 };
-        iced::widget::container(
-            iced::widget::rich_text(restyle(&text.spans(settings.style)))
-                .size(size)
-                .on_link_click(Self::on_link_click),
-        )
-        .padding(iced::Padding::new(0.0).top(top))
-        .into()
-    }
-
-    fn code_block(
-        &self,
-        settings: markdown::Settings,
-        _language: Option<&'a str>,
-        code: &'a str,
-        _lines: &'a [markdown::Text],
-    ) -> Element<'a, markdown::Uri> {
-        use iced::widget::{column, container, text};
-        let lines = code
-            .strip_suffix('\n')
-            .unwrap_or(code)
-            .split('\n')
-            .map(|line| {
-                text(line.strip_suffix('\r').unwrap_or(line))
-                    .font(theme::MONO_FONT)
-                    .size(settings.code_size)
-                    .line_height(iced::widget::text::LineHeight::Relative(1.25))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .color(theme::TEXT)
-                    .into()
-            });
-        container(
-            scrollable(container(column(lines)).padding(settings.code_size)).direction(
-                scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::default()
-                        .width(settings.code_size / 2)
-                        .scroller_width(settings.code_size / 2),
-                ),
-            ),
-        )
-        .width(Fill)
-        .padding(settings.code_size / 4)
-        .style(theme::boxed(theme::PANEL))
-        .into()
     }
 }
 

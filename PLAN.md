@@ -39,7 +39,7 @@ is built and in what order.
 |---|---|---|
 | UI | **iced 0.14** | Native, GPU-drawn, Elm-style state, built-in animation helpers, `Canvas` with dashed strokes, `text_editor` |
 | Editor highlighting | **Our own markdown tokenizer** (`core/src/syntax.rs`) | iced's `highlighter` feature loads a grammar database for hundreds of languages: about 30 MB of RAM just to colour markdown. Ours knows tasks, `@people`, `^ids` and links |
-| Markdown rendering | **iced's `markdown` widget** (pulldown-cmark) after our own pre-pass for Obsidian syntax | Tables, task lists, strikethrough. Footnotes need our own pass later. Code blocks in the preview aren't syntax-coloured, to stay off the grammar database |
+| Markdown rendering | **Our own Live Preview renderer** (`core/src/live.rs` + `app/src/live.rs`), used by Live, Split and Reading | iced's `markdown` widget was the first preview; it's gone (and its feature off) so all views draw a note the same way. Footnotes need our own pass later. Code blocks aren't syntax-coloured, to stay off the grammar database |
 | Task, link and status parsing | **Our own line parser** | The syntax is line-based. Owning it lets the app patch single lines safely |
 | Frontmatter | A read-only YAML reader (`yaml-rust2` or `saphyr`) | The app reads frontmatter but never rewrites it |
 | File watching | **notify** with its debouncer | Picks up edits from Obsidian, VS Code and `git pull` |
@@ -65,7 +65,7 @@ obsession/
       vault.rs          scan folders, index files, link resolution (shortest name)
       store.rs          file store: files in RAM, pinning, budget, disk counters
       syntax.rs         line tokens for editor highlighting
-      preview.rs        Obsidian syntax -> plain markdown, for the preview only
+      preview.rs        Obsidian syntax -> plain markdown (unused by the app now; kept for export)
       fuzzy.rs          quick switcher matching
       status.rs         tasks (task_box), status formats, next status
       doc.rs            a note as lines, each with its own line ending (byte-exact)
@@ -91,12 +91,13 @@ obsession/
       theme.rs          colors, spacing, animation timings
       sidebar.rs        file tree (virtual list)
       switcher.rs       quick switcher (Ctrl+P)
-      note.rs           raw editor + preview, autosave and preview timers
+      note.rs           one note: Live or Source body, Split's mirror, autosave timers
       highlight.rs      iced highlighter on top of core's syntax.rs, status colours
       status_menu.rs    right-click status menu
       right_click.rs    wrapper that reports where a right-click landed
       new_note.rs       new-note box (Ctrl+N)
       live.rs           Live Preview: drawn blocks + the active block's editor
+      source_scroll.rs  where the Source editor is scrolled to (for Split)
       live_text.rs      a drawn line: styled spans, click → character offset
       timer.rs          one-shot delays without an async runtime
       settings.rs       last opened vault (%APPDATA%\Obsession)
@@ -221,11 +222,8 @@ How milestone 2 works, in short:
   red unknown). A click on the box advances it; a right-click anywhere on a
   task line opens the menu. The change selects the one character, replaces
   it and puts the caret back.
-- **Preview:** each `[c]` becomes its symbol as a `status:<line>` link, so a
-  click advances that line. ⚠ marks unknown characters.
-- **Right-click in the preview** isn't there yet: iced's markdown links only
-  report left clicks. Planned for milestone 8 (or earlier, with a custom
-  preview for task lines). Until then the editor has the menu.
+- **Live, Split and Reading:** each `[c]` is drawn as its symbol; a click
+  advances it and a right-click opens the menu. ⚠ marks unknown characters.
 - `statuses:` is re-read when you type in the frontmatter, and the team
   format when `_settings.md` is saved from the app. Edits made in other apps
   are picked up when the file watcher arrives in milestone 6.
@@ -259,6 +257,17 @@ How Live Preview works:
 - **Undo** (`core/src/history.rs`) stores a snapshot of the text once per
   group of edits (typing on one line without a 1 s pause is one group).
   It works in Live and Source, and across switching between them.
+- **Reading and Split** reuse the same renderer with `read_only` set: presses
+  on links and chips act, nothing starts editing. Split's right pane is a
+  second, read-only `Live` rebuilt from the Source text 150 ms after typing
+  stops (and at once after a status click), keeping its scroll position.
+- **Split scrolling together:** iced keeps the Source editor's scroll
+  private, so `app/src/source_scroll.rs` follows it with cosmic-text's own
+  rules (wheel, caret reveal, clamping), using line heights laid out with the
+  editor's font and width. Each pane then puts an anchor at the same height:
+  the editor's middle after a wheel, the caret's line after typing or a click.
+  Scrolling the view scrolls the editor to match its middle. Heights of view
+  lines not drawn yet are estimates, so a long jump is corrected once they are.
 
 Known limits, for later:
 
@@ -473,7 +482,7 @@ performance budgets checked.
 |---|---|---|
 | 1 | **Vault and editor** ✅ | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
 | 2 | **Tasks and statuses** ✅ | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
-| 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source and Reading views, undo/redo |
+| 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source, Split and Reading views, undo/redo |
 | 3 | **Links** | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |

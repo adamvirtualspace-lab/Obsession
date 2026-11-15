@@ -3,6 +3,7 @@
 
 #[cfg(debug_assertions)]
 mod dev;
+mod source_scroll;
 mod highlight;
 mod live;
 mod live_text;
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
-    Space, button, column, container, markdown, operation, row, stack, text, text_editor,
+    Space, button, column, container, operation, row, rule, stack, text, text_editor,
 };
 use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 
@@ -60,7 +61,6 @@ enum Message {
     Edit(text_editor::Action),
     Timer(u64, Timer),
     Saved(SaveResult),
-    Link(markdown::Uri),
     SetMode(Mode),
     Shortcut(Shortcut),
     Switcher(switcher::Message),
@@ -178,6 +178,21 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // Split mode: scroll the read-only view to stay level with the editor.
+        match self.note_mut().and_then(Note::take_mirror_scroll) {
+            Some(y) => Task::batch([
+                task,
+                operation::scroll_to(
+                    live::scroll_id(),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                ),
+            ]),
+            None => task,
+        }
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PickFolder | Message::Shortcut(Shortcut::OpenFolder) => {
                 let save = self.save_now();
@@ -336,7 +351,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Link(uri) => self.follow_link(&uri),
             Message::SetMode(mode) => self.set_mode(mode),
             Message::Live(message) => {
                 let Some(ws) = &mut self.workspace else {
@@ -346,6 +360,9 @@ impl App {
                     return Task::none();
                 };
                 let outcome = note.live_message(message, ws.team.as_ref());
+                if self.mode.shows_preview() {
+                    note.refresh_preview_if_stale();
+                }
                 let id = note.id;
                 if outcome.performed.message.is_some() {
                     self.status = outcome.performed.message;
@@ -646,9 +663,6 @@ impl App {
     }
 
     fn follow_link(&mut self, uri: &str) -> Task<Message> {
-        if let Some(line) = uri.strip_prefix(obsession_core::preview::STATUS_SCHEME) {
-            return self.click_status_chip(line.parse().ok());
-        }
         let Some(ws) = &self.workspace else {
             return Task::none();
         };
@@ -695,24 +709,6 @@ impl App {
         }
     }
 
-    /// A status chip was clicked in the preview.
-    fn click_status_chip(&mut self, line: Option<usize>) -> Task<Message> {
-        let Some(note) = self.note_mut() else {
-            return Task::none();
-        };
-        let Some(task) = line.and_then(|line| note.task_at_line(line)) else {
-            return Task::none();
-        };
-        let performed = note.advance(task);
-        let id = note.id;
-        // Show the change right away rather than after the preview delay.
-        note.refresh_preview_if_stale();
-        if performed.message.is_some() {
-            self.status = performed.message;
-        }
-        start_timers(id, performed.timers)
-    }
-
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
@@ -741,21 +737,36 @@ impl App {
                     .center(Fill)
                     .into(),
                     Some(note) => {
-                        let preview = || note.view_preview().map(Message::Link);
-                        match self.mode {
-                            Mode::Live => note
-                                .view_live()
-                                .map_or_else(preview, |view| view.map(Message::Live)),
-                            Mode::Source => match note.view_editor() {
-                                Some(editor) => right_click::right_click(
+                        let editor = || {
+                            note.view_editor().map(|editor| -> Element<'_, Message> {
+                                right_click::right_click(
                                     editor.map(Message::Edit),
                                     Message::EditorRightClick,
                                 )
-                                .into(),
-                                None => preview(),
-                            },
-                            Mode::Reading => preview(),
-                        }
+                                .into()
+                            })
+                        };
+                        let body = match self.mode {
+                            Mode::Live | Mode::Reading => {
+                                note.view_live().map(|view| view.map(Message::Live))
+                            }
+                            Mode::Source => editor(),
+                            Mode::Split => editor().map(|editor| {
+                                let mirror: Element<'_, Message> = match note.view_mirror() {
+                                    Some(view) => view.map(Message::Live),
+                                    None => Space::new().into(),
+                                };
+                                row![
+                                    container(editor).width(Fill),
+                                    rule::vertical(1),
+                                    container(mirror).width(Fill),
+                                ]
+                                .into()
+                            }),
+                        };
+                        // set_mode keeps the note's body in step with the
+                        // mode, so this is only a fallback.
+                        body.unwrap_or_else(|| Space::new().into())
                     }
                 };
 
@@ -813,6 +824,7 @@ impl App {
                 Space::new().width(Fill),
                 mode_button("Live", Mode::Live),
                 mode_button("Source", Mode::Source),
+                mode_button("Split", Mode::Split),
                 mode_button("Reading", Mode::Reading),
             ]
             .spacing(10)

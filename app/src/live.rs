@@ -136,6 +136,9 @@ pub struct Live {
     heights: Vec<Cell<f32>>,
     /// Scroll offset and visible height of the page.
     scroll: (f32, f32),
+    /// Reading mode and Split's mirror: links and status chips click, but
+    /// nothing starts editing.
+    pub read_only: bool,
 }
 
 impl Live {
@@ -150,6 +153,7 @@ impl Live {
             reveal: 0,
             heights: Vec::new(),
             scroll: (0.0, 1600.0),
+            read_only: false,
         };
         live.rebuild(format);
         live
@@ -163,6 +167,13 @@ impl Live {
             .map(|i| render(self.doc.line(i), self.roles[i], format))
             .collect();
         self.heights = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
+    }
+
+    /// Replaces the whole text without editing it (Split's mirror).
+    pub fn reload(&mut self, text: &str, format: &Format) {
+        self.doc = Doc::from_text(text);
+        self.active = None;
+        self.rebuild(format);
     }
 
     pub fn scrolled(&mut self, viewport: scrollable::Viewport) {
@@ -398,7 +409,7 @@ impl Live {
         {
             return Some(action);
         }
-        if press.right {
+        if press.right || self.read_only {
             return None;
         }
         let raw_len = self.doc.line(line).len();
@@ -419,7 +430,9 @@ impl Live {
     pub fn restore(&mut self, text: &str, cursor: (usize, usize), format: &Format) {
         self.doc = Doc::from_text(text);
         self.rebuild(format);
-        self.activate(cursor.0, cursor.1);
+        if !self.read_only {
+            self.activate(cursor.0, cursor.1);
+        }
     }
 
     /// Clicks the active editor at a point (for a right-click), returning
@@ -479,9 +492,15 @@ impl Live {
 
         // Only the empty space below the last line starts editing at the
         // end; margins and the gaps between lines do nothing.
-        let below = mouse_area(Space::new().width(Fill).height(Length::Fixed(240.0)))
-            .on_press(Message::Background)
-            .interaction(iced::mouse::Interaction::Text);
+        let space = Space::new().width(Fill).height(Length::Fixed(240.0));
+        let below: Element<'a, Message> = if self.read_only {
+            space.into()
+        } else {
+            mouse_area(space)
+                .on_press(Message::Background)
+                .interaction(iced::mouse::Interaction::Text)
+                .into()
+        };
         let page = column(items)
             .push(below)
             .spacing(SPACING)
@@ -520,7 +539,7 @@ impl Live {
             return CODE_SIZE * 1.25;
         }
         let size = heading_size(text.heading);
-        let row = size * 1.55;
+        let row = size * 1.5;
         // About 0.5 em per character, on a page about 800 px wide.
         let chars = text.segs.iter().map(|s| s.text.chars().count()).sum::<usize>() as f32;
         let rows = ((chars * size * 0.5) / 800.0).ceil().max(1.0);
@@ -534,6 +553,61 @@ impl Live {
             BlockKind::Fence => lines + 18.0,
             BlockKind::Frontmatter => lines + 36.0,
         }
+    }
+
+    /// The scroll offset and visible height of the page.
+    pub fn viewport(&self) -> (f32, f32) {
+        self.scroll
+    }
+
+    /// Where a line's own text starts inside its block (boxes have padding,
+    /// and the frontmatter a "Properties" label).
+    fn block_inset(kind: BlockKind) -> f32 {
+        match kind {
+            BlockKind::Fence => 8.0,
+            BlockKind::Frontmatter => 28.0,
+            _ => 0.0,
+        }
+    }
+
+    /// The page y of a point `frac` of the way down `line` (measured
+    /// heights where lines have been drawn, estimates elsewhere).
+    pub fn y_of(&self, line: usize, frac: f32) -> f32 {
+        let mut y = PAGE_PADDING.0;
+        for block in &self.blocks {
+            if block.lines.end <= line {
+                y += self.block_height(block) + SPACING;
+                continue;
+            }
+            y += Self::block_inset(block.kind);
+            for i in block.lines.start..line.max(block.lines.start) {
+                y += self.line_height(i);
+            }
+            return y + frac * self.line_height(line.min(self.doc.len().saturating_sub(1)));
+        }
+        y
+    }
+
+    /// The line at page y `y`, and how far into it.
+    pub fn at(&self, y: f32) -> (usize, f32) {
+        let mut top = PAGE_PADDING.0;
+        for block in &self.blocks {
+            let height = self.block_height(block);
+            if y >= top + height + SPACING {
+                top += height + SPACING;
+                continue;
+            }
+            let mut line_top = top + Self::block_inset(block.kind);
+            for i in block.lines.clone() {
+                let h = self.line_height(i);
+                if y < line_top + h || i + 1 == block.lines.end {
+                    let frac = if h > 0.0 { (y - line_top) / h } else { 0.0 };
+                    return (i, frac.clamp(0.0, 1.0));
+                }
+                line_top += h;
+            }
+        }
+        (self.doc.len().saturating_sub(1), 1.0)
     }
 
     fn block_element<'a>(&'a self, block: &Block) -> Element<'a, Message> {
@@ -573,7 +647,8 @@ impl Live {
                         .size(TEXT_SIZE - 1.0)
                         .line_height(LINE_HEIGHT)
                         .font(theme::UI_FONT)
-                        .color(theme::TEXT),
+                        .color(theme::TEXT)
+                        .read_only(self.read_only),
                     )
                     .padding([4, 10])
                     .width(Fill)
@@ -603,7 +678,8 @@ impl Live {
                 .measure(&self.heights[line])
                 .size(if mono { CODE_SIZE } else { size })
                 .line_height(if mono { CODE_LINE_HEIGHT } else { LINE_HEIGHT })
-                .color(theme::TEXT);
+                .color(theme::TEXT)
+                .read_only(self.read_only);
                 if mono {
                     widget = widget.no_wrap();
                 }
@@ -918,6 +994,11 @@ fn callout_color(kind: Option<&str>) -> iced::Color {
 }
 
 fn heading_level(line: &str) -> u8 {
+    let lead = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if lead > 3 {
+        return 0;
+    }
+    let line = &line[lead..];
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     if (1..=6).contains(&hashes) && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t')) {
         hashes as u8

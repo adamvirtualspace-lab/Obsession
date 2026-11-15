@@ -237,11 +237,14 @@ pub fn line(raw: &str, format: &Format) -> Line {
         return out;
     }
 
-    // Headings.
-    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
-    if (1..=6).contains(&hashes) && matches!(bytes.get(hashes), None | Some(b' ' | b'\t')) {
+    // Headings (up to three spaces may come first, as in Obsidian).
+    let lead = bytes.iter().take(4).take_while(|&&b| b == b' ').count();
+    let hashes = bytes[lead.min(3)..].iter().take_while(|&&b| b == b'#').count();
+    let after = lead.min(3) + hashes;
+    if lead <= 3 && (1..=6).contains(&hashes) && matches!(bytes.get(after), None | Some(b' ' | b'\t')) {
         out.heading = hashes as u8;
-        let start = (hashes + 1).min(raw.len());
+        let gap = bytes[after..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+        let start = (after + gap).min(raw.len());
         let end = trailing_block_id(raw).unwrap_or(raw.len());
         inline(raw, start, end, Style::default(), &mut out.segs);
         merge(&mut out.segs);
@@ -803,6 +806,16 @@ mod tests {
         assert_eq!(drawn(r"not \*em\*"), "not *em*");
         assert_eq!(drawn("snake_case_name stays"), "snake_case_name stays");
         assert_eq!(drawn("2 * 3 * 4"), "2 * 3 * 4");
+    }
+
+    #[test]
+    fn indented_headings() {
+        let l = line("  #### 003B Interact", &fmt());
+        assert_eq!(l.heading, 4);
+        assert_eq!(l.text(), "003B Interact");
+        assert_eq!(line("####   003A", &fmt()).text(), "003A");
+        // Four spaces is too many.
+        assert_eq!(line("    # not", &fmt()).heading, 0);
     }
 
     #[test]
