@@ -682,9 +682,77 @@ impl Note {
 /// a horizontal scrollbar for long lines.
 struct PreviewViewer;
 
+/// Turns the preview step's private links (`hl:`, `at:`, `tag:`) back into
+/// plain text with a highlight or a colour.
+fn restyle(
+    spans: &[iced::advanced::text::Span<'static, markdown::Uri>],
+) -> Vec<iced::advanced::text::Span<'static, markdown::Uri>> {
+    use obsession_core::preview::{HIGHLIGHT_SCHEME, MENTION_SCHEME, TAG_SCHEME};
+    spans
+        .iter()
+        .cloned()
+        .map(|mut span| {
+            let Some(link) = span.link.as_deref() else {
+                return span;
+            };
+            if link.starts_with(HIGHLIGHT_SCHEME) {
+                span.link = None;
+                span.color(theme::TEXT)
+                    .background(iced::Background::Color(theme::HIGHLIGHT_BG))
+                    .padding([0, 2])
+            } else if link.starts_with(MENTION_SCHEME) {
+                span.link = None;
+                span.color(theme::MENTION)
+            } else if link.starts_with(TAG_SCHEME) {
+                span.link = None;
+                span.color(theme::TAG)
+            } else {
+                span
+            }
+        })
+        .collect()
+}
+
 impl<'a> markdown::Viewer<'a, markdown::Uri> for PreviewViewer {
     fn on_link_click(url: markdown::Uri) -> markdown::Uri {
         url
+    }
+
+    fn paragraph(
+        &self,
+        settings: markdown::Settings,
+        text: &markdown::Text,
+    ) -> Element<'a, markdown::Uri> {
+        iced::widget::rich_text(restyle(&text.spans(settings.style)))
+            .size(settings.text_size)
+            .on_link_click(Self::on_link_click)
+            .into()
+    }
+
+    fn heading(
+        &self,
+        settings: markdown::Settings,
+        level: &'a markdown::HeadingLevel,
+        text: &'a markdown::Text,
+        index: usize,
+    ) -> Element<'a, markdown::Uri> {
+        use markdown::HeadingLevel as H;
+        let size = match level {
+            H::H1 => settings.h1_size,
+            H::H2 => settings.h2_size,
+            H::H3 => settings.h3_size,
+            H::H4 => settings.h4_size,
+            H::H5 => settings.h5_size,
+            H::H6 => settings.h6_size,
+        };
+        let top = if index > 0 { settings.text_size.0 / 2.0 } else { 0.0 };
+        iced::widget::container(
+            iced::widget::rich_text(restyle(&text.spans(settings.style)))
+                .size(size)
+                .on_link_click(Self::on_link_click),
+        )
+        .padding(iced::Padding::new(0.0).top(top))
+        .into()
     }
 
     fn code_block(

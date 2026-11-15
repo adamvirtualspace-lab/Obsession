@@ -14,6 +14,9 @@
 //! - Single line breaks are kept, as Obsidian does by default ("strict line
 //!   breaks" off): each text line ends in a markdown hard break.
 //! - `> [!type] Title` callouts get their icon and a bold title.
+//! - `==highlights==`, `@people` and `#tags` become links with the private
+//!   schemes `hl:`, `at:` and `tag:`; the app's viewer turns those back into
+//!   plain text with a highlight or a colour. Trailing `^block-ids` are hidden.
 
 use crate::status::{Format, task_box};
 
@@ -21,6 +24,10 @@ use crate::status::{Format, task_box};
 pub const WIKI_SCHEME: &str = "wiki:";
 /// The URI scheme used for status chips: `status:<line>`.
 pub const STATUS_SCHEME: &str = "status:";
+/// Private schemes for pieces the viewer restyles (not clickable).
+pub const HIGHLIGHT_SCHEME: &str = "hl:";
+pub const MENTION_SCHEME: &str = "at:";
+pub const TAG_SCHEME: &str = "tag:";
 
 pub fn to_markdown(source: &str, format: &Format) -> String {
     let mut out = String::with_capacity(source.len() + source.len() / 8);
@@ -58,6 +65,20 @@ pub fn to_markdown(source: &str, format: &Format) -> String {
                 continue;
             }
         }
+
+        // Hide a trailing ` ^block-id`, as Obsidian's reading view does.
+        let without_id;
+        let line = match (!in_comment)
+            .then(|| crate::live::trailing_block_id(trimmed))
+            .flatten()
+        {
+            Some(cut) => {
+                without_id = format!("{}{}", &trimmed[..cut], &line[trimmed.len()..]);
+                without_id.as_str()
+            }
+            None => line,
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
 
         // Keep single line breaks: end non-blank text lines with a hard
         // break (two spaces) before the line ending.
@@ -207,6 +228,55 @@ fn convert_line(line: &str, in_comment: &mut bool, out: &mut String) {
                     i += 2;
                 }
             }
+            // A markdown link (including the chips made above): copied as
+            // is, so nothing inside its label or URL is touched.
+            b'[' => match markdown_link_len(&line[i..]) {
+                Some(len) => i += len,
+                None => i += 1,
+            },
+            // Bare URLs: `#` and `@` inside them aren't tags or people.
+            b'h' if line[i..].starts_with("http://") || line[i..].starts_with("https://") => {
+                i += line[i..].find(char::is_whitespace).unwrap_or(line.len() - i);
+            }
+            b'=' if line[i..].starts_with("==") => {
+                let inner_start = i + 2;
+                let close = line[inner_start..].find("==");
+                match close {
+                    Some(len)
+                        if len > 0
+                            && !line[inner_start..inner_start + len].contains('[')
+                            && !line[inner_start..].starts_with(' ')
+                            && !line[..inner_start + len].ends_with(' ') =>
+                    {
+                        let inner = &line[inner_start..inner_start + len];
+                        out.push_str(&line[copied..i]);
+                        out.push_str(&format!("[{inner}](<{HIGHLIGHT_SCHEME}>)"));
+                        i = inner_start + len + 2;
+                        copied = i;
+                    }
+                    _ => i += 2,
+                }
+            }
+            b'@' | b'#' if crate::live::word_start(bytes, i) => {
+                let len = line[i + 1..]
+                    .bytes()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'/'))
+                    .count();
+                let name = &line[i + 1..i + 1 + len];
+                let is_tag = bytes[i] == b'#';
+                if len == 0 || (is_tag && name.bytes().all(|c| c.is_ascii_digit())) {
+                    i += 1;
+                    continue;
+                }
+                let scheme = if is_tag { TAG_SCHEME } else { MENTION_SCHEME };
+                out.push_str(&line[copied..i]);
+                out.push_str(&format!(
+                    "[{}{name}](<{scheme}{name}>)",
+                    if is_tag { "\\#" } else { "@" }
+                ));
+                i += 1 + len;
+                copied = i;
+            }
             _ => i += 1,
         }
     }
@@ -217,6 +287,16 @@ fn convert_line(line: &str, in_comment: &mut bool, out: &mut String) {
         // Keep line structure even inside a multi-line comment.
         out.push('\n');
     }
+}
+
+/// Length of a `[label](url)` link at the start of `s`.
+fn markdown_link_len(s: &str) -> Option<usize> {
+    let close = s.find("](")?;
+    if s[1..close].contains('[') && !s[1..close].contains("\\[") {
+        return None;
+    }
+    let end = close + 2 + s[close + 2..].find(')')?;
+    Some(end + 1)
 }
 
 fn find_backtick_run(bytes: &[u8], len: usize) -> Option<usize> {
@@ -317,6 +397,22 @@ mod tests {
         assert_eq!(
             to_markdown_default("a\r\n[[b]]\r\n"),
             "a  \r\n[b](<wiki:b>)  \r\n"
+        );
+    }
+
+    #[test]
+    fn marks_highlights_people_tags() {
+        assert_eq!(
+            to_markdown_default("Ask @ika about ==rim light== #anim/polish ^a1"),
+            "Ask [@ika](<at:ika>) about [rim light](<hl:>) [\\#anim/polish](<tag:anim/polish>)"
+        );
+        // Not inside code, links, URLs or emails; not issue numbers.
+        let src = "`@x #y` [a #b](http://x.com/#c) https://x.com/#d bob@mail.com #42";
+        assert_eq!(to_markdown_default(src), src);
+        // Chips stay intact.
+        assert_eq!(
+            to_markdown_default("- [x] done @ika"),
+            "- [✅](<status:0>) done [@ika](<at:ika>)"
         );
     }
 

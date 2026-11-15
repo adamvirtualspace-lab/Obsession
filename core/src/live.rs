@@ -471,7 +471,7 @@ pub(crate) fn capitalize(s: &str) -> String {
 }
 
 /// Where a trailing ` ^id` starts (including the space before it).
-fn trailing_block_id(line: &str) -> Option<usize> {
+pub(crate) fn trailing_block_id(line: &str) -> Option<usize> {
     let trimmed = line.trim_end();
     let caret = trimmed.rfind('^')?;
     let id = &trimmed[caret + 1..];
@@ -480,7 +480,7 @@ fn trailing_block_id(line: &str) -> Option<usize> {
     (valid && spaced).then(|| line[..caret].trim_end().len())
 }
 
-fn word_start(bytes: &[u8], i: usize) -> bool {
+pub(crate) fn word_start(bytes: &[u8], i: usize) -> bool {
     i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
 }
 

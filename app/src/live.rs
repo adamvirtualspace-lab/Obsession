@@ -47,6 +47,8 @@ const PAGE_PADDING: (f32, f32) = (28.0, 40.0);
 /// How far above and below the visible part blocks are still built.
 const OVERSCAN: f32 = 900.0;
 const INDENT: f32 = 22.0;
+/// Text inset per `>` level of a quote.
+const QUOTE_INDENT: f32 = 16.0;
 
 pub fn editor_id() -> Id {
     Id::new("live-editor")
@@ -614,7 +616,7 @@ impl Live {
                     // layer) stretch to it.
                     let depth = f32::from(drawn.quote);
                     let text = container(element)
-                        .padding(iced::Padding::new(0.0).left(depth * 16.0))
+                        .padding(iced::Padding::new(0.0).left(depth * QUOTE_INDENT))
                         .width(Fill);
                     let bars = row((0..drawn.quote).map(|_| {
                         container(Space::new().width(3).height(Fill))
@@ -713,8 +715,24 @@ impl Live {
             .reveal(self.reveal, Message::Reveal);
 
         let top = if heading > 0 { 10.0 } else { 0.0 };
+        // Keep the text where it was drawn: shift the raw line right so its
+        // first character of text lines up with the drawn one, and the
+        // markup (`- [ ] `, `> `, indentation) appears to its left.
+        let left = if single {
+            let font = if heading > 0 {
+                Font {
+                    weight: Weight::Semibold,
+                    ..theme::UI_FONT
+                }
+            } else {
+                theme::UI_FONT
+            };
+            self.align_offset(range.start, font, heading_size(heading))
+        } else {
+            0.0
+        };
         let mut element: Element<'a, Message> = container(editor)
-            .padding(iced::Padding::new(0.0).top(top))
+            .padding(iced::Padding::new(0.0).top(top).left(left))
             .width(Fill)
             .into();
         if mono {
@@ -725,6 +743,60 @@ impl Live {
         }
         element
     }
+}
+
+impl Live {
+    /// How far right the raw line must start so that its text begins where
+    /// the drawn line's text begins (never negative: a heading's `## ` just
+    /// pushes its text right, as in Obsidian).
+    fn align_offset(&self, line: usize, font: Font, size: f32) -> f32 {
+        let Some(Rendered::Line(drawn)) = self.rendered.get(line) else {
+            return 0.0;
+        };
+        let raw = self.doc.line(line);
+        // The first piece of real text, and the raw byte it starts at.
+        let (before, raw_at) = match drawn
+            .segs
+            .iter()
+            .position(|s| s.verbatim && !s.text.is_empty())
+        {
+            Some(i) => (
+                drawn.segs[..i].iter().map(|s| s.text.as_str()).collect::<String>(),
+                drawn.segs[i].raw.start,
+            ),
+            None => (drawn.text(), raw.len()),
+        };
+        let drawn_x = f32::from(drawn.indent) * INDENT
+            + f32::from(drawn.quote) * QUOTE_INDENT
+            + text_width(&before, font, size);
+        let raw_x = text_width(&raw[..raw_at.min(raw.len())], font, size);
+        (drawn_x - raw_x).max(0.0)
+    }
+}
+
+/// The width of `text` as drawn (trailing spaces included).
+fn text_width(text: &str, font: Font, size: f32) -> f32 {
+    use iced::advanced::text::Paragraph as _;
+    type P = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+    if text.is_empty() {
+        return 0.0;
+    }
+    let measure = |content: &str| {
+        P::with_text(iced::advanced::Text {
+            content,
+            bounds: iced::Size::INFINITE,
+            size: iced::Pixels(size),
+            line_height: LINE_HEIGHT,
+            font,
+            align_x: iced::widget::text::Alignment::Default,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Advanced,
+            wrapping: iced::widget::text::Wrapping::None,
+        })
+        .min_width()
+    };
+    // A marker after the text keeps trailing spaces in the measurement.
+    measure(&format!("{text}|")) - measure("|")
 }
 
 /// Decides how each line is drawn from the blocks.
