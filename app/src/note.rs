@@ -13,7 +13,7 @@ use obsession_core::history::{EditKind, History, Snapshot};
 use obsession_core::status::{self, Format, Next, Source};
 use obsession_core::{preview, syntax};
 
-use crate::highlight::Statuses;
+use crate::highlight::{LinkStates, Statuses};
 use crate::live::{self, LINE_PX, Live};
 use crate::source_scroll::SourceScroll;
 use crate::theme;
@@ -94,6 +94,10 @@ pub struct LiveOutcome {
     pub focus: bool,
     /// Scroll the page by this much.
     pub scroll: Option<f32>,
+    /// A fresh editor appeared: lay the page out once more next frame (iced
+    /// works out the caret and selection shapes before the editor's mixed
+    /// fonts are applied, and only redoes them on the next layout).
+    pub settle: bool,
 }
 
 enum Body {
@@ -425,6 +429,75 @@ impl Note {
         self.task_at_line(line)
     }
 
+    // ---- Links ----
+
+    /// Sets how the note's links stand (re-colours them if that changed).
+    pub fn set_link_states(&mut self, states: LinkStates) {
+        if self.statuses.links == states {
+            return;
+        }
+        self.statuses.links = states.clone();
+        if let Body::Live(live) = &mut self.body {
+            live.links = states.clone();
+        }
+        if let Some(mirror) = &mut self.mirror {
+            mirror.links = states;
+        }
+    }
+
+    /// Shows `line` near the top: the caret goes there in Source, the page
+    /// scrolls there in Live and Reading.
+    pub fn jump_to(&mut self, line: usize) {
+        let line = line.min(self.line_count().saturating_sub(1));
+        match &mut self.body {
+            Body::Source(content) => {
+                let before = (content.cursor(), content.line_count());
+                content.move_to(Cursor {
+                    position: Position { line, column: 0 },
+                    selection: None,
+                });
+                self.track_source(before, false, None);
+            }
+            Body::Live(live) => {
+                live.deactivate();
+                self.sync.anchor = Some(Anchor {
+                    line,
+                    frac: 0.0,
+                    screen: 48.0,
+                });
+                self.sync_mirror();
+            }
+        }
+    }
+
+    /// Puts new text in (another note was renamed and this note's links to
+    /// it were rewritten). Undo can bring the old text back.
+    pub fn replace_text(&mut self, text: &str) {
+        self.record(EditKind::Other);
+        match &mut self.body {
+            Body::Live(live) => live.reload(text, &self.format),
+            Body::Source(content) => {
+                let cursor = content.cursor().position;
+                *content = text_editor::Content::with_text(text);
+                let line = cursor.line.min(content.line_count().saturating_sub(1));
+                let len = content.line(line).map_or(0, |l| l.text.len());
+                content.move_to(Cursor {
+                    position: Position {
+                        line,
+                        column: cursor.column.min(len),
+                    },
+                    selection: None,
+                });
+                self.scroll.reset();
+            }
+        }
+        self.history.break_group();
+        self.preview_stale = true;
+        if self.mirror.is_some() {
+            self.refresh_preview_if_stale();
+        }
+    }
+
     // ---- Split: keeping both panes at the same place ----
 
     /// The Source editor's text area (its size minus padding).
@@ -501,42 +574,53 @@ impl Note {
         self.sync_mirror();
     }
 
-    /// Asks for the Split view to be scrolled to its anchor.
+    /// The Live view on screen, if any: the note's own, or Split's.
+    fn shown_live_ref(&self) -> Option<&Live> {
+        match &self.body {
+            Body::Live(live) => Some(live),
+            Body::Source(_) => self.mirror.as_ref(),
+        }
+    }
+
+    /// Asks for the Live view on screen to be scrolled to the anchor.
     fn sync_mirror(&mut self) {
-        let (Some(mirror), Some(anchor)) = (&self.mirror, self.sync.anchor) else {
+        let (Some(live), Some(anchor)) = (self.shown_live_ref(), self.sync.anchor) else {
             return;
         };
-        let target = (mirror.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
+        let target = (live.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
         self.sync.pending = Some(target);
         self.sync.expect = Some(target);
         self.sync.tries = 0;
     }
 
-    /// A scroll the app should send to Split's view, if one is due.
+    /// A scroll the app should send to the Live view, if one is due.
     pub fn take_mirror_scroll(&mut self) -> Option<f32> {
         self.sync.pending.take()
     }
 
-    /// Split's view scrolled: either our own scroll arriving (corrected if
+    /// The Live view scrolled: either our own scroll arriving (corrected if
     /// lines measured on the way changed the target), or the user scrolling
-    /// it, which scrolls the editor to match.
-    fn mirror_scrolled(&mut self, viewport: iced::widget::scrollable::Viewport) {
-        let Some(mirror) = &mut self.mirror else {
+    /// it, which in Split scrolls the editor to match.
+    fn view_scrolled(&mut self, viewport: iced::widget::scrollable::Viewport) {
+        let anchor = self.sync.anchor;
+        let expect = self.sync.expect;
+        let tries = self.sync.tries;
+        let Some(live) = self.shown_live() else {
             return;
         };
-        let previous = mirror.viewport().0;
-        mirror.scrolled(viewport);
+        let previous = live.viewport().0;
+        live.scrolled(viewport);
         let y = viewport.absolute_offset().y;
         let max = (viewport.content_bounds().height - viewport.bounds().height).max(0.0);
 
-        if let Some(expect) = self.sync.expect {
+        if let Some(expect) = expect {
             let ours = (y - expect).abs() < 1.5 || (expect >= max - 1.0 && y >= max - 1.0);
             if ours {
                 // Lines drawn on the way may have changed the target.
-                if let Some(anchor) = self.sync.anchor
-                    && self.sync.tries < 3
+                if let Some(anchor) = anchor
+                    && tries < 3
                 {
-                    let target = (mirror.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
+                    let target = (live.y_of(anchor.line, anchor.frac) - anchor.screen).max(0.0);
                     if (target.min(max) - y).abs() > 2.0 {
                         self.sync.tries += 1;
                         self.sync.pending = Some(target);
@@ -551,10 +635,12 @@ impl Note {
             return;
         }
 
-        // The user scrolled the view: bring the editor's middle to match.
+        // The user scrolled: stop steering, and in Split bring the editor's
+        // middle to match.
+        let middle = live.at(y + viewport.bounds().height / 2.0);
         self.sync.expect = None;
         self.sync.anchor = None;
-        let (line, frac) = mirror.at(y + viewport.bounds().height / 2.0);
+        let (line, frac) = middle;
         let area = self.text_area();
         let Body::Source(content) = &mut self.body else {
             return;
@@ -648,10 +734,18 @@ impl Note {
                 }
             }
             live::Message::Reveal(dy) => outcome.scroll = Some(dy),
-            live::Message::Scrolled(viewport) => match &mut self.body {
-                Body::Live(live) => live.scrolled(viewport),
-                Body::Source(_) => self.mirror_scrolled(viewport),
-            },
+            live::Message::Scrolled(viewport) => self.view_scrolled(viewport),
+            live::Message::DragAt { line, cell, offset } => {
+                if let Body::Live(live) = &mut self.body {
+                    live.drag_to(line, cell, offset);
+                }
+            }
+            live::Message::MouseUp => {
+                if let Body::Live(live) = &mut self.body {
+                    outcome.focus = live.release();
+                    outcome.settle = outcome.focus;
+                }
+            }
             live::Message::Background => {
                 let Body::Live(live) = &mut self.body else {
                     return outcome;

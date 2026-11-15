@@ -15,6 +15,8 @@ use crate::theme;
 pub enum Message {
     Toggle(u32),
     Open(u32),
+    /// Right-click on a note: rename it.
+    Rename(u32),
     Scrolled(Viewport),
 }
 
@@ -112,13 +114,19 @@ impl Tree {
             .align_y(iced::Center);
             let label = container(label).width(Fill).clip(true);
 
-            button(label)
+            let row = button(label)
                 .on_press(message)
                 .padding([0, 4])
                 .height(theme::ROW_HEIGHT)
                 .width(Fill)
-                .style(theme::row(selected))
-                .into()
+                .style(theme::row(selected));
+            match entry.kind {
+                // Right-click a note to rename it.
+                Kind::Note => iced::widget::mouse_area(row)
+                    .on_right_press(Message::Rename(index))
+                    .into(),
+                Kind::Folder => row.into(),
+            }
         });
 
         let above = first as f32 * theme::ROW_HEIGHT;

@@ -8,10 +8,12 @@
 //! - [`fuzzy`]: matching for the quick switcher.
 //! - [`syntax`]: line-by-line markdown tokens for editor highlighting.
 //! - [`status`]: tasks, status formats and what a click changes.
+//! - [`links`]: links in a note, the vault's link index, renames.
 
 pub mod doc;
 pub mod fuzzy;
 pub mod history;
+pub mod links;
 pub mod live;
 pub mod preview;
 pub mod status;

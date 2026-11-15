@@ -4,6 +4,7 @@
 //! obsession-bench gen  <dir> <notes>   write a test vault (refuses a non-empty dir)
 //! obsession-bench scan <dir>           time a vault scan
 //! obsession-bench read <dir>           time reading every note through the store, twice
+//! obsession-bench links <dir>          time building the link index and backlink lookups
 //! ```
 
 use std::fs;
@@ -24,7 +25,8 @@ fn main() {
         },
         [cmd, dir] if cmd == "scan" => scan(Path::new(dir)),
         [cmd, dir] if cmd == "read" => read(Path::new(dir)),
-        _ => Err("usage: obsession-bench gen <dir> <notes> | scan <dir> | read <dir>".into()),
+        [cmd, dir] if cmd == "links" => links(Path::new(dir)),
+        _ => Err("usage: obsession-bench gen <dir> <notes> | scan <dir> | read <dir> | links <dir>".into()),
     };
     if let Err(error) = result {
         eprintln!("{error}");
@@ -107,5 +109,21 @@ fn read(dir: &Path) -> Result<(), String> {
             store.bytes_in_ram() / 1024
         );
     }
+    Ok(())
+}
+
+fn links(dir: &Path) -> Result<(), String> {
+    let vault = Vault::scan(dir).map_err(|e| e.to_string())?;
+    let rels: Vec<&str> = vault.notes().map(|e| &*e.rel).collect();
+    let start = Instant::now();
+    let index = obsession_core::links::LinkIndex::build(dir, rels.iter().copied());
+    println!("indexed {} notes in {:.0?}", index.len(), start.elapsed());
+    let start = Instant::now();
+    let mut total = 0;
+    for rel in rels.iter().take(1000) {
+        total += index.backlinks(rel, &vault).len();
+    }
+    let n = rels.len().min(1000);
+    println!("backlinks for {n} notes in {:.0?} ({total} found)", start.elapsed());
     Ok(())
 }

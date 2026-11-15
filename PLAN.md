@@ -62,7 +62,8 @@ obsession/
   bench/                package "obsession-bench": test vault generator + timings
   core/                 package "obsession-core": no UI, fully testable
     src/
-      vault.rs          scan folders, index files, link resolution (shortest name)
+      vault.rs          scan folders, name/path lookups, Obsidian link resolution
+      links.rs          links in a note, outlines, the link index, rename rewrites
       store.rs          file store: files in RAM, pinning, budget, disk counters
       syntax.rs         line tokens for editor highlighting
       preview.rs        Obsidian syntax -> plain markdown (unused by the app now; kept for export)
@@ -95,7 +96,8 @@ obsession/
       highlight.rs      iced highlighter on top of core's syntax.rs, status colours
       status_menu.rs    right-click status menu
       right_click.rs    wrapper that reports where a right-click landed
-      new_note.rs       new-note box (Ctrl+N)
+      new_note.rs       new-note box (Ctrl+N), also the rename box (F2)
+      backlinks.rs      backlinks panel
       live.rs           Live Preview: drawn blocks + the active block's editor
       source_scroll.rs  where the Source editor is scrolled to (for Split)
       live_text.rs      a drawn line: styled spans, click → character offset
@@ -271,7 +273,9 @@ How Live Preview works:
 
 Known limits, for later:
 
-- Selecting text across several blocks isn't possible in Live; use Source.
+- Selecting by dragging works in Live, but the page doesn't scroll by itself
+  when you drag past its top or bottom edge yet (scroll with the wheel while
+  holding the button). Selecting text in Reading isn't possible yet.
 - Up/Down through a blank line forgets the column.
 - The scrollbar can shift slightly while scrolling a long note for the first
   time, as estimated heights are replaced by measured ones.
@@ -280,6 +284,44 @@ Known limits, for later:
 How to measure: `cargo build -p obsession --profile measure` builds a release
 binary that keeps the debug-only hooks in `app/src/dev.rs`, then read the
 process's working set, CPU time and I/O counters (see the README).
+
+### Links (milestone 3)
+
+| What | Measured |
+|---|---|
+| Building the link index, 10,000 notes (3.5 MB), background thread | **0.86 s** |
+| Backlinks of one note, 10,000-note vault | **57 µs** |
+| Resolving a link | hash lookups by name and path, not a scan of the vault |
+
+How it works:
+
+- **Resolution** (`core/src/vault.rs`): `./` and `../` relative paths, then
+  an exact path from the root or from the linking note's folder, then every
+  note whose path ends with the target. Several matches are ambiguous; we open
+  the one Obsidian would (the linking note's folder first, then the shortest
+  path, then alphabetical) and draw the link amber. Images and other files
+  count as attachments, not missing notes.
+- **The index** (`core/src/links.rs`) keeps per note only its outgoing links
+  (target, line, a 160-character snippet) and its headings and block ids,
+  plus a name -> linking notes map, so backlinks only resolve links whose
+  name could match. It's read once when a vault opens, off the UI thread,
+  and each note is re-indexed when it's saved.
+- **Link colours** come from one map per open note (`dest_key` -> state),
+  re-checked 150 ms after typing stops and shared by Source highlighting,
+  Live, Reading and Split.
+- **Rename** saves the open note, moves the file, then rewrites and saves
+  (atomically) each note the index says links to it, re-indexes them and
+  re-reads the folder.
+
+Known limits, for later:
+
+- Folders can't be renamed yet, only notes (moving a note into another folder
+  works).
+- Relative markdown links *inside* a moved note aren't adjusted.
+- Attachments open from the vault root only (they aren't scanned yet).
+- Backlink snippets show the raw line, and unlinked mentions aren't listed.
+- Edits made by other apps reach the index when the file watcher arrives
+  (milestone 6).
 
 ### Drawing: only when something changes
 
@@ -483,7 +525,7 @@ performance budgets checked.
 | 1 | **Vault and editor** ✅ | Open a folder, file tree, raw editor with highlighting, preview, autosave, theme, quick switcher |
 | 2 | **Tasks and statuses** ✅ | Status chips in editor and preview, click to advance, right-click menu, status formats, ⚠ for unknown characters |
 | 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source, Split and Reading views, undo/redo |
-| 3 | **Links** | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
+| 3 | **Links** ✅ | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
 | 6 | **Running functions** | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |

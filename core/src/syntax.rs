@@ -204,6 +204,12 @@ fn opens_fence(line: &str) -> Option<(u8, u8)> {
 }
 
 fn is_heading(line: &str) -> bool {
+    // Up to three spaces may come first, as in Obsidian.
+    let lead = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if lead > 3 {
+        return false;
+    }
+    let line = &line[lead..];
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     (1..=6).contains(&hashes) && matches!(line.as_bytes().get(hashes), None | Some(b' ' | b'\t'))
 }

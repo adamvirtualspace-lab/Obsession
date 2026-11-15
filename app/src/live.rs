@@ -28,7 +28,7 @@ use obsession_core::live::{self, Block, BlockKind, Line as Drawn, Style};
 use obsession_core::status::Format;
 use obsession_core::syntax::LineState;
 
-use crate::highlight::{self, Statuses};
+use crate::highlight::{self, LinkStates, Statuses};
 use crate::live_text::{LiveText, Press};
 use crate::right_click::right_click;
 use crate::theme;
@@ -88,6 +88,23 @@ pub enum Message {
     /// A click below the last line.
     Background,
     Scrolled(scrollable::Viewport),
+    /// While selecting: the cursor moved over a drawn line, to this offset
+    /// of its drawn text.
+    DragAt {
+        line: usize,
+        cell: Option<usize>,
+        offset: usize,
+    },
+    /// The left mouse button went up (anywhere in the window).
+    MouseUp,
+}
+
+/// A selection being dragged across drawn lines: (doc line, byte column).
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    moved: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +156,12 @@ pub struct Live {
     /// Reading mode and Split's mirror: links and status chips click, but
     /// nothing starts editing.
     pub read_only: bool,
+    /// How each `[[link]]` stands, for its colour.
+    pub links: LinkStates,
+    /// A selection being dragged, until the button goes up.
+    drag: Option<Drag>,
+    /// The button went down in the editor (a drag may leave it).
+    editor_pressed: bool,
 }
 
 impl Live {
@@ -154,6 +177,9 @@ impl Live {
             heights: Vec::new(),
             scroll: (0.0, 1600.0),
             read_only: false,
+            links: LinkStates::default(),
+            drag: None,
+            editor_pressed: false,
         };
         live.rebuild(format);
         live
@@ -264,7 +290,18 @@ impl Live {
     /// Applies an editor action; returns whether the text changed.
     pub fn perform(&mut self, action: Action, format: &Format) -> bool {
         let is_edit = action.is_edit();
+        let click = matches!(action, Action::Click(_));
+        let drag = matches!(action, Action::Drag(_));
         self.content.perform(action);
+        if click {
+            self.editor_pressed = true;
+        }
+        // A selection that left the editor and came back into it.
+        let cursor = self.cursor();
+        if drag && let Some(selection) = &mut self.drag {
+            selection.head = cursor;
+            selection.moved = true;
+        }
         if is_edit {
             self.sync_from_editor(format);
             self.reveal += 1;
@@ -412,10 +449,106 @@ impl Live {
         if press.right || self.read_only {
             return None;
         }
+        // Editing starts when the button goes up: a drag selects instead.
         let raw_len = self.doc.line(line).len();
         let column = drawn.map_or(raw_len, |d| d.raw_offset(press.offset, raw_len));
-        self.activate(line, column);
+        self.drag = Some(Drag {
+            anchor: (line, column),
+            head: (line, column),
+            moved: false,
+        });
         None
+    }
+
+    /// Whether a selection may be dragged now (drawn lines then report
+    /// where the cursor is).
+    fn dragging(&self) -> bool {
+        self.drag.is_some() || self.editor_pressed
+    }
+
+    /// The cursor moved over a drawn line while the button is down.
+    pub fn drag_to(&mut self, line: usize, cell: Option<usize>, offset: usize) {
+        let drawn = match (self.rendered.get(line), cell) {
+            (Some(Rendered::Line(d)), _) => Some(d),
+            (Some(Rendered::Cells(cells)), Some(c)) => cells.get(c),
+            _ => None,
+        };
+        let raw_len = self.doc.line(line).len();
+        let column = drawn.map_or(raw_len, |d| d.raw_offset(offset, raw_len));
+        if self.drag.is_none() && self.editor_pressed && self.active.is_some() {
+            // The drag began in the editor: its anchor is where it began.
+            let start = self.active.as_ref().map_or(0, |r| r.start);
+            let cursor = self.content.cursor();
+            let anchor = cursor.selection.unwrap_or(cursor.position);
+            self.drag = Some(Drag {
+                anchor: (start + anchor.line, anchor.column),
+                head: (line, column),
+                moved: false,
+            });
+        }
+        if let Some(drag) = &mut self.drag {
+            drag.head = (line, column);
+            drag.moved |= drag.head != drag.anchor;
+        }
+    }
+
+    /// The button went up. A plain click starts editing where it landed; a
+    /// drag edits every line it covered, with that text selected. Returns
+    /// whether the editor should take the keyboard.
+    pub fn release(&mut self) -> bool {
+        self.editor_pressed = false;
+        let Some(drag) = self.drag.take() else {
+            return false;
+        };
+        if !drag.moved {
+            self.activate(drag.anchor.0, drag.anchor.1);
+            return true;
+        }
+        self.select(drag.anchor, drag.head);
+        true
+    }
+
+    /// Edits the blocks from `anchor`'s line to `head`'s with the text
+    /// between them selected (copy, cut, typing and Delete then work as in
+    /// any editor).
+    fn select(&mut self, anchor: (usize, usize), head: (usize, usize)) {
+        let last = self.doc.len().saturating_sub(1);
+        let (anchor, head) = ((anchor.0.min(last), anchor.1), (head.0.min(last), head.1));
+        let (lo, hi) = (anchor.0.min(head.0), anchor.0.max(head.0));
+        let start = self.block_of(lo).map_or(lo, |b| b.lines.start.min(lo));
+        let end = self.block_of(hi).map_or(hi + 1, |b| b.lines.end.max(hi + 1));
+        self.content = text_editor::Content::with_text(&self.doc.joined(start..end));
+        let position = |(line, column): (usize, usize)| {
+            let text = self.doc.line(line);
+            Position {
+                line: line - start,
+                column: floor_char_boundary(text, column.min(text.len())),
+            }
+        };
+        let (head, anchor) = (position(head), position(anchor));
+        self.content.move_to(Cursor {
+            position: head,
+            selection: Some(anchor),
+        });
+        self.active = Some(start..end);
+        self.reveal += 1;
+    }
+
+    /// The raw bytes of `line` inside the selection being dragged.
+    fn selected(&self, line: usize) -> Option<Range<usize>> {
+        let drag = self.drag.filter(|d| d.moved)?;
+        let (from, to) = if drag.anchor <= drag.head {
+            (drag.anchor, drag.head)
+        } else {
+            (drag.head, drag.anchor)
+        };
+        if line < from.0 || line > to.0 {
+            return None;
+        }
+        let len = self.doc.line(line).len();
+        let start = if line == from.0 { from.1.min(len) } else { 0 };
+        let end = if line == to.0 { to.1.min(len) } else { len };
+        (start < end).then_some(start..end)
     }
 
     /// Changes one line from outside the editor (a status click).
@@ -493,7 +626,7 @@ impl Live {
         // Only the empty space below the last line starts editing at the
         // end; margins and the gaps between lines do nothing.
         let space = Space::new().width(Fill).height(Length::Fixed(240.0));
-        let below: Element<'a, Message> = if self.read_only {
+        let below: Element<'a, Message> = if self.read_only || self.dragging() {
             space.into()
         } else {
             mouse_area(space)
@@ -639,10 +772,15 @@ impl Live {
                 let header = self.roles[line] == Role::TableHeader;
                 row(cells.iter().enumerate().map(|(c, drawn)| {
                     container(
-                        LiveText::new(spans(drawn, 0, header, theme::UI_FONT), move |press| Message::Press {
+                        LiveText::new(spans(drawn, 0, header, theme::UI_FONT, &self.links, None), move |press| Message::Press {
                             line,
                             cell: Some(c),
                             press,
+                        })
+                        .on_drag(self.dragging(), move |offset| Message::DragAt {
+                            line,
+                            cell: Some(c),
+                            offset,
                         })
                         .size(TEXT_SIZE - 1.0)
                         .line_height(LINE_HEIGHT)
@@ -668,12 +806,19 @@ impl Live {
                 }
                 let size = heading_size(drawn.heading);
                 let base = if mono { theme::MONO_FONT } else { theme::UI_FONT };
-                let mut widget = LiveText::new(spans(drawn, drawn.heading, false, base), move |press| {
-                    Message::Press {
+                let selected = self.selected(line).and_then(|raw| drawn_range(drawn, raw));
+                let mut widget = LiveText::new(
+                    spans(drawn, drawn.heading, false, base, &self.links, selected),
+                    move |press| Message::Press {
                         line,
                         cell: None,
                         press,
-                    }
+                    },
+                )
+                .on_drag(self.dragging(), move |offset| Message::DragAt {
+                    line,
+                    cell: None,
+                    offset,
                 })
                 .measure(&self.heights[line])
                 .size(if mono { CODE_SIZE } else { size })
@@ -728,9 +873,16 @@ impl Live {
             .filter(|b| b.lines == range)
             .map_or(BlockKind::Line, |b| b.kind);
         let single = kind == BlockKind::Line && range.len() == 1;
+        // A selection over ordinary lines edits them as plain text; code,
+        // tables and the frontmatter keep the monospace box.
+        let plain = self
+            .blocks
+            .iter()
+            .filter(|b| b.lines.start < range.end && range.start < b.lines.end)
+            .all(|b| b.kind == BlockKind::Line);
         let first_line = self.doc.line(range.start);
-        let heading = heading_level(first_line);
-        let mono = !single;
+        let heading = if single { heading_level(first_line) } else { 0 };
+        let mono = !plain;
 
         let cursor = self.content.cursor();
         let last = self.content.line_count().saturating_sub(1);
@@ -1026,75 +1178,158 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 
 /// Turns a drawn line into styled spans. Spans with an action carry their
 /// piece index as the link, so presses can tell what was hit.
-fn spans(drawn: &Drawn, heading: u8, header: bool, base: Font) -> Vec<Span<'_, usize, Font>> {
+/// Where a raw byte range of a line falls in its drawn text. Pieces drawn
+/// differently from the raw text (chips, aliases) count whole.
+fn drawn_range(drawn: &Drawn, raw: Range<usize>) -> Option<Range<usize>> {
+    let mut at = 0;
+    let mut out: Option<Range<usize>> = None;
+    for seg in &drawn.segs {
+        let len = seg.text.len();
+        if seg.raw.start < raw.end && raw.start < seg.raw.end.max(seg.raw.start + 1) && len > 0 {
+            let (a, b) = if seg.verbatim {
+                let a = raw.start.saturating_sub(seg.raw.start).min(len);
+                let b = (raw.end - seg.raw.start).min(len);
+                (floor_char_boundary(&seg.text, a), floor_char_boundary(&seg.text, b))
+            } else {
+                (0, len)
+            };
+            if a < b {
+                let piece = at + a..at + b;
+                out = Some(match out {
+                    Some(r) => r.start.min(piece.start)..r.end.max(piece.end),
+                    None => piece,
+                });
+            }
+        }
+        at += len;
+    }
+    out
+}
+
+fn spans<'a>(
+    drawn: &'a Drawn,
+    heading: u8,
+    header: bool,
+    base: Font,
+    links: &LinkStates,
+    selected: Option<Range<usize>>,
+) -> Vec<Span<'a, usize, Font>> {
+    let mut at = 0;
     drawn
         .segs
         .iter()
         .enumerate()
-        .map(|(index, seg)| {
-            let s = seg.style;
-            let mut font = if heading > 0 || header || s.has(Style::BOLD) {
-                Font {
-                    weight: if s.has(Style::BOLD) { Weight::Bold } else { Weight::Semibold },
-                    ..base
+        .flat_map(|(index, seg)| {
+            // The selection splits a piece into up to three spans.
+            let start = at;
+            at += seg.text.len();
+            let mut cuts = vec![0, seg.text.len()];
+            if let Some(sel) = &selected {
+                for edge in [sel.start, sel.end] {
+                    if edge > start && edge < at {
+                        cuts.push(edge - start);
+                    }
                 }
-            } else {
-                base
-            };
-            if s.has(Style::ITALIC) {
-                font.style = FontStyle::Italic;
             }
-            let mut color = if heading > 0 { theme::HEADING } else { theme::TEXT };
-            let mut span = Span::new(seg.text.as_str());
-            if s.has(Style::CODE) {
-                font = theme::MONO_FONT;
-                color = theme::CODE;
-            }
-            if s.has(Style::LINK) {
-                color = theme::LINK;
-            }
-            if s.has(Style::TAG) {
-                color = theme::TAG;
-            }
-            if s.has(Style::MENTION) {
-                color = theme::MENTION;
-            }
-            if s.has(Style::MARKER) || s.has(Style::FAINT) {
-                color = theme::MUTED;
-            }
-            if s.has(Style::DONE) && !s.has(Style::CHIP) {
-                color = theme::MUTED;
-                span = span.strikethrough(true);
-            }
-            if s.has(Style::UNKNOWN) {
-                color = theme::WARNING;
-            }
-            if s.has(Style::STRIKE) {
-                span = span.strikethrough(true);
-            }
-            if s.has(Style::HIGHLIGHT) {
-                span = span.background(Background::Color(theme::HIGHLIGHT_BG)).padding([0, 2]);
-            }
-            if s.has(Style::CODE) {
-                span = span
-                    .background(Background::Color(theme::RAISED))
-                    .border(Border {
-                        radius: 3.0.into(),
-                        ..Border::default()
-                    })
-                    .padding([0, 3]);
-            }
-            if s.has(Style::CALLOUT) {
-                color = callout_color(drawn.callout.as_deref());
-            }
-            let span = span.font(font).color(color);
-            if seg.action.is_some() {
-                span.link(index)
-            } else {
-                span
-            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            let pieces: Vec<(Range<usize>, bool)> = cuts
+                .windows(2)
+                .map(|w| {
+                    let inside = selected
+                        .as_ref()
+                        .is_some_and(|sel| start + w[0] >= sel.start && start + w[1] <= sel.end);
+                    (w[0]..w[1], inside)
+                })
+                .collect();
+            let pieces = if pieces.is_empty() { vec![(0..0, false)] } else { pieces };
+            pieces
+                .into_iter()
+                .map(move |(range, inside)| styled(drawn, seg, index, &seg.text[range], heading, header, base, links, inside))
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn styled<'a>(
+    drawn: &Drawn,
+    seg: &live::Seg,
+    index: usize,
+    piece: &'a str,
+    heading: u8,
+    header: bool,
+    base: Font,
+    links: &LinkStates,
+    selected: bool,
+) -> Span<'a, usize, Font> {
+    let s = seg.style;
+    let mut font = if heading > 0 || header || s.has(Style::BOLD) {
+        Font {
+            weight: if s.has(Style::BOLD) { Weight::Bold } else { Weight::Semibold },
+            ..base
+        }
+    } else {
+        base
+    };
+    if s.has(Style::ITALIC) {
+        font.style = FontStyle::Italic;
+    }
+    let mut color = if heading > 0 { theme::HEADING } else { theme::TEXT };
+    let mut span = Span::new(piece);
+    if s.has(Style::CODE) {
+        font = theme::MONO_FONT;
+        color = theme::CODE;
+    }
+    if s.has(Style::LINK) {
+        color = match &seg.action {
+            Some(live::Action::Wiki(dest)) => highlight::link_color(links.get(dest)),
+            _ => theme::LINK,
+        };
+    }
+    if s.has(Style::TAG) {
+        color = theme::TAG;
+    }
+    if s.has(Style::MENTION) {
+        color = theme::MENTION;
+    }
+    if s.has(Style::MARKER) || s.has(Style::FAINT) {
+        color = theme::MUTED;
+    }
+    if s.has(Style::DONE) && !s.has(Style::CHIP) {
+        color = theme::MUTED;
+        span = span.strikethrough(true);
+    }
+    if s.has(Style::UNKNOWN) {
+        color = theme::WARNING;
+    }
+    if s.has(Style::STRIKE) {
+        span = span.strikethrough(true);
+    }
+    if s.has(Style::HIGHLIGHT) {
+        span = span.background(Background::Color(theme::HIGHLIGHT_BG)).padding([0, 2]);
+    }
+    if s.has(Style::CODE) {
+        span = span
+            .background(Background::Color(theme::RAISED))
+            .border(Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            })
+            .padding([0, 3]);
+    }
+    if s.has(Style::CALLOUT) {
+        color = callout_color(drawn.callout.as_deref());
+    }
+    if selected {
+        span = span.background(Background::Color(theme::SELECTION)).padding(0);
+    }
+    let span = span.font(font).color(color);
+    if seg.action.is_some() {
+        span.link(index)
+    } else {
+        span
+    }
 }
 
 #[cfg(test)]

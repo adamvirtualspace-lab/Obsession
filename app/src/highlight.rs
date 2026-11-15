@@ -3,21 +3,48 @@
 //! The editor re-highlights from the first edited line downward, and only
 //! for the lines it lays out, so typing costs a few lines of work.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use iced::advanced::text::highlighter::{self, Format};
 use iced::{Font, Theme};
 
+use obsession_core::links::{self, LinkState};
 use obsession_core::status;
 use obsession_core::syntax::{Kind, LineState, scan_line};
 
 use crate::theme;
 
-/// What the highlighter needs from the note's status format. When it
-/// changes (someone edits `statuses:`), the whole note is re-coloured.
+/// How each `[[link]]` in the open note stands (keyed by
+/// [`links::dest_key`]), shared by the editor, Live Preview and Split.
+#[derive(Debug, Clone, Default)]
+pub struct LinkStates(Arc<HashMap<String, LinkState>>);
+
+impl LinkStates {
+    pub fn new(map: HashMap<String, LinkState>) -> Self {
+        Self(Arc::new(map))
+    }
+
+    /// The state of a link to `dest` (`target#sub`, maybe `|alias`).
+    /// Unknown links (typed since the last check) count as fine.
+    pub fn get(&self, dest: &str) -> LinkState {
+        self.0.get(&links::dest_key(dest)).copied().unwrap_or(LinkState::Ok)
+    }
+}
+
+impl PartialEq for LinkStates {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+/// What the highlighter needs from the note: its status format and its
+/// links' states. When either changes, the whole note is re-coloured.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statuses {
     format: status::Format,
+    pub links: LinkStates,
     /// The state of the editor's first line: `Start` for a whole note, and
     /// `Normal` for a Live Preview block in the middle of one.
     first: LineState,
@@ -27,6 +54,7 @@ impl Statuses {
     pub fn new(format: &status::Format) -> Self {
         Self {
             format: format.clone(),
+            links: LinkStates::default(),
             first: LineState::Start,
         }
     }
@@ -43,6 +71,7 @@ pub enum Mark {
     Open,
     Finished,
     Unknown,
+    Link(LinkState),
 }
 
 pub struct Markdown {
@@ -99,6 +128,14 @@ impl highlighter::Highlighter for Markdown {
                             Some(_) => Mark::Open,
                         }
                     }
+                    Kind::Link => {
+                        let text = &line[range.clone()];
+                        let inner = text.trim_start_matches('!');
+                        match inner.strip_prefix("[[").and_then(|i| i.strip_suffix("]]")) {
+                            Some(dest) => Mark::Link(self.statuses.links.get(dest)),
+                            None => Mark::Syntax(Kind::Link),
+                        }
+                    }
                     kind => Mark::Syntax(kind),
                 };
                 (range, mark)
@@ -123,11 +160,22 @@ pub fn is_markup(kind: Kind) -> bool {
 pub fn live_format(mark: &Mark, theme: &Theme) -> Format<Font> {
     let markup = match mark {
         Mark::Open | Mark::Finished | Mark::Unknown => true,
+        Mark::Link(_) => false,
         Mark::Syntax(kind) => is_markup(*kind),
     };
     Format {
         font: markup.then_some(theme::MONO_FONT),
         ..format(mark, theme)
+    }
+}
+
+/// A link's colour: normal, dim when the note doesn't exist yet, amber
+/// when it's ambiguous or its `#heading` is missing.
+pub fn link_color(state: LinkState) -> iced::Color {
+    match state {
+        LinkState::Ok => theme::LINK,
+        LinkState::Missing => theme::LINK_MISSING,
+        LinkState::Ambiguous | LinkState::MissingSection => theme::WARNING,
     }
 }
 
@@ -138,6 +186,7 @@ pub fn format(mark: &Mark, _: &Theme) -> Format<Font> {
         Mark::Open => theme::ACCENT,
         Mark::Finished => theme::SUCCESS,
         Mark::Unknown => theme::DANGER,
+        Mark::Link(state) => link_color(*state),
         Mark::Syntax(kind) => match kind {
             Kind::Heading => theme::HEADING,
             Kind::ListMarker | Kind::Quote | Kind::Frontmatter => theme::MUTED,

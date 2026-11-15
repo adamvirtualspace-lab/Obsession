@@ -22,6 +22,8 @@ pub const WARNING: Color = color!(0xd29922);
 pub const DANGER: Color = color!(0xf85149);
 pub const HEADING: Color = color!(0xe6edf3);
 pub const LINK: Color = color!(0x58a6ff);
+/// A link to a note that doesn't exist yet (a click creates it).
+pub const LINK_MISSING: Color = color!(0x3d6a9e);
 pub const MENTION: Color = color!(0xd2a8ff);
 pub const TAG: Color = color!(0x7ee787);
 pub const CODE: Color = color!(0xffa657);
@@ -218,3 +220,8 @@ pub fn quote_bar(_: &Theme) -> container::Style {
 }
 
 pub const HIGHLIGHT_BG: Color = color!(0x5a4a12);
+/// Selected text (the editors use the same colour).
+pub const SELECTION: Color = Color {
+    a: 0.35,
+    ..ACCENT
+};

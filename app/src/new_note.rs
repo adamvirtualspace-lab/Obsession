@@ -1,5 +1,6 @@
 //! The "new note" box (Ctrl+N): starts with the open note's folder filled
 //! in, so typing a name and pressing Enter creates the note next to it.
+//! The same box renames a note (F2, or right-click in the file tree).
 
 use iced::widget::{Id, column, container, opaque, text, text_input};
 use iced::{Element, Fill, Length};
@@ -17,10 +18,18 @@ pub enum Message {
     Close,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Purpose {
+    New,
+    /// Rename the note at this path.
+    Rename(Box<str>),
+}
+
 #[derive(Debug)]
 pub struct NewNote {
     pub input: String,
     pub error: Option<String>,
+    pub purpose: Purpose,
 }
 
 impl NewNote {
@@ -31,7 +40,20 @@ impl NewNote {
         } else {
             format!("{folder}/")
         };
-        Self { input, error: None }
+        Self {
+            input,
+            error: None,
+            purpose: Purpose::New,
+        }
+    }
+
+    /// Starts with the note's current path (without `.md`) to edit.
+    pub fn rename(rel: &str) -> Self {
+        Self {
+            input: rel.strip_suffix(".md").unwrap_or(rel).to_owned(),
+            error: None,
+            purpose: Purpose::Rename(rel.into()),
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -43,16 +65,25 @@ impl NewNote {
             .size(15)
             .style(theme::search);
 
+        let renaming = matches!(self.purpose, Purpose::Rename(_));
         let hint = match &self.error {
             Some(error) => text(error.as_str()).size(theme::SMALL).color(theme::WARNING),
-            None => text("Enter to create · Esc to cancel · / makes folders")
-                .size(theme::SMALL)
-                .color(theme::MUTED),
+            None => text(if renaming {
+                "Enter to rename (links to it are updated) · Esc to cancel · / moves it"
+            } else {
+                "Enter to create · Esc to cancel · / makes folders"
+            })
+            .size(theme::SMALL)
+            .color(theme::MUTED),
+        };
+        let title = match &self.purpose {
+            Purpose::New => "New note".to_owned(),
+            Purpose::Rename(rel) => format!("Rename {rel}"),
         };
 
         let panel = container(
             column![
-                text("New note").size(theme::SMALL).color(theme::MUTED),
+                text(title).size(theme::SMALL).color(theme::MUTED),
                 input,
                 hint
             ]

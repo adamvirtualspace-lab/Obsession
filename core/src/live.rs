@@ -610,7 +610,12 @@ fn inline(raw: &str, start: usize, end: usize, style: Style, out: &mut Vec<Seg>)
                         action: link,
                     }),
                     _ => out.push(Seg {
-                        text: alias.map_or_else(|| target.replace('#', " > "), str::to_owned),
+                        // `[[note#Part]]` reads "note > Part"; `[[#Part]]`
+                        // (this note) just "Part".
+                        text: alias.map_or_else(
+                            || target.trim_start_matches('#').replace('#', " > "),
+                            str::to_owned,
+                        ),
                         raw: whole.clone(),
                         verbatim: false,
                         style,

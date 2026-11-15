@@ -11,9 +11,12 @@
 //! - `OBSESSION_DEV_RIGHT=x,y[,wx,wy]`  right-click the editor (widget point, window point)
 //! - `OBSESSION_DEV_PICK=c`  pick status `c` in the open status menu
 //! - `OBSESSION_DEV_LPRESS=line,offset[,link]`  press a drawn Live Preview line
+//! - `OBSESSION_DEV_LDRAG=line,offset`  after LPRESS, drag to here before letting go
 //! - `OBSESSION_DEV_LTYPE=text{enter}…`  type into the Live Preview editor
 //! - `OBSESSION_DEV_SCROLL=lines[,steps]`  wheel the Source editor
 //! - `OBSESSION_DEV_VSCROLL=y`  scroll the Live view (Split's right pane) to `y`
+//! - `OBSESSION_DEV_RENAME=new/name`  rename the open note
+//! - `OBSESSION_DEV_FOLLOW=wiki:target#sub`  follow a link from the open note
 //! - `OBSESSION_DEV_TYPE=text`  type text at the start of the open note
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
@@ -35,6 +38,8 @@ pub enum Step {
     /// Scroll the Live view (Split's right pane) to this offset, as the user
     /// dragging its scrollbar would.
     ScrollView(f32),
+    /// Follow a link, as a click on it would.
+    Follow(String),
 }
 
 fn later(ms: u64, message: Message) -> Task<Message> {
@@ -104,6 +109,21 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 press,
             }),
         ));
+        // Then a drag to another line, if asked, and the button going up.
+        if let Some(d) = point("OBSESSION_DEV_LDRAG") {
+            tasks.push(later(
+                450,
+                Message::Live(crate::live::Message::DragAt {
+                    line: d[0] as usize,
+                    cell: None,
+                    offset: d[1] as usize,
+                }),
+            ));
+        }
+        // `OBSESSION_DEV_HOLD=1` keeps the button down (to see a drag).
+        if var("OBSESSION_DEV_HOLD").is_none() {
+            tasks.push(later(500, Message::Live(crate::live::Message::MouseUp)));
+        }
     }
     // Live Preview: type into the active editor. `{enter}`, `{bs}`, `{del}`,
     // `{up}`, `{down}`, `{left}`, `{right}`, `{esc}`, `{undo}`, `{redo}` are keys.
@@ -113,6 +133,16 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
             tasks.push(later(delay, step));
             delay += 30;
         }
+    }
+    // Rename the open note (as typed in the rename box).
+    if let Some(input) = var("OBSESSION_DEV_RENAME") {
+        tasks.push(later(500, Message::Shortcut(crate::Shortcut::Rename)));
+        tasks.push(later(600, Message::NewNote(crate::new_note::Message::Input(input))));
+        tasks.push(later(700, Message::NewNote(crate::new_note::Message::Submit)));
+    }
+    // Follow a link from the open note: `wiki:target#sub`, a URL or a path.
+    if let Some(uri) = var("OBSESSION_DEV_FOLLOW") {
+        tasks.push(later(800, Message::Dev(Step::Follow(uri))));
     }
     // Wheel the Source editor: `lines` per step, `steps` times.
     if let Some(spec) = var("OBSESSION_DEV_SCROLL") {
@@ -196,7 +226,7 @@ fn live_script(script: &str) -> Vec<Message> {
 
 pub fn update(step: Step) -> Task<Message> {
     match step {
-        Step::Later(_) => Task::none(),
+        Step::Later(_) | Step::Follow(_) => Task::none(),
         Step::ScrollView(y) => iced::widget::operation::scroll_to(
             crate::live::scroll_id(),
             iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },

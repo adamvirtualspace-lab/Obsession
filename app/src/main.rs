@@ -1,6 +1,7 @@
 // No console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backlinks;
 #[cfg(debug_assertions)]
 mod dev;
 mod source_scroll;
@@ -18,6 +19,7 @@ mod theme;
 mod timer;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
@@ -27,6 +29,9 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 
 use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
+use obsession_core::links::{self, Backlink, LinkIndex};
+
+use crate::highlight::LinkStates;
 use obsession_core::vault::{self, Kind, Resolved, Vault};
 
 use new_note::NewNote;
@@ -53,6 +58,12 @@ enum Message {
     PickFolder,
     FolderPicked(Option<PathBuf>),
     Scanned(Result<Vault, String>),
+    /// The vault's links were read (for the vault at this root).
+    Indexed(PathBuf, Arc<LinkIndex>),
+    Backlinks(backlinks::Message),
+    ToggleBacklinks,
+    /// Nothing to do; just lays the window out again.
+    Settle,
     /// The vault was scanned again after a note was created; open `rel`.
     Rescanned(Result<Vault, String>, Box<str>),
     NewNote(new_note::Message),
@@ -83,6 +94,7 @@ enum Shortcut {
     Save,
     Undo,
     Redo,
+    Rename,
     Up,
     Down,
     Escape,
@@ -95,6 +107,11 @@ struct Workspace {
     note: Option<Note>,
     /// `statuses:` from `_settings.md`, the team default.
     team: Option<Format>,
+    /// Who links to whom (empty until `indexed`).
+    links: LinkIndex,
+    indexed: bool,
+    /// Links to the open note.
+    backlinks: Vec<Backlink>,
 }
 
 /// The vault-root settings note.
@@ -129,6 +146,7 @@ struct App {
     status: Option<String>,
     scanning: bool,
     next_note_id: u64,
+    show_backlinks: bool,
 }
 
 impl App {
@@ -143,6 +161,7 @@ impl App {
             status: None,
             scanning: false,
             next_note_id: 0,
+            show_backlinks: true,
         };
         let start = std::env::args_os()
             .nth(1)
@@ -216,12 +235,25 @@ impl App {
                 let store = Store::new(&vault.root);
                 let tree = Tree::new(&vault);
                 self.status = Some(format!("{} notes", vault.notes().count()));
+                // Read every note's links on a background thread.
+                let root = vault.root.clone();
+                let rels: Vec<Box<str>> = vault.notes().map(|e| e.rel.clone()).collect();
+                let index = Task::perform(
+                    async move {
+                        let index = LinkIndex::build(&root, rels.iter().map(|r| &**r));
+                        (root, Arc::new(index))
+                    },
+                    |(root, index)| Message::Indexed(root, index),
+                );
                 let mut ws = Workspace {
                     vault,
                     store,
                     tree,
                     note: None,
                     team: None,
+                    links: LinkIndex::default(),
+                    indexed: false,
+                    backlinks: Vec::new(),
                 };
                 if let Some(warning) = ws.load_team().into_iter().next() {
                     self.status = Some(format!("_settings.md: {warning}"));
@@ -231,8 +263,33 @@ impl App {
                 self.switcher = None;
                 self.new_note = None;
                 #[cfg(debug_assertions)]
-                return dev::after_scan(self);
+                return Task::batch([index, dev::after_scan(self)]);
                 #[cfg(not(debug_assertions))]
+                index
+            }
+            Message::Indexed(root, index) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                if ws.vault.root != root {
+                    return Task::none();
+                }
+                let mut index = Arc::try_unwrap(index).unwrap_or_else(|shared| (*shared).clone());
+                // The open note may have changed while the vault was read.
+                if let Some(note) = &ws.note {
+                    index.update(&note.rel, &note.text());
+                }
+                ws.links = index;
+                ws.indexed = true;
+                self.refresh_links();
+                Task::none()
+            }
+            Message::Backlinks(backlinks::Message::Open(rel, line)) => {
+                self.open_at(rel, Some(Jump::Line(line)))
+            }
+            Message::Settle => Task::none(),
+            Message::ToggleBacklinks => {
+                self.show_backlinks = !self.show_backlinks;
                 Task::none()
             }
             Message::Rescanned(result, rel) => {
@@ -243,7 +300,14 @@ impl App {
                     Ok(vault) if vault.root == ws.vault.root => {
                         ws.vault = vault;
                         ws.tree.refresh(&ws.vault);
-                        self.open(rel)
+                        // A new note: empty, so nothing to read for its links.
+                        if ws.links.outline(&rel).is_none() {
+                            ws.links.update(&rel, "");
+                        }
+                        let open = self.open(rel);
+                        // Links to it from the note we came from are fine now.
+                        self.refresh_links();
+                        open
                     }
                     Ok(_) => Task::none(),
                     Err(error) => {
@@ -273,6 +337,13 @@ impl App {
                         Task::none()
                     }
                     sidebar::Message::Open(index) => self.open_index(index),
+                    sidebar::Message::Rename(index) => match ws.vault.entries.get(index as usize) {
+                        Some(entry) if entry.kind == Kind::Note => {
+                            let rel = entry.rel.clone();
+                            self.start_rename(&rel)
+                        }
+                        _ => Task::none(),
+                    },
                 }
             }
             Message::Edit(action) => {
@@ -336,6 +407,8 @@ impl App {
                             if mode.shows_preview() {
                                 note.refresh_preview_if_stale();
                             }
+                            // Links typed since: are they there?
+                            self.refresh_links();
                             Task::none()
                         }
                         Timer::Save => self.save_now(),
@@ -371,6 +444,12 @@ impl App {
                 if outcome.focus {
                     tasks.push(operation::focus(live::editor_id()));
                 }
+                if outcome.settle {
+                    tasks.push(Task::perform(
+                        timer::after(std::time::Duration::from_millis(20)),
+                        |()| Message::Settle,
+                    ));
+                }
                 if let Some(dy) = outcome.scroll {
                     tasks.push(operation::scroll_by(
                         live::scroll_id(),
@@ -393,6 +472,8 @@ impl App {
             }
             #[cfg(debug_assertions)]
             Message::Dev(dev::Step::Later(message)) => self.update(*message),
+            #[cfg(debug_assertions)]
+            Message::Dev(dev::Step::Follow(uri)) => self.follow_link(&uri),
             #[cfg(debug_assertions)]
             Message::Dev(step) => dev::update(step),
         }
@@ -481,6 +562,12 @@ impl App {
                 ])
             }
             Shortcut::CycleMode => self.set_mode(self.mode.next()),
+            Shortcut::Rename => {
+                match self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).map(|n| n.rel.clone()) {
+                    Some(rel) => self.start_rename(&rel),
+                    None => Task::none(),
+                }
+            }
             Shortcut::Undo => self.undo(false),
             Shortcut::Redo => self.undo(true),
             Shortcut::Save => self.save_now(),
@@ -516,7 +603,34 @@ impl App {
         }
     }
 
+    fn start_rename(&mut self, rel: &str) -> Task<Message> {
+        self.switcher = None;
+        self.menu = None;
+        self.new_note = Some(NewNote::rename(rel));
+        Task::batch([
+            operation::focus(new_note::input_id()),
+            operation::move_cursor_to_end(new_note::input_id()),
+        ])
+    }
+
     fn new_note_message(&mut self, message: new_note::Message) -> Task<Message> {
+        if let (new_note::Message::Submit, Some(form)) = (&message, &self.new_note)
+            && let new_note::Purpose::Rename(old) = &form.purpose
+        {
+            let (old, input) = (old.clone(), form.input.clone());
+            return match self.rename(&old, &input) {
+                Ok(task) => {
+                    self.new_note = None;
+                    task
+                }
+                Err(error) => {
+                    if let Some(form) = &mut self.new_note {
+                        form.error = Some(error);
+                    }
+                    Task::none()
+                }
+            };
+        }
         let (Some(form), Some(ws)) = (&mut self.new_note, &self.workspace) else {
             return Task::none();
         };
@@ -615,7 +729,148 @@ impl App {
                 self.status = Some(format!("Couldn't open {rel}: {error}"));
             }
         }
+        self.refresh_links();
         save
+    }
+
+    /// Opens a note and shows a line or a `#heading`/`^block` in it.
+    fn open_at(&mut self, rel: Box<str>, jump: Option<Jump>) -> Task<Message> {
+        let task = self.open(rel.clone());
+        let Some(jump) = jump else {
+            return task;
+        };
+        let Some(note) = self.note_mut().filter(|n| n.rel == rel) else {
+            return task;
+        };
+        let line = match &jump {
+            Jump::Line(line) => Some(*line),
+            Jump::Section(sub) => links::outline(&note.text()).find(sub),
+        };
+        match line {
+            Some(line) => note.jump_to(line),
+            None => {
+                if let Jump::Section(sub) = jump {
+                    self.status = Some(format!("⚠ No “{sub}” in {}", rel.trim_end_matches(".md")));
+                }
+            }
+        }
+        task
+    }
+
+    /// Re-checks the open note's links and its backlinks.
+    fn refresh_links(&mut self) {
+        let Some(ws) = &mut self.workspace else {
+            return;
+        };
+        let Some(note) = &mut ws.note else {
+            ws.backlinks.clear();
+            return;
+        };
+        let text = note.text();
+        let states = links::link_states(&text, &note.rel, &ws.vault, &ws.links);
+        note.set_link_states(LinkStates::new(states));
+        ws.backlinks = if ws.indexed {
+            ws.links.backlinks(&note.rel, &ws.vault)
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Renames (or moves) a note and rewrites every link to it, the way
+    /// Obsidian does. Runs on this thread: the open note is saved first,
+    /// then the file is moved, then each linking note is rewritten and
+    /// saved (each write is atomic).
+    fn rename(&mut self, old: &str, input: &str) -> Result<Task<Message>, String> {
+        let new_rel = vault::note_rel_from_input(input).map_err(str::to_owned)?;
+        if new_rel == old {
+            return Ok(Task::none());
+        }
+        self.save_blocking();
+        let Some(ws) = &mut self.workspace else {
+            return Ok(Task::none());
+        };
+        if !ws.indexed {
+            return Err("Still reading the vault's links; try again in a moment".into());
+        }
+        if ws.vault.note(&new_rel).is_some() && !new_rel.eq_ignore_ascii_case(old) {
+            return Err("A note with that name is already there".into());
+        }
+        let sources = ws.links.linking_notes(old, &ws.vault);
+        let from = ws.vault.path(old);
+        let to = ws.vault.path(&new_rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Couldn't make the folder: {e}"))?;
+        }
+        std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename it: {e}"))?;
+
+        // The store and the open note follow the file.
+        let was_open = ws.note.as_ref().is_some_and(|n| &*n.rel == old);
+        ws.store.forget(old);
+        if was_open && let Some(note) = &mut ws.note {
+            note.rel = new_rel.clone().into();
+            let _ = ws.store.pin(&new_rel);
+        }
+        ws.links.remove(old);
+
+        let mut notes = 0;
+        let mut count = 0;
+        let mut failed = Vec::new();
+        for source in &sources {
+            // The renamed note may link to itself.
+            let now: &str = if &**source == old { &new_rel } else { source };
+            let Ok(text) = ws.store.get(now).map(str::to_owned) else {
+                failed.push(now.to_owned());
+                continue;
+            };
+            let Some((new_text, n)) = links::rewrite_links(&text, source, &ws.vault, old, &new_rel) else {
+                continue;
+            };
+            ws.store.set(now, new_text.clone());
+            if let Some(job) = ws.store.take_save(now) {
+                let result = job.run();
+                ws.store.finish_save(&result);
+                if result.error().is_some() {
+                    failed.push(now.to_owned());
+                    continue;
+                }
+            }
+            ws.links.update(now, &new_text);
+            if let Some(note) = &mut ws.note
+                && &*note.rel == now
+            {
+                note.replace_text(&new_text);
+            }
+            notes += 1;
+            count += n;
+        }
+        if ws.links.outline(&new_rel).is_none()
+            && let Ok(text) = ws.store.get(&new_rel).map(str::to_owned)
+        {
+            ws.links.update(&new_rel, &text);
+        }
+
+        match Vault::scan(&ws.vault.root) {
+            Ok(vault) => {
+                ws.vault = vault;
+                ws.tree.refresh(&ws.vault);
+                ws.tree.reveal(&ws.vault, &new_rel);
+            }
+            Err(error) => self.status = Some(format!("Couldn't re-read the folder: {error}")),
+        }
+        let name = new_rel.trim_end_matches(".md");
+        self.status = Some(if !failed.is_empty() {
+            format!("⚠ Renamed to {name}, but couldn't update links in: {}", failed.join(", "))
+        } else if count == 0 {
+            format!("Renamed to {name}")
+        } else {
+            format!(
+                "Renamed to {name} · updated {count} link{} in {notes} note{}",
+                if count == 1 { "" } else { "s" },
+                if notes == 1 { "" } else { "s" }
+            )
+        });
+        self.refresh_links();
+        Ok(Task::none())
     }
 
     /// Hands unsaved edits to the store and starts a background write if the
@@ -630,6 +885,7 @@ impl App {
         if note.unsynced {
             let text = note.text();
             note.analyze(&text);
+            ws.links.update(&note.rel, &text);
             ws.store.set(&note.rel, text);
             note.unsynced = false;
             if &*note.rel == SETTINGS_NOTE {
@@ -663,47 +919,101 @@ impl App {
     }
 
     fn follow_link(&mut self, uri: &str) -> Task<Message> {
-        let Some(ws) = &self.workspace else {
-            return Task::none();
-        };
-        if let Some(target) = uri.strip_prefix(obsession_core::preview::WIKI_SCHEME) {
-            return match ws.vault.resolve(target) {
-                Resolved::One(entry) => {
-                    let rel = entry.rel.clone();
-                    self.open(rel)
-                }
-                Resolved::Ambiguous(n) => {
-                    self.status = Some(format!(
-                        "⚠ [[{target}]] matches {n} notes. Add part of the folder path."
-                    ));
-                    Task::none()
-                }
-                Resolved::NotFound => {
-                    self.status = Some(format!("No note called [[{target}]]"));
-                    Task::none()
-                }
+        if let Some(dest) = uri.strip_prefix(obsession_core::preview::WIKI_SCHEME) {
+            let dest = dest.split('|').next().unwrap_or(dest);
+            let (target, sub) = match dest.split_once('#') {
+                Some((target, sub)) => (target.trim(), Some(sub.trim().to_owned())),
+                None => (dest.trim(), None),
             };
+            return self.follow_note(target, sub, true);
         }
-        if uri.starts_with("https://") || uri.starts_with("http://") {
+        if uri.starts_with("https://") || uri.starts_with("http://") || uri.starts_with("mailto:") {
             let _ = std::process::Command::new("rundll32")
                 .args(["url.dll,FileProtocolHandler", uri])
                 .spawn();
             return Task::none();
         }
-        // A plain markdown link to a note: relative to the note, then the root.
-        let target = uri.trim_start_matches("./");
-        let from_note = ws
-            .note
-            .as_ref()
-            .and_then(|n| n.rel.rsplit_once('/').map(|(dir, _)| format!("{dir}/{target}")));
-        let candidates = from_note.into_iter().chain([target.to_owned()]);
-        let found = candidates
-            .into_iter()
-            .find_map(|c| ws.vault.notes().find(|e| *e.rel == *c).map(|e| e.rel.clone()));
-        match found {
-            Some(rel) => self.open(rel),
+        match links::note_url(uri) {
+            Some((target, sub)) => self.follow_note(&target, sub, false),
             None => {
                 self.status = Some(format!("Can't open {uri}"));
+                Task::none()
+            }
+        }
+    }
+
+    /// Opens what a link to `target` (`#sub`) leads to, from the open note.
+    /// A `[[wiki link]]` to a note that doesn't exist creates it, as in
+    /// Obsidian (at the path the link names, from the vault root).
+    fn follow_note(&mut self, target: &str, sub: Option<String>, create: bool) -> Task<Message> {
+        let Some(ws) = &self.workspace else {
+            return Task::none();
+        };
+        let from = ws.note.as_ref().map(|n| n.rel.clone());
+        let jump = sub.map(Jump::Section);
+        if target.is_empty() {
+            // `[[#heading]]`: this note.
+            return match from {
+                Some(rel) => self.open_at(rel, jump),
+                None => Task::none(),
+            };
+        }
+        match ws.vault.resolve_from(target, from.as_deref()) {
+            Resolved::One(entry) => {
+                let rel = entry.rel.clone();
+                self.open_at(rel, jump)
+            }
+            Resolved::Ambiguous { picked, count } => {
+                let rel = picked.rel.clone();
+                let task = self.open_at(rel.clone(), jump);
+                self.status = Some(format!(
+                    "⚠ [[{target}]] matches {count} notes; opened {}. Add part of the folder path to pick one.",
+                    rel.trim_end_matches(".md")
+                ));
+                task
+            }
+            Resolved::Attachment => {
+                let path = ws.vault.root.join(target);
+                if path.is_file() {
+                    let _ = std::process::Command::new("rundll32")
+                        .arg("url.dll,FileProtocolHandler")
+                        .arg(&path)
+                        .spawn();
+                } else {
+                    self.status = Some(format!("Can't find {target} (attachments open from the vault root for now)"));
+                }
+                Task::none()
+            }
+            Resolved::NotFound if create => {
+                let rel = match vault::note_rel_from_input(target) {
+                    Ok(rel) => rel,
+                    Err(error) => {
+                        self.status = Some(format!("Can't create [[{target}]]: {error}"));
+                        return Task::none();
+                    }
+                };
+                match vault::create_note(&ws.vault.root, &rel) {
+                    Ok(()) => {
+                        self.status = Some(format!("Created {rel}"));
+                        let root = ws.vault.root.clone();
+                        let rel: Box<str> = rel.into();
+                        let save = self.save_now();
+                        Task::batch([
+                            save,
+                            Task::perform(
+                                async move { Vault::scan(root).map_err(|e| e.to_string()) },
+                                move |result| Message::Rescanned(result, rel.clone()),
+                            ),
+                        ])
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("Couldn't create {rel}: {error}"));
+                        Task::none()
+                    }
+                }
+            }
+            Resolved::NotFound => {
+                self.status = Some(format!("Can't find {target}"));
                 Task::none()
             }
         }
@@ -714,6 +1024,12 @@ impl App {
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
+            event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                    Some(Message::Live(live::Message::MouseUp))
+                }
+                _ => None,
+            }),
         ])
     }
 
@@ -770,13 +1086,14 @@ impl App {
                     }
                 };
 
-                column![
-                    self.view_toolbar(ws),
-                    row![sidebar, container(body).style(theme::page).width(Fill).height(Fill)]
-                        .height(Fill),
-                    self.view_status(ws),
-                ]
-                .into()
+                let page = container(body).style(theme::page).width(Fill).height(Fill);
+                let mut middle = row![sidebar, page].height(Fill);
+                if self.show_backlinks && ws.note.is_some() {
+                    middle = middle.push(rule::vertical(1)).push(
+                        backlinks::view(&ws.backlinks, ws.indexed).map(Message::Backlinks),
+                    );
+                }
+                column![self.view_toolbar(ws), middle, self.view_status(ws)].into()
             }
         };
 
@@ -822,6 +1139,11 @@ impl App {
                     .style(theme::tool(false)),
                 text(path).size(theme::SMALL).color(theme::MUTED),
                 Space::new().width(Fill),
+                button(text("Backlinks").size(theme::SMALL))
+                    .on_press(Message::ToggleBacklinks)
+                    .padding([4, 12])
+                    .style(theme::tool(self.show_backlinks)),
+                Space::new().width(8),
                 mode_button("Live", Mode::Live),
                 mode_button("Source", Mode::Source),
                 mode_button("Split", Mode::Split),
@@ -906,6 +1228,14 @@ impl App {
     }
 }
 
+/// Where to show a note once it's open.
+#[derive(Debug, Clone)]
+enum Jump {
+    Line(usize),
+    /// A `#heading` (or `#a#b`) or `^block`, as written after `#`.
+    Section(String),
+}
+
 fn start_timers(id: u64, timers: Vec<(Timer, std::time::Duration)>) -> Task<Message> {
     Task::batch(timers.into_iter().map(|(timer, delay)| {
         Task::perform(timer::after(delay), move |()| Message::Timer(id, timer))
@@ -953,6 +1283,9 @@ fn shortcut_from_event(
     let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
         return None;
     };
+    if key == Key::Named(Named::F2) {
+        return Some(Shortcut::Rename);
+    }
     if modifiers.command() {
         return match key.as_ref() {
             Key::Character("o") => Some(Shortcut::OpenFolder),

@@ -26,12 +26,15 @@ The app remembers the last vault in `%APPDATA%\Obsession\last_vault.txt`.
 | Ctrl+E | Cycle Live / Source / Split / Reading |
 | Ctrl+S | Save now (autosave runs 1 s after you stop typing) |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
+| F2 | Rename or move the open note (links to it are updated); right-click a note in the tree does the same |
 
 **Views:** **Live** (the default) shows the note formatted and turns the line
 you click into raw markdown, like Obsidian's Live Preview. Arrow keys move
 between lines, Enter continues lists, Backspace at the start of a line joins
-it to the one above, Esc stops editing. A code block, table or the
-frontmatter is edited as a whole. **Source** is the raw markdown, for big
+it to the one above, Esc stops editing. Drag across lines to select: the
+selection is highlighted as you drag, and when you let go those lines turn
+raw with the text selected, so Ctrl+C, Ctrl+X, typing and Delete work. A code
+block, table or the frontmatter is edited as a whole. **Source** is the raw markdown, for big
 edits and selecting across many lines. **Split** is Source with a read-only
 Live view beside it that follows your typing. The two scroll together: the
 view keeps the line at the editor's middle level with it, or the caret's line
@@ -43,6 +46,17 @@ the text in the same column.
 Right-click a task (in any view) to pick any status. Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`
 at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
+
+**Links** resolve as in Obsidian: `[[sh040]]` finds the note by name wherever
+it is, `[[anim/sh040]]` narrows it by folder, `./` and `../` are relative, and
+`#Heading`, `#^block` and `|alias` work. A link is blue when it's fine, dim
+when the note doesn't exist yet (clicking creates it, at the vault root or the
+path the link names), and amber when it's ambiguous (several notes share the
+name; the click opens the one Obsidian would and says so) or its `#heading` or
+`^block` isn't there. The **Backlinks** panel on the right lists every line
+that links to the open note; click one to go there. Renaming a note rewrites
+every `[[link]]` and markdown link to it, keeping headings, aliases and `!`
+embeds, using the shortest form that stays unique.
 
 ## Workspace
 

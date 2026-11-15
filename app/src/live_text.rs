@@ -38,6 +38,9 @@ pub struct LiveText<'a, Message> {
     wrapping: Wrapping,
     /// Plain text shows the arrow, not the text caret (Reading mode).
     read_only: bool,
+    /// While a selection is being dragged: called with the text offset
+    /// under the cursor as it moves over this line.
+    on_drag: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_press: Box<dyn Fn(Press) -> Message + 'a>,
 }
 
@@ -55,6 +58,7 @@ impl<'a, Message> LiveText<'a, Message> {
             color: Color::WHITE,
             wrapping: Wrapping::WordOrGlyph,
             read_only: false,
+            on_drag: None,
             on_press: Box::new(on_press),
         }
     }
@@ -96,12 +100,23 @@ impl<'a, Message> LiveText<'a, Message> {
         self.read_only = read_only;
         self
     }
+
+    /// Reports the offset under the cursor as it moves, while `dragging`.
+    pub fn on_drag(mut self, dragging: bool, on_drag: impl Fn(usize) -> Message + 'a) -> Self {
+        if dragging {
+            self.on_drag = Some(Box::new(on_drag));
+        }
+        self
+    }
 }
 
 struct State {
     spans: Vec<Span<'static, usize, Font>>,
     paragraph: P,
     hovered_link: Option<usize>,
+    /// The last offset reported while dragging, so moves within one
+    /// character don't repeat it.
+    dragged: Option<usize>,
 }
 
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Message> {
@@ -114,6 +129,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
             spans: Vec::new(),
             paragraph: P::default(),
             hovered_link: None,
+            dragged: None,
         })
     }
 
@@ -262,6 +278,24 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
             shell.request_redraw();
         }
 
+        if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
+            match (&self.on_drag, local) {
+                (Some(on_drag), Some(point)) => {
+                    let offset = state
+                        .paragraph
+                        .hit_test(point)
+                        .map_or(usize::MAX, |hit| hit.cursor());
+                    if state.dragged != Some(offset) {
+                        state.dragged = Some(offset);
+                        shell.publish(on_drag(offset));
+                    }
+                }
+                (None, _) => state.dragged = None,
+                _ => {}
+            }
+            return;
+        }
+
         let right = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => false,
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => true,
@@ -274,9 +308,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
             .paragraph
             .hit_test(point)
             .map_or(usize::MAX, |hit| hit.cursor());
+        let link = hovered.and_then(|span| self.spans.get(span)?.link);
+        state.dragged = Some(offset);
         shell.publish((self.on_press)(Press {
             offset,
-            link: hovered,
+            link,
             right,
             window,
         }));
