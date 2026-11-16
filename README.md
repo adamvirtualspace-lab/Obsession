@@ -48,7 +48,8 @@ Right-click a task (in any view) to pick any status. Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`
 at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
 
-**Graphs:** a folder's `_nodes.md` opens as a graph (the **Graph** button
+**Graphs:** any note named `…_nodes.md` (`_nodes.md`, `lighting_nodes.md`;
+several per folder are fine) opens as a graph (the **Graph** button
 switches between the graph and its text). Each node is a card with the note's
 name, folder, tasks and progress; amber when several notes share the name,
 dashed when the note doesn't exist yet. Drag the background (or hold the middle

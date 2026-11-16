@@ -627,7 +627,8 @@ performance budgets checked.
 ## Decisions so far
 
 - Rust + iced. Start fresh, nothing carried over from Possess.
-- Graph files are `_nodes.md`, one per folder.
+- Graph files are any note named `…_nodes.md` (`_nodes.md`, `lighting_nodes.md`);
+  a folder can hold several.
 - Files starting with `_` mean something to the app: `_nodes.md`, `_funct.md`,
   `_crew/`, `_settings.md`.
 - `.obsessed/` holds machine-local data (undo log, window state, caches) and

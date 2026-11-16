@@ -1,4 +1,4 @@
-//! Graph files: `_nodes.md` (Syntax.md, section 7).
+//! Graph files: any note named `…_nodes.md` (Syntax.md, section 7).
 //!
 //! A graph file is an ordinary note with three sections the app reads:
 //! `## Nodes` (one link or `fn Name` per list item), `## Wires`
@@ -13,13 +13,16 @@ use std::ops::Range;
 
 use crate::syntax::{LineState, scan_line};
 
-/// The graph file's name; one per folder.
-pub const FILE: &str = "_nodes.md";
+/// How a graph file's name ends: `_nodes.md`, `shot040_nodes.md`, …
+pub const SUFFIX: &str = "_nodes.md";
 
-/// Whether `rel` is a graph file.
+/// Whether `rel` is a graph file: any note whose name ends in `_nodes.md`
+/// (ignoring case), so a folder can hold several graphs.
 pub fn is_graph(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.eq_ignore_ascii_case(FILE)
+    name.len() >= SUFFIX.len()
+        && name.is_char_boundary(name.len() - SUFFIX.len())
+        && name[name.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +595,12 @@ mod tests {
     fn graph_files() {
         assert!(is_graph("shots/_nodes.md"));
         assert!(is_graph("_Nodes.md"));
+        assert!(is_graph("tryingtimes_nodes.md"));
+        assert!(is_graph("shots/sh040 lighting_NODES.md"));
+        assert!(is_graph("é_nodes.md"));
         assert!(!is_graph("shots/nodes.md"));
+        assert!(!is_graph("shots/_nodes.txt"));
+        assert!(!is_graph("shots/my-nodes.md"));
+        assert!(!is_graph("odes.md"));
     }
 }

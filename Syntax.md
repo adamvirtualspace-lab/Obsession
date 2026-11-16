@@ -9,7 +9,7 @@ few extra conventions it understands. How the app is built is in
 | File | What it is | Shared with the team? |
 |---|---|---|
 | any `.md` | A note. May contain tasks, `@people` and links | Yes |
-| `_nodes.md` | The node graph for its folder (section 7) | Yes |
+| `_nodes.md`, `anything_nodes.md` | A node graph (section 7) | Yes |
 | `_funct.md` | Saved functions for the whole vault, at the vault root (section 9) | Yes |
 | `_crew/<name>.md` | One crew member's card (section 4) | Yes |
 | `_settings.md` | Optional vault settings, at the vault root (section 3) | Yes |
@@ -222,8 +222,10 @@ The app reads the same links Obsidian does:
 
 ## 7. Graphs: `_nodes.md`
 
-Each folder can have one `_nodes.md`. It's a normal note with three sections the
-app understands. Everything else in it is yours.
+Any note whose name ends in `_nodes.md` is a graph: `_nodes.md`,
+`lighting_nodes.md`, `ep04 delivery_nodes.md` (case doesn't matter). A folder can
+hold as many as you like. It's a normal note with three sections the app
+understands. Everything else in it is yours.
 
 ~~~md
 # sh040
@@ -275,8 +277,9 @@ fn Check Lighting 300,200
 - Each list item is one node: a single link to a file, or `fn Name` for a
   function shown as a node (section 8).
 - Any file can be a node, including files from other folders.
-- Links to another folder's `_nodes.md` must include the path
-  (`[[fx/_nodes]]`), because every graph file has the same name.
+- Links to a graph named just `_nodes.md` must include the path
+  (`[[fx/_nodes]]`), because many folders have one. A graph with its own name
+  (`[[lighting_nodes]]`) links like any note.
 
 ### `## Wires`
 
