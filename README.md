@@ -3,6 +3,7 @@ Markdown Note App made with Rust. It's Node-based so everyone understood the flo
 
 - [PLAN.md](PLAN.md): how the app is built, milestones, performance budgets
 - [Syntax.md](Syntax.md): what the app reads and writes in your notes
+- [CODEMAP.md](CODEMAP.md): every file, its main types and functions, and how they connect
 
 ## Run it
 
@@ -57,6 +58,21 @@ a wire; select a card or wire and press Delete to remove it from the graph
 (the note itself stays). **+ Node** adds a note. `[[links]]` between cards show
 as fainter wires (**Link wires** hides them). Everything is written back into
 `_nodes.md` as Syntax.md section 7 describes, and Ctrl+Z undoes it.
+
+**Functions:** hover a wire and click its **ƒ** to put a function on it: pick
+one (the first time, the app creates `_funct.md` with *Wait For Done* and *Copy
+Status*) or type a name to create a new one in the graph's `## Functions`. A
+wire turns solid once its function checks out, and stays dashed with ⚠ and the
+reason when it doesn't. Clicking a wire's ƒ (or double-clicking a `fn` card)
+opens the **function editor**: the function's nodes, Blueprint style. Drag a
+node to move it; drag from a pin on a node's right to a pin on another's left
+to connect them (pins of the wrong type refuse); drag a connection off a pin to
+remove it. **+ Node** (or double-click the canvas) adds a node from the
+library. Click a node to set its values in the panel; hover a pin to see its
+live value, read from the real notes the wire connects. The panel also holds
+the wire's own values (`task`, `target`…). **+ Function** adds a function with
+several ins or outs as a node; wire notes to its pins. Nothing runs yet:
+functions only show what they would change (milestone 6 runs them).
 
 **Links** resolve as in Obsidian: `[[sh040]]` finds the note by name wherever
 it is, `[[anim/sh040]]` narrows it by folder, `./` and `../` are relative, and

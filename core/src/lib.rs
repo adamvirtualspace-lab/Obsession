@@ -10,8 +10,11 @@
 //! - [`status`]: tasks, status formats and what a click changes.
 //! - [`links`]: links in a note, the vault's link index, renames.
 //! - [`nodes`]: graph files (`_nodes.md`): nodes, wires, layout.
+//! - [`func`]: functions: the text format, node library, type checking,
+//!   evaluation.
 
 pub mod doc;
+pub mod func;
 pub mod fuzzy;
 pub mod history;
 pub mod links;

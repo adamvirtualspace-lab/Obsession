@@ -4,6 +4,7 @@
 mod backlinks;
 #[cfg(debug_assertions)]
 mod dev;
+mod func_editor;
 mod graph;
 mod source_scroll;
 mod highlight;
@@ -31,11 +32,14 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
 use obsession_core::links::{self, Backlink, LinkIndex};
-use obsession_core::nodes::{self, Section};
+use obsession_core::func::{self, Library, Origin};
+use obsession_core::func::eval::Bind;
+use obsession_core::nodes::{self, End, Section};
 
 use crate::highlight::LinkStates;
 use obsession_core::vault::{self, Kind, Resolved, Vault};
 
+use func_editor::{Context, Editor, Picker};
 use new_note::NewNote;
 use note::{Mode, Note, Timer};
 use sidebar::Tree;
@@ -70,6 +74,10 @@ enum Message {
     ToggleLinkWires,
     /// Pick a note to add to the open graph.
     AddNode,
+    /// Pick a function to add to the open graph as a node.
+    AddFunctionNode,
+    Editor(func_editor::Message),
+    Picker(func_editor::PickerMessage),
     /// Nothing to do; just lays the window out again.
     Settle,
     /// The vault was scanned again after a note was created; open `rel`.
@@ -163,6 +171,39 @@ struct App {
     adding_node: bool,
     /// Bumped when a different graph opens, so the view fits it.
     graph_fit: u64,
+    /// The open graph's functions and the saved ones.
+    functions: Library,
+    /// The function being edited (shown instead of the graph).
+    editor: Option<Editor>,
+    editor_fit: u64,
+    /// Choosing a function for a wire or a function node.
+    picker: Option<(Picker, PickTarget)>,
+}
+
+/// What the function picker is choosing for.
+#[derive(Debug, Clone)]
+enum PickTarget {
+    /// A wire: its line in `## Wires` (`None` for a link wire, which gets a
+    /// line when it gets a function) and its ends.
+    Wire { line: Option<usize>, from: End, to: End },
+    /// A new `fn Name` node.
+    Node,
+}
+
+/// An end as written in a wire line.
+fn end_text(end: &End) -> String {
+    match end {
+        End::Note { target, sub: Some(sub) } => format!("[[{target}#{sub}]]"),
+        End::Note { target, sub: None } => format!("[[{target}]]"),
+        End::Pin { function, pin } => format!("{function}.{pin}"),
+    }
+}
+
+fn end_kind(end: &End) -> func::PortKind {
+    match end {
+        End::Note { sub, .. } => func_editor::kind_of(sub.as_deref()),
+        End::Pin { .. } => func::PortKind::File,
+    }
 }
 
 impl App {
@@ -183,6 +224,10 @@ impl App {
             show_link_wires: true,
             adding_node: false,
             graph_fit: 0,
+            functions: Library::default(),
+            editor: None,
+            editor_fit: 0,
+            picker: None,
         };
         let start = std::env::args_os()
             .nth(1)
@@ -326,6 +371,12 @@ impl App {
                 }
                 Task::none()
             }
+            Message::AddFunctionNode => {
+                self.open_picker(PickTarget::Node, None);
+                Task::none()
+            }
+            Message::Editor(message) => self.editor_message(message),
+            Message::Picker(message) => self.picker_message(message),
             Message::AddNode => {
                 let Some(ws) = &self.workspace else {
                     return Task::none();
@@ -588,6 +639,10 @@ impl App {
         if self.menu.take().is_some() && matches!(shortcut, Shortcut::Escape) {
             return Task::none();
         }
+        if self.picker.is_some() && matches!(shortcut, Shortcut::Escape) {
+            self.picker = None;
+            return Task::none();
+        }
         if self.new_note.is_some() {
             if matches!(shortcut, Shortcut::Escape | Shortcut::NewNote) {
                 self.new_note = None;
@@ -790,6 +845,8 @@ impl App {
         };
         let text = note.text();
         let rel = note.rel.clone();
+        let library = load_library(ws, &text);
+        let previous = self.graph.take();
         let mut graph = graph::Graph::build(
             &text,
             &rel,
@@ -797,10 +854,415 @@ impl App {
             &mut ws.store,
             ws.team.as_ref(),
             &ws.links,
+            &library,
+            previous.as_ref(),
             self.show_link_wires,
         );
         graph.fit = self.graph_fit;
+        self.functions = library;
         self.graph = Some(graph);
+        self.refresh_editor();
+    }
+
+    /// Opens the editor on a function.
+    fn open_editor(&mut self, name: &str, context: Context) {
+        let Some((block, origin, shadowed)) = self.functions.find(name) else {
+            self.status = Some(format!("⚠ There's no function called {name}"));
+            return;
+        };
+        let mut editor = Editor::new(block.function.name.clone(), origin, context);
+        self.editor_fit += 1;
+        editor.fit = self.editor_fit;
+        if shadowed {
+            self.status = Some(format!("⚠ {name} in this graph hides the saved one in _funct.md"));
+        }
+        self.editor = Some(editor);
+        self.refresh_editor();
+    }
+
+    /// Re-reads the edited function, its wire's values and the files it's
+    /// wired to, then checks and runs it for the live values.
+    fn refresh_editor(&mut self) {
+        let Some(editor) = &self.editor else { return };
+        let (name, origin, context) = (editor.name.clone(), editor.origin, editor.context.clone());
+        let Some(ws) = &mut self.workspace else { return };
+        let Some(note) = ws.note.as_ref().filter(|n| nodes::is_graph(&n.rel)) else {
+            self.editor = None;
+            return;
+        };
+        let graph_text = note.text();
+        let graph_rel = note.rel.clone();
+        let pool = match origin {
+            Origin::Local => &self.functions.local,
+            Origin::Saved => &self.functions.saved,
+        };
+        let block = pool.iter().find(|b| b.function.name.eq_ignore_ascii_case(&name)).cloned();
+        let parsed = nodes::parse(&graph_text);
+        let (ins, outs) = block
+            .as_ref()
+            .map_or((0, 0), |b| (b.function.inputs.len(), b.function.outputs.len()));
+        let mut ends: Vec<Option<(String, Option<String>)>> = vec![None; ins + outs];
+        let mut args = Vec::new();
+        let mut label = None;
+        let note_end = |e: &End| match e {
+            End::Note { target, sub } => Some((target.clone(), sub.clone())),
+            End::Pin { .. } => None,
+        };
+        match context {
+            Context::Wire { line } => {
+                if let Some(w) = parsed.wires.iter().find(|w| w.line == line) {
+                    if let Some(Ok((_, a))) = w.function.as_deref().map(func::parse_call) {
+                        args = a;
+                    }
+                    if ins == 1 {
+                        ends[0] = note_end(&w.from);
+                    }
+                    if outs == 1 {
+                        ends[ins] = note_end(&w.to);
+                    }
+                    label = Some(format!("{} → {}", end_text(&w.from), end_text(&w.to)));
+                }
+            }
+            Context::Node => {
+                if let Some(f) = block.as_ref().map(|b| &b.function) {
+                    for w in &parsed.wires {
+                        if let End::Pin { function, pin } = &w.to
+                            && function.eq_ignore_ascii_case(&name)
+                            && let Some(k) = f.inputs.iter().position(|p| p.name.eq_ignore_ascii_case(pin))
+                        {
+                            ends[k] = note_end(&w.from);
+                        }
+                        if let End::Pin { function, pin } = &w.from
+                            && function.eq_ignore_ascii_case(&name)
+                            && let Some(k) = f.outputs.iter().position(|p| p.name.eq_ignore_ascii_case(pin))
+                        {
+                            ends[ins + k] = note_end(&w.to);
+                        }
+                    }
+                }
+            }
+        }
+        let binds: Vec<Option<Bind>> = ends
+            .into_iter()
+            .map(|end| {
+                let (target, sub) = end?;
+                let entry = ws.vault.resolve_from(&target, Some(&graph_rel)).entry()?;
+                let rel = entry.rel.clone();
+                let text = ws.store.get(&rel).ok()?.to_owned();
+                Some(Bind {
+                    rel: rel.to_string(),
+                    text,
+                    sub,
+                })
+            })
+            .collect();
+        let team = ws.team.clone();
+        if let Some(editor) = &mut self.editor {
+            editor.wire_label = label;
+            editor.refresh(block, &args, binds, team.as_ref());
+        }
+    }
+
+    /// Changes the text holding the edited function: the graph (undoable)
+    /// or `_funct.md`.
+    fn edit_function(&mut self, change: Box<dyn FnOnce(&str) -> String>) -> Task<Message> {
+        let Some(editor) = &self.editor else {
+            return Task::none();
+        };
+        match editor.origin {
+            Origin::Local => self.edit_graph(change, true),
+            Origin::Saved => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                let Ok(text) = ws.store.get(func::SAVED).map(str::to_owned) else {
+                    self.status = Some("⚠ Couldn't read _funct.md".into());
+                    return Task::none();
+                };
+                let new = change(&text);
+                if new == text {
+                    return Task::none();
+                }
+                ws.store.set(func::SAVED, new);
+                let task = match ws.store.take_save(func::SAVED) {
+                    Some(job) => Task::perform(async move { job.run() }, Message::Saved),
+                    None => Task::none(),
+                };
+                self.rebuild_graph();
+                task
+            }
+        }
+    }
+
+    fn editor_message(&mut self, message: func_editor::Message) -> Task<Message> {
+        use func_editor::Outcome;
+        let Some(editor) = &mut self.editor else {
+            return Task::none();
+        };
+        let context = editor.context.clone();
+        let name = editor.name.clone();
+        match editor.update(message) {
+            Outcome::None => Task::none(),
+            Outcome::Edit(change) => self.edit_function(change),
+            Outcome::Status(s) => {
+                self.status = Some(s);
+                Task::none()
+            }
+            Outcome::Back => {
+                self.editor = None;
+                Task::none()
+            }
+            Outcome::Wire(call) => match context {
+                Context::Wire { line } => self.edit_graph(|text| nodes::set_wire_function(text, line, Some(&call)), true),
+                Context::Node => Task::none(),
+            },
+            Outcome::Change => {
+                if let Context::Wire { line } = context
+                    && let Some(w) = self.graph_wire(line)
+                {
+                    self.open_picker(
+                        PickTarget::Wire {
+                            line: Some(line),
+                            from: w.from,
+                            to: w.to,
+                        },
+                        Some(name),
+                    );
+                }
+                Task::none()
+            }
+            Outcome::TakeOff => match context {
+                Context::Wire { line } => {
+                    self.editor = None;
+                    self.edit_graph(|text| nodes::set_wire_function(text, line, None), true)
+                }
+                Context::Node => Task::none(),
+            },
+            Outcome::Duplicate => self.duplicate_function(&name, context),
+        }
+    }
+
+    /// The wire at `line` of the open graph.
+    fn graph_wire(&self, line: usize) -> Option<nodes::Wire> {
+        let note = self.workspace.as_ref()?.note.as_ref()?;
+        nodes::parse(&note.text()).wires.into_iter().find(|w| w.line == line)
+    }
+
+    /// Copies a saved function into the graph as `Name copy`, and points
+    /// the wire being edited at the copy.
+    fn duplicate_function(&mut self, name: &str, context: Context) -> Task<Message> {
+        let Some((block, _, _)) = self.functions.find(name) else {
+            return Task::none();
+        };
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let Ok(saved) = ws.store.get(func::SAVED).map(str::to_owned) else {
+            return Task::none();
+        };
+        let taken = |n: &str| self.functions.find(n).is_some();
+        let copy = (1..)
+            .map(|n| if n == 1 { format!("{name} copy") } else { format!("{name} copy {n}") })
+            .find(|n| !taken(n))
+            .unwrap_or_default();
+        let mut lines: Vec<String> = saved
+            .lines()
+            .skip(block.open)
+            .take(block.close + 1 - block.open)
+            .map(str::to_owned)
+            .collect();
+        if let Some(fn_line) = lines.iter_mut().find(|l| l.trim_start().starts_with("fn ")) {
+            *fn_line = format!("fn {copy}");
+        }
+        let wire = match context {
+            Context::Wire { line } => Some(line),
+            Context::Node => None,
+        };
+        let call = wire.and_then(|line| self.graph_wire(line)).and_then(|w| w.function);
+        let task = self.edit_graph(
+            |text| {
+                let text = match (wire, call) {
+                    (Some(line), Some(call)) => {
+                        let rest = call.find('(').map_or("", |i| &call[i..]).to_owned();
+                        nodes::set_wire_function(text, line, Some(&format!("{copy}{rest}")))
+                    }
+                    _ => text.to_owned(),
+                };
+                nodes::add_block(&text, Section::Functions, &lines)
+            },
+            true,
+        );
+        self.status = Some(match wire {
+            Some(_) => format!("Copied to {copy} in this graph; this wire uses the copy"),
+            None => format!("Copied to {copy} in this graph"),
+        });
+        let context = match wire {
+            Some(line) => Context::Wire { line },
+            None => Context::Node,
+        };
+        self.open_editor(&copy.clone(), context);
+        task
+    }
+
+    /// Creates `_funct.md` with the two starter functions, the first time
+    /// the function library is opened.
+    fn ensure_saved_functions(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        if ws.vault.note(func::SAVED).is_some() {
+            return;
+        }
+        let path = ws.vault.path(func::SAVED);
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, func::SAVED_DEFAULT.as_bytes()));
+        if let Err(error) = created {
+            self.status = Some(format!("⚠ Couldn't create _funct.md: {error}"));
+            return;
+        }
+        if let Ok(vault) = Vault::scan(&ws.vault.root) {
+            ws.vault = vault;
+            ws.tree.refresh(&ws.vault);
+        }
+        self.status = Some("Created _funct.md with Wait For Done and Copy Status".into());
+        self.rebuild_graph();
+    }
+
+    fn open_picker(&mut self, target: PickTarget, current: Option<String>) {
+        self.ensure_saved_functions();
+        let wants = match &target {
+            PickTarget::Wire { from, to, .. } => Some((end_kind(from), end_kind(to))),
+            PickTarget::Node => None,
+        };
+        let choices = self
+            .functions
+            .all()
+            .into_iter()
+            .map(|(b, origin)| {
+                let f = &b.function;
+                let fits = match wants {
+                    Some(w) => f.wire_shape() == Some(w),
+                    None => true,
+                };
+                (f.name.clone(), origin, fits, func_editor::shape(f))
+            })
+            .collect();
+        let missing = current.as_ref().filter(|c| self.functions.find(c).is_none()).cloned();
+        let picker = Picker {
+            choices,
+            name: missing.unwrap_or_default(),
+            for_wire: matches!(target, PickTarget::Wire { .. }),
+            current,
+        };
+        self.picker = Some((picker, target));
+    }
+
+    fn picker_message(&mut self, message: func_editor::PickerMessage) -> Task<Message> {
+        use func_editor::PickerMessage;
+        let Some((picker, target)) = &mut self.picker else {
+            return Task::none();
+        };
+        match message {
+            PickerMessage::Name(name) => {
+                picker.name = name;
+                Task::none()
+            }
+            PickerMessage::Close => {
+                self.picker = None;
+                Task::none()
+            }
+            PickerMessage::Remove => {
+                let target = target.clone();
+                self.picker = None;
+                self.editor = None;
+                match target {
+                    PickTarget::Wire { line: Some(line), .. } => {
+                        self.edit_graph(|text| nodes::set_wire_function(text, line, None), true)
+                    }
+                    _ => Task::none(),
+                }
+            }
+            PickerMessage::Pick(name) => {
+                let target = target.clone();
+                self.picker = None;
+                self.attach(&name, target, None)
+            }
+            PickerMessage::Create => {
+                let name = picker.name.trim().to_owned();
+                if name.is_empty() {
+                    self.status = Some("⚠ Give the new function a name".into());
+                    return Task::none();
+                }
+                if name.contains(['(', ')', '.', ':', '[', ']']) {
+                    self.status = Some("⚠ A function's name can't contain ( ) . : [ or ]".into());
+                    return Task::none();
+                }
+                let target = target.clone();
+                self.picker = None;
+                if self.functions.find(&name).is_some() {
+                    return self.attach(&name, target, None);
+                }
+                let (kin, kout) = match &target {
+                    PickTarget::Wire { from, to, .. } => (end_kind(from), end_kind(to)),
+                    PickTarget::Node => (func::PortKind::File, func::PortKind::File),
+                };
+                let block = vec![
+                    "```obsession".to_owned(),
+                    format!("fn {name}"),
+                    func::edit::port_line(true, "src", kin),
+                    func::edit::port_line(false, "dst", kout),
+                    "```".to_owned(),
+                ];
+                self.attach(&name, target, Some(block))
+            }
+        }
+    }
+
+    /// Puts a function on a wire (or adds it as a node), creating its block
+    /// in `## Functions` first when `block` is given, then opens it.
+    fn attach(&mut self, name: &str, target: PickTarget, block: Option<Vec<String>>) -> Task<Message> {
+        let add = |text: &str| match &block {
+            Some(lines) => nodes::add_block(text, Section::Functions, lines),
+            None => text.to_owned(),
+        };
+        match target {
+            PickTarget::Node => {
+                let item = format!("fn {name}");
+                let task = self.edit_graph(|text| add(&nodes::add_item(text, Section::Nodes, &item)), true);
+                self.editor = None;
+                task
+            }
+            PickTarget::Wire { line, from, to } => {
+                let task = self.edit_graph(
+                    |text| match line {
+                        Some(line) => add(&nodes::set_wire_function(text, line, Some(name))),
+                        None => add(&nodes::add_item(
+                            text,
+                            Section::Wires,
+                            &format!("{} → {} : {name}", end_text(&from), end_text(&to)),
+                        )),
+                    },
+                    true,
+                );
+                // The wire's line now (a link wire just got one).
+                let line = self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).and_then(|note| {
+                    nodes::parse(&note.text())
+                        .wires
+                        .into_iter()
+                        .find(|w| {
+                            w.from == from
+                                && w.to == to
+                                && w.function.as_deref().is_some_and(|f| f.split('(').next().unwrap_or(f).trim().eq_ignore_ascii_case(name))
+                        })
+                        .map(|w| w.line)
+                });
+                if let Some(line) = line {
+                    self.open_editor(name, Context::Wire { line });
+                }
+                task
+            }
+        }
     }
 
     /// Changes the open graph's text (undoable, autosaved), then redraws
@@ -847,25 +1309,84 @@ impl App {
                     return Task::none();
                 };
                 if c.kind == graph::CardKind::Function {
-                    self.status = Some("Function nodes open in milestone 5".into());
+                    let name = c.title.clone();
+                    self.open_editor(&name, Context::Node);
                     return Task::none();
                 }
                 let key = c.key.clone();
                 self.follow_note(&key, None, true)
             }
             graph::Message::Connect(from, to) => {
-                let (Some(a), Some(b)) = (graph.cards.get(from), graph.cards.get(to)) else {
+                let (Some(a), Some(b)) = (graph.cards.get(from.card), graph.cards.get(to.card)) else {
                     return Task::none();
                 };
-                if a.kind == graph::CardKind::Function || b.kind == graph::CardKind::Function {
-                    self.status = Some("Wiring function pins comes in milestone 5".into());
+                let fa = a.kind == graph::CardKind::Function;
+                let fb = b.kind == graph::CardKind::Function;
+                if fa && fb {
+                    self.status = Some("⚠ Wire a function's pins to notes, not to another function".into());
                     return Task::none();
                 }
-                if graph.wires.iter().any(|w| w.from == from && w.to == to && !w.link) {
+                let start = if fa {
+                    match from.pin.and_then(|k| a.pins_out.get(k)) {
+                        Some((pin, _)) => format!("{}.{pin}", a.title),
+                        None => {
+                            self.status = Some(format!("⚠ {} has no outputs", a.title));
+                            return Task::none();
+                        }
+                    }
+                } else {
+                    format!("[[{}]]", a.key)
+                };
+                let end = if fb {
+                    match to.pin.and_then(|k| b.pins_in.get(k)) {
+                        Some((pin, _)) => format!("{}.{pin}", b.title),
+                        None => {
+                            self.status = Some(format!("⚠ {} has no inputs", b.title));
+                            return Task::none();
+                        }
+                    }
+                } else {
+                    format!("[[{}]]", b.key)
+                };
+                let known = graph.wires.iter().any(|w| {
+                    !w.link
+                        && w.from == from.card
+                        && w.to == to.card
+                        && (!fa || w.from_pin == from.pin)
+                        && (!fb || w.to_pin == to.pin)
+                });
+                if known {
                     return Task::none();
                 }
-                let item = format!("[[{}]] → [[{}]]", a.key, b.key);
+                let item = format!("{start} → {end}");
                 self.edit_graph(|text| nodes::add_item(text, Section::Wires, &item), true)
+            }
+            graph::Message::Function(wire) => {
+                let Some(w) = graph.wires.get(wire).cloned() else {
+                    return Task::none();
+                };
+                let (a, b) = (&graph.cards[w.from], &graph.cards[w.to]);
+                if a.kind == graph::CardKind::Function || b.kind == graph::CardKind::Function {
+                    self.status = Some("A wire to a function's pin carries a file; the function itself is the node".into());
+                    return Task::none();
+                }
+                let (a_key, b_key) = (a.key.clone(), b.key.clone());
+                let name = w.label.as_ref().map(|l| l.split('(').next().unwrap_or(l).trim().to_owned());
+                if let (Some(name), Some(line)) = (&name, w.line)
+                    && self.functions.find(name).is_some()
+                {
+                    self.open_editor(name, Context::Wire { line });
+                    return Task::none();
+                }
+                let (from, to) = match w.line.and_then(|line| self.graph_wire(line)) {
+                    Some(parsed) => (parsed.from, parsed.to),
+                    None => (
+                        End::Note { target: a_key, sub: None },
+                        End::Note { target: b_key, sub: None },
+                    ),
+                };
+                self.open_picker(PickTarget::Wire { line: w.line, from, to }, name);
+                Task::none()
             }
             graph::Message::Delete(graph::Selected::Card(card)) => {
                 let Some(c) = graph.cards.get(card) else {
@@ -945,6 +1466,8 @@ impl App {
         let save = self.save_now();
         let mode = self.mode;
         self.next_note_id += 1;
+        self.editor = None;
+        self.picker = None;
         let id = self.next_note_id;
 
         let Some(ws) = &mut self.workspace else {
@@ -1303,11 +1826,12 @@ impl App {
                                 .into()
                             })
                         };
-                        let graph = self
-                            .graph
-                            .as_ref()
-                            .filter(|_| self.show_graph)
-                            .map(|g| g.view().map(Message::Graph));
+                        let graph = self.graph.as_ref().filter(|_| self.show_graph).map(|g| {
+                            match &self.editor {
+                                Some(editor) => editor.view().map(Message::Editor),
+                                None => g.view().map(Message::Graph),
+                            }
+                        });
                         let body = match self.mode {
                             _ if graph.is_some() => graph,
                             Mode::Live | Mode::Reading => {
@@ -1335,7 +1859,7 @@ impl App {
 
                 let page = container(body).style(theme::page).width(Fill).height(Fill);
                 let mut middle = row![sidebar, page].height(Fill);
-                if self.show_backlinks && ws.note.is_some() {
+                if self.show_backlinks && ws.note.is_some() && !(self.editor.is_some() && self.show_graph) {
                     middle = middle.push(rule::vertical(1)).push(
                         backlinks::view(&ws.backlinks, ws.indexed).map(Message::Backlinks),
                     );
@@ -1353,6 +1877,9 @@ impl App {
         }
         if let Some(form) = &self.new_note {
             return stack![main, form.view().map(Message::NewNote)].into();
+        }
+        if let Some((picker, _)) = &self.picker {
+            return stack![main, picker.view().map(Message::Picker)].into();
         }
         match (&self.switcher, &self.workspace) {
             (Some(switcher), Some(ws)) => {
@@ -1393,13 +1920,19 @@ impl App {
                             .padding([4, 12])
                             .style(theme::tool(self.show_graph))
                     }))
-                    .push((self.graph.is_some() && self.show_graph).then(|| {
+                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("+ Node").size(theme::SMALL))
                             .on_press(Message::AddNode)
                             .padding([4, 12])
                             .style(theme::tool(false))
                     }))
-                    .push((self.graph.is_some() && self.show_graph).then(|| {
+                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
+                        button(text("+ Function").size(theme::SMALL))
+                            .on_press(Message::AddFunctionNode)
+                            .padding([4, 12])
+                            .style(theme::tool(false))
+                    }))
+                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("Link wires").size(theme::SMALL))
                             .on_press(Message::ToggleLinkWires)
                             .padding([4, 12])
@@ -1501,6 +2034,20 @@ enum Jump {
     Line(usize),
     /// A `#heading` (or `#a#b`) or `^block`, as written after `#`.
     Section(String),
+}
+
+/// The open graph's own functions and the saved ones in `_funct.md`
+/// (through the store, so it's read once).
+fn load_library(ws: &mut Workspace, graph_text: &str) -> Library {
+    let saved = if ws.vault.note(func::SAVED).is_some() {
+        ws.store.get(func::SAVED).map(func::blocks).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Library {
+        local: func::local_blocks(graph_text),
+        saved,
+    }
 }
 
 fn start_timers(id: u64, timers: Vec<(Timer, std::time::Duration)>) -> Task<Message> {

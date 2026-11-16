@@ -157,7 +157,66 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
             let n = |i: usize| parts.get(i).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             let message = match parts.first().copied() {
                 Some("move") => Message::Graph(G::Moved(n(1) as usize, iced::Point::new(n(2), n(3)))),
-                Some("connect") => Message::Graph(G::Connect(n(1) as usize, n(2) as usize)),
+                Some("connect") => {
+                    // `connect,a,b[,from pin,to pin]` (-1: no pin).
+                    let pin = |i: usize| parts.get(i).and_then(|v| v.parse::<usize>().ok());
+                    Message::Graph(G::Connect(
+                        crate::graph::PinRef { card: n(1) as usize, pin: pin(3) },
+                        crate::graph::PinRef { card: n(2) as usize, pin: pin(4) },
+                    ))
+                }
+                // The ƒ button on wire `n`.
+                Some("fn") => Message::Graph(G::Function(n(1) as usize)),
+                // The function picker: `pick,Name`, `create,Name`.
+                Some("pick") => Message::Picker(crate::func_editor::PickerMessage::Pick(parts.get(1).unwrap_or(&"").to_string())),
+                Some("create") => {
+                    tasks.push(later(
+                        delay,
+                        Message::Picker(crate::func_editor::PickerMessage::Name(parts.get(1).unwrap_or(&"").to_string())),
+                    ));
+                    delay += 100;
+                    Message::Picker(crate::func_editor::PickerMessage::Create)
+                }
+                // The function editor: `edadd,Op`, `edsel,step`,
+                // `edwire,step,input,source`, `edset,step,input,value`,
+                // `edparam,k,value`, `edhead,line`, `edback`.
+                Some(op) if op.starts_with("ed") => {
+                    use crate::func_editor::{Message as E, Sel};
+                    let text = |i: usize| parts[i.min(parts.len())..].join(",");
+                    let m = match op {
+                        "edadd" => E::AddNode(
+                            obsession_core::func::library::find(parts.get(1).unwrap_or(&""))
+                                .map_or("Len", |s| s.name),
+                        ),
+                        "edsel" => E::Select(Some(Sel::Step(n(1) as usize))),
+                        "edwire" => E::Connect {
+                            step: n(1) as usize,
+                            input: n(2) as usize,
+                            source: parts.get(3).unwrap_or(&"").to_string(),
+                            from: None,
+                        },
+                        "edset" => {
+                            tasks.push(later(delay, Message::Editor(E::Select(Some(Sel::Step(n(1) as usize))))));
+                            tasks.push(later(delay + 50, Message::Editor(E::Draft(n(2) as usize, text(3)))));
+                            delay += 100;
+                            E::Submit(n(2) as usize)
+                        }
+                        "edparam" => {
+                            tasks.push(later(delay, Message::Editor(E::ParamDraft(n(1) as usize, text(2)))));
+                            delay += 50;
+                            E::ParamSubmit
+                        }
+                        "edhead" => {
+                            tasks.push(later(delay, Message::Editor(E::Select(Some(Sel::Entry)))));
+                            tasks.push(later(delay + 50, Message::Editor(E::HeaderDraft(text(1)))));
+                            delay += 100;
+                            E::HeaderSubmit
+                        }
+                        "edback" => E::Back,
+                        _ => continue,
+                    };
+                    Message::Editor(m)
+                }
                 Some("delcard") => Message::Graph(G::Delete(Selected::Card(n(1) as usize))),
                 Some("delwire") => Message::Graph(G::Delete(Selected::Wire(n(1) as usize))),
                 Some("open") => Message::Graph(G::Open(n(1) as usize)),

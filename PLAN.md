@@ -72,16 +72,14 @@ obsession/
       doc.rs            a note as lines, each with its own line ending (byte-exact)
       history.rs        undo/redo: one snapshot per group of edits, capped at 8 MB
       live.rs           Live Preview model: blocks, drawn lines, click-to-raw mapping
-      parse/
-        task.rs         - [c] text @people ^id (parsing beyond the status box)
-        link.rs         [[links]], shortest-name resolution, renames
-        nodes.rs        _nodes.md: node list, wires, functions, layout
-        func.rs         obsession code blocks (the function text format)
+      nodes.rs          _nodes.md: node list, wires, layout, wire functions
       func/
-        types.rs        Text, List, Bool, Number, Task
+        mod.rs          obsession code blocks (the text format), Library
+        types.rs        Text, List, Bool, Number, Task; what an argument accepts
         library.rs      every node in the function library
         check.rs        type checking: decides dashed vs solid
-        eval.rs         runs functions in memory, collects patches
+        eval.rs         runs functions in memory: live values, patches
+        edit.rs         editor changes as one-line text edits
       crew.rs           _crew/*.md, mention counts, badges
       runner.rs         throttle (1 run/s), one pending run, loop guard
       log.rs            undo log in .obsessed/
@@ -104,9 +102,8 @@ obsession/
       timer.rs          one-shot delays without an async runtime
       settings.rs       last opened vault (%APPDATA%\Obsession)
       dev.rs            debug-only hooks: open a note, screenshot, quit
-      graph.rs          graph view: cards, wires, pan, zoom, drag, hit testing
-      graph/
-        func_editor.rs  inner canvas for a function (milestone 5)
+      graph.rs          graph view: cards, pins, wires, pan, zoom, drag, hit testing
+      func_editor.rs    function editor (canvas + panel) and the function picker
       crew_hand.rs      the card hand
 ```
 
@@ -355,13 +352,52 @@ How it works:
 
 Known limits, for later:
 
-- Function nodes are placeholders until milestone 5: no pins yet, wires to
-  them attach to the card, and wiring or opening them says so.
 - A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the row.
 - The view isn't saved: a graph opens fitted to the window.
 - Link wires can't be removed from the graph yet (Syntax.md wants it to ask
   whether to remove the link from the note); Delete says where the link is.
 - The card look is a first pass, to be matched to the Possess mockup.
+
+### Function editor (milestone 5)
+
+| What | Measured |
+|---|---|
+| Idle CPU, graph with function wires open | **0 ms** over 6 s |
+| Idle CPU, function editor open | **0 ms** over 6 s |
+| Core tests | 73, of which 15 for functions |
+
+How it works:
+
+- **Text first.** A function is parsed from its ```` ```obsession ```` block
+  (`core/src/func/mod.rs`); the editor never keeps its own copy. Every change
+  (move a node, connect a pin, set a value, add or remove a node, port or
+  param) is a one-line edit from `func/edit.rs`, applied to the file that holds
+  the function: the open `_nodes.md` (so Ctrl+Z undoes it) or `_funct.md`.
+  Comments, blank lines and alignment on other lines stay as they were.
+- **Checking** (`func/check.rs`) binds each node's arguments to the library's
+  inputs, finds loops, types every node in order, and requires an action. An
+  action's target must be an `out` or a task found in one. The wire is solid
+  only if the function checks, it has the right shape for where it sits (one
+  in, one out for a wire), the wire's ends are the right kinds (`[[a]]` File,
+  `[[a#^id]]` Task, `[[a#Heading]]` Section), and the wire's values fit the
+  params. A `fn` card is ready once every pin is wired.
+- **Live values** (`func/eval.rs`) run the function against the wired notes
+  (read through the store, so from RAM) each time the editor refreshes. Actions
+  produce patches (line, old lines, new lines) and a sentence saying what they
+  would change; nothing is written. `apply_patches` is ready for milestone 6
+  and the tests use it to check that running twice changes nothing.
+- **Turning solid** animates over 450 ms: the wire is drawn in the overlay with
+  its gaps closing, then joins the cached layer. Frames are requested only
+  while a wire is animating.
+
+Known limits, for later:
+
+- Edits to a saved function in `_funct.md` are saved straight away but aren't
+  in Ctrl+Z (only the open note has undo history).
+- Renaming a function (its `fn` line) doesn't update the wires that use it.
+- The editor's view and the inputs node's place aren't saved.
+- An `id` can't be renamed from the editor (edit the text).
+- `Find Task` and `Set Status`'s `find` ignore case (Syntax.md says so now).
 
 ### Drawing: only when something changes
 
@@ -567,7 +603,7 @@ performance budgets checked.
 | 2½ | **Live Preview** ✅ | Formatted editing with the clicked line raw, Source, Split and Reading views, undo/redo |
 | 3 | **Links** ✅ | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** ✅ | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
-| 5 | **Function editor** | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
+| 5 | **Function editor** ✅ | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
 | 6 | **Running functions** | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** | Animation pass, compact mode, vault search, performance on large vaults |

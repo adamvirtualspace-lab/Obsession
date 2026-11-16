@@ -364,8 +364,8 @@ Set Status(dst, st, find: target, from: "- ")  @680,60
 | `// text` | A comment. |
 
 - Arguments are positional or named (`ignore case: true`). An argument is a node
-  `id`, an `in` or `param` name, `"text"` (with `\"` for a quote), a number, or
-  `true` / `false`.
+  `id`, an `in`, `out` or `param` name, `"text"` (with `\"` for a quote, `\\`
+  for a backslash, `\n` for a new line), a number, or `true` / `false`.
 - One node per line, no nesting. Line order doesn't matter. Loops are an error.
 
 ### On a wire or as a node
@@ -454,7 +454,7 @@ missing. A wire with no function is plain dashed, without ⚠.
 | Node | Gives |
 |---|---|
 | `Tasks(text)` | List of Task |
-| `Find Task(text or list, find)` | The first task whose text contains `find`. If `find` starts with `^`, matches the ID instead |
+| `Find Task(text or list, find)` | The first task whose text contains `find` (ignoring case; empty `find` takes the first task). If `find` starts with `^`, matches the ID instead |
 | `Status(task)` | Text |
 | `Task Text(task)` | Text, without status, people or ID |
 | `People(task)` | List of Text |

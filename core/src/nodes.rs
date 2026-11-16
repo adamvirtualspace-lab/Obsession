@@ -148,7 +148,7 @@ impl Lines {
 }
 
 /// `## Title` → (2, "Title").
-fn heading(line: &str) -> Option<(usize, &str)> {
+pub(crate) fn heading(line: &str) -> Option<(usize, &str)> {
     let t = line.trim_start();
     if line.len() - t.len() > 3 {
         return None;
@@ -409,7 +409,77 @@ pub fn remove_lines(text: &str, remove: &[usize]) -> String {
     .join()
 }
 
-/// The lines of the `## Functions` section's code, for later milestones.
+/// Adds lines (a function's code block) at the end of a section, after a
+/// blank line, creating the section (before the layout comment) if the
+/// file doesn't have it.
+pub fn add_block(text: &str, section: Section, block: &[String]) -> String {
+    let mut lines = Lines::new(text);
+    let sections = lines.sections();
+    let layout = lines.layout();
+    let in_section: Vec<usize> = (0..lines.lines.len())
+        .filter(|&i| sections[i] == Some(section))
+        .filter(|&i| !layout.is_some_and(|(open, close)| (open..=close).contains(&i)))
+        .collect();
+    if let Some(&first) = in_section.first() {
+        let last = in_section.iter().rev().find(|&&i| !lines.lines[i].trim().is_empty()).copied();
+        let at = last.map_or(first, |i| i + 1);
+        let mut new = Vec::with_capacity(block.len() + 1);
+        if last.is_some() {
+            new.push(String::new());
+        }
+        new.extend(block.iter().cloned());
+        lines.lines.splice(at..at, new);
+        return lines.join();
+    }
+    // No such section: let `add_item` create it, then swap in the block.
+    const MARK: &str = "\u{1}obsession-block";
+    let with = add_item(text, section, MARK);
+    let mut lines = Lines::new(&with);
+    if let Some(i) = lines.lines.iter().position(|l| l.ends_with(MARK)) {
+        lines.lines.splice(i..=i, block.iter().cloned());
+    }
+    lines.join()
+}
+
+/// How long the `from → to` part of a wire item is.
+fn wire_head(item: &str) -> Option<usize> {
+    let (at, len) = arrow(item)?;
+    let after = at + len;
+    let rest = &item[after..];
+    let lead = rest.len() - rest.trim_start().len();
+    let rest = rest.trim_start();
+    let end = if rest.starts_with("[[") {
+        rest.find("]]")? + 2
+    } else {
+        rest.find(':').unwrap_or(rest.len())
+    };
+    Some(after + lead + rest[..end].trim_end().len())
+}
+
+/// Puts a function on the wire at `line` (`: Name(...)`), or takes it off
+/// with `None`. Nothing else on the line changes.
+pub fn set_wire_function(text: &str, line: usize, function: Option<&str>) -> String {
+    let mut lines = Lines::new(text);
+    let Some(raw) = lines.lines.get(line).cloned() else {
+        return text.to_owned();
+    };
+    let Some(item) = list_item(&raw) else {
+        return text.to_owned();
+    };
+    let item_at = item.as_ptr() as usize - raw.as_ptr() as usize;
+    let Some(head) = wire_head(item) else {
+        return text.to_owned();
+    };
+    let mut new = raw[..item_at + head].to_owned();
+    if let Some(f) = function.map(str::trim).filter(|f| !f.is_empty()) {
+        new.push_str(" : ");
+        new.push_str(f);
+    }
+    lines.lines[line] = new;
+    lines.join()
+}
+
+/// The lines of a section (after its heading).
 pub fn section_lines(text: &str, section: Section) -> Range<usize> {
     let lines = Lines::new(text);
     let sections = lines.sections();
@@ -492,6 +562,30 @@ mod tests {
         let g = parse(&removed);
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.wires.len(), 3);
+    }
+
+    #[test]
+    fn wire_functions_and_blocks() {
+        let on = set_wire_function(SAMPLE, 11, Some("Copy Status(task: \"a\")"));
+        assert_eq!(
+            on.lines().nth(11),
+            Some("- [[comp/sh040]] -> [[delivery/ep04#^a1]] : Copy Status(task: \"a\")")
+        );
+        let off = set_wire_function(SAMPLE, 10, None);
+        assert_eq!(off.lines().nth(10), Some("- [[lighting/sh040]] → [[comp/sh040]]"));
+        let swapped = set_wire_function(SAMPLE, 10, Some("Copy Status"));
+        assert_eq!(swapped.lines().nth(10), Some("- [[lighting/sh040]] → [[comp/sh040]] : Copy Status"));
+        let pin = set_wire_function("## Wires\n- [[a]] → Check.anim : Old\n", 1, Some("New"));
+        assert_eq!(pin, "## Wires\n- [[a]] → Check.anim : New\n");
+        assert_eq!(parse(&on).wires.len(), 4);
+
+        let block = ["```obsession".to_owned(), "fn New".to_owned(), "```".to_owned()];
+        let added = add_block(SAMPLE, Section::Functions, &block);
+        assert!(added.contains("## not a heading\n```\n\n```obsession\nfn New\n```\n\n%%\nobsession-layout"), "{added}");
+        let fresh = add_block("# G\n\n## Nodes\n- [[a]]\n", Section::Functions, &block);
+        assert_eq!(fresh, "# G\n\n## Nodes\n- [[a]]\n\n## Functions\n```obsession\nfn New\n```\n");
+        let names: Vec<String> = crate::func::local_blocks(&added).into_iter().map(|b| b.function.name).collect();
+        assert_eq!(names, ["Check Lighting", "New"]);
     }
 
     #[test]

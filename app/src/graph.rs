@@ -16,6 +16,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, LineDash, Path, Stroke, Text};
 use iced::{Color, Element, Fill, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
 
+use obsession_core::func::{self, Library, PortKind};
 use obsession_core::links::LinkIndex;
 use obsession_core::nodes::{self, End, NodeKind};
 use obsession_core::status::{self, Format};
@@ -29,12 +30,15 @@ const HEADER: f32 = 52.0;
 const ROW: f32 = 22.0;
 const FOOTER: f32 = 30.0;
 const MAX_ROWS: usize = 8;
-const FUNCTION_SIZE: Size = Size::new(200.0, 44.0);
+const FUNCTION_WIDTH: f32 = 220.0;
+const PIN_ROW: f32 = 22.0;
 /// Below this zoom, cards are drawn as blocks with just a title.
 const DETAIL_ZOOM: f32 = 0.5;
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 2.5;
 const GRID: f32 = 40.0;
+/// How long a wire takes to go from dashed to solid.
+const SOLID_MS: f32 = 450.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -42,10 +46,21 @@ pub enum Message {
     Moved(usize, Point),
     /// Double-click: open the card's note.
     Open(usize),
-    /// A wire was dragged from one card's handle to another card.
-    Connect(usize, usize),
+    /// A wire was dragged from one card (or a function's output pin) to
+    /// another card (or a function's input pin).
+    Connect(PinRef, PinRef),
     /// Delete was pressed with this selected.
     Delete(Selected),
+    /// The ƒ button on a wire was clicked.
+    Function(usize),
+}
+
+/// A card, and on a function card, one of its pins (an output pin at the
+/// start of a wire, an input pin at the end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinRef {
+    pub card: usize,
+    pub pin: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,13 +100,28 @@ pub struct Card {
     pub tasks: Vec<TaskRow>,
     pub done: usize,
     pub pos: Point,
+    /// A function card's pins: its `in`s and `out`s.
+    pub pins_in: Vec<(String, PortKind)>,
+    pub pins_out: Vec<(String, PortKind)>,
+    /// Why a function card isn't ready (shown with ⚠).
+    pub problem: Option<String>,
     accent: Color,
 }
 
 impl Card {
+    /// Where pin `k` sits (graph coordinates): inputs on the left edge,
+    /// outputs on the right.
+    fn pin_at(&self, pos: Point, output: bool, k: usize) -> Point {
+        let x = if output { pos.x + FUNCTION_WIDTH } else { pos.x };
+        Point::new(x, pos.y + HEADER + k as f32 * PIN_ROW + PIN_ROW / 2.0)
+    }
+
     pub fn size(&self) -> Size {
         match self.kind {
-            CardKind::Function => FUNCTION_SIZE,
+            CardKind::Function => {
+                let rows = self.pins_in.len().max(self.pins_out.len());
+                Size::new(FUNCTION_WIDTH, HEADER + rows as f32 * PIN_ROW + 10.0)
+            }
             CardKind::Missing => Size::new(CARD_WIDTH, HEADER + FOOTER),
             _ => {
                 let rows = self.tasks.len().min(MAX_ROWS) + usize::from(self.tasks.len() > MAX_ROWS);
@@ -111,6 +141,22 @@ pub struct WireView {
     pub label: Option<String>,
     /// Its line in `_nodes.md`.
     pub line: Option<usize>,
+    /// The function card's output pin it starts at / input pin it ends at.
+    pub from_pin: Option<usize>,
+    pub to_pin: Option<usize>,
+    pub state: WireState,
+    /// When it turned solid (for the dashed-to-solid animation).
+    pub solid_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireState {
+    /// No function: a relation only.
+    Plain,
+    /// Its function checks out.
+    Solid,
+    /// Dashed with ⚠: why it isn't ready.
+    Broken(String),
 }
 
 pub struct Graph {
@@ -133,21 +179,23 @@ struct DrawKey {
     version: u64,
     lifted: Option<usize>,
     links: bool,
+    /// How many wires are turning solid (drawn in the overlay meanwhile).
+    growing: usize,
 }
 
 /// Screen <-> graph coordinates.
 #[derive(Debug, Clone, Copy)]
-struct View {
-    pan: Vector,
-    zoom: f32,
+pub struct View {
+    pub pan: Vector,
+    pub zoom: f32,
 }
 
 impl View {
-    fn screen(&self, p: Point) -> Point {
+    pub fn screen(&self, p: Point) -> Point {
         Point::new(p.x * self.zoom + self.pan.x, p.y * self.zoom + self.pan.y)
     }
 
-    fn graph(&self, p: Point) -> Point {
+    pub fn graph(&self, p: Point) -> Point {
         Point::new((p.x - self.pan.x) / self.zoom, (p.y - self.pan.y) / self.zoom)
     }
 }
@@ -182,6 +230,7 @@ enum Interaction {
     },
     Wiring {
         from: usize,
+        pin: Option<usize>,
         to: Point,
     },
 }
@@ -190,12 +239,19 @@ enum Interaction {
 enum Hover {
     Card(usize),
     Handle(usize),
+    /// A function card's pin: (card, output, index).
+    Pin(usize, bool, usize),
     Wire(usize),
+    /// The ƒ button in the middle of a hovered wire.
+    Button(usize),
 }
 
 impl Graph {
     /// Reads the graph in `text` (the file at `rel`) and every note it
     /// shows (through the store, so each is read from disk at most once).
+    /// `previous` is the graph this one replaces, so wires that just became
+    /// solid can animate.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         text: &str,
         rel: &str,
@@ -203,13 +259,15 @@ impl Graph {
         store: &mut Store,
         team: Option<&Format>,
         links: &LinkIndex,
+        library: &Library,
+        previous: Option<&Graph>,
         show_links: bool,
     ) -> Self {
         let graph = nodes::parse(text);
         let mut cards: Vec<Card> = graph
             .nodes
             .iter()
-            .map(|node| card(node, rel, vault, store, team))
+            .map(|node| card(node, rel, vault, store, team, library))
             .collect();
 
         // Wires from `## Wires`.
@@ -219,7 +277,7 @@ impl Graph {
                     let to = vault.resolve_from(target, Some(rel)).entry().map(|e| e.rel.clone());
                     cards.iter().position(|c| match (&c.rel, &to) {
                         (Some(a), Some(b)) => a == b,
-                        _ => c.key.eq_ignore_ascii_case(target),
+                        _ => c.kind != CardKind::Function && c.key.eq_ignore_ascii_case(target),
                     })
                 }
                 End::Pin { function, .. } => cards
@@ -227,19 +285,63 @@ impl Graph {
                     .position(|c| c.kind == CardKind::Function && c.title.eq_ignore_ascii_case(function)),
             }
         };
-        let mut wires: Vec<WireView> = graph
-            .wires
-            .iter()
-            .filter_map(|w| {
-                Some(WireView {
-                    from: find(&w.from, &cards)?,
-                    to: find(&w.to, &cards)?,
-                    link: false,
-                    label: w.function.clone(),
-                    line: Some(w.line),
-                })
-            })
-            .collect();
+        let pin_of = |end: &End, pins: &[(String, PortKind)]| match end {
+            End::Pin { pin, .. } => pins.iter().position(|(n, _)| n.eq_ignore_ascii_case(pin)),
+            End::Note { .. } => None,
+        };
+        let mut wires: Vec<WireView> = Vec::new();
+        for w in &graph.wires {
+            let (Some(from), Some(to)) = (find(&w.from, &cards), find(&w.to, &cards)) else {
+                continue;
+            };
+            let from_pin = pin_of(&w.from, &cards[from].pins_out);
+            let to_pin = pin_of(&w.to, &cards[to].pins_in);
+            let state = wire_state(w, &cards[from], &cards[to], from_pin, to_pin, library);
+            wires.push(WireView {
+                from,
+                to,
+                link: false,
+                label: w.function.clone(),
+                line: Some(w.line),
+                from_pin,
+                to_pin,
+                state,
+                solid_since: None,
+            });
+        }
+
+        // A function card is ready once every pin is wired; until then its
+        // wires are dashed too.
+        for (i, c) in cards.iter_mut().enumerate() {
+            if c.kind != CardKind::Function || c.problem.is_some() {
+                continue;
+            }
+            let unwired = c
+                .pins_in
+                .iter()
+                .enumerate()
+                .find(|(k, _)| !wires.iter().any(|w| w.to == i && w.to_pin == Some(*k)))
+                .map(|(_, (n, _))| n.clone())
+                .or_else(|| {
+                    c.pins_out
+                        .iter()
+                        .enumerate()
+                        .find(|(k, _)| !wires.iter().any(|w| w.from == i && w.from_pin == Some(*k)))
+                        .map(|(_, (n, _))| n.clone())
+                });
+            if let Some(pin) = unwired {
+                c.problem = Some(format!("`{pin}` isn't wired yet"));
+            }
+        }
+        for w in &mut wires {
+            for c in [w.from, w.to] {
+                if w.state == WireState::Solid
+                    && let Some(p) = &cards[c].problem
+                {
+                    w.state = WireState::Broken(p.clone());
+                }
+            }
+        }
 
         // `[[links]]` between two cards: from the linked note to the note
         // with the link.
@@ -260,8 +362,29 @@ impl Graph {
                         link: true,
                         label: None,
                         line: None,
+                        from_pin: None,
+                        to_pin: None,
+                        state: WireState::Plain,
+                        solid_since: None,
                     });
                 }
+            }
+        }
+
+        // Wires that just became solid animate from dashed.
+        if let Some(previous) = previous {
+            let now = Instant::now();
+            for w in wires.iter_mut().filter(|w| w.state == WireState::Solid) {
+                let before = previous.wires.iter().find(|p| {
+                    p.line == w.line
+                        && p.label == w.label
+                        && previous.cards.get(p.from).map(|c| &c.key) == cards.get(w.from).map(|c| &c.key)
+                        && previous.cards.get(p.to).map(|c| &c.key) == cards.get(w.to).map(|c| &c.key)
+                });
+                w.solid_since = match before {
+                    Some(p) if p.state == WireState::Solid => p.solid_since,
+                    _ => Some(now),
+                };
             }
         }
 
@@ -287,6 +410,11 @@ impl Graph {
             drawn: Cell::new(None),
             version: 0,
         }
+    }
+
+    /// Whether a wire is still turning solid.
+    fn animating(&self) -> bool {
+        self.wires.iter().any(|w| w.solid_since.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < SOLID_MS))
     }
 
     /// Something about the cards changed: redraw them.
@@ -324,19 +452,64 @@ impl Graph {
     fn wire_ends(&self, wire: &WireView, state: &State) -> (Point, Point) {
         let a = self.card_rect(wire.from, state);
         let b = self.card_rect(wire.to, state);
-        (
-            Point::new(a.x + a.width, a.y + a.height.min(HEADER + 40.0) / 2.0),
-            Point::new(b.x, b.y + b.height.min(HEADER + 40.0) / 2.0),
-        )
+        let start = match wire.from_pin {
+            Some(k) => self.cards[wire.from].pin_at(a.position(), true, k),
+            None => handle(a),
+        };
+        let end = match wire.to_pin {
+            Some(k) => self.cards[wire.to].pin_at(b.position(), false, k),
+            None => Point::new(b.x, b.y + b.height.min(HEADER + 40.0) / 2.0),
+        };
+        (start, end)
+    }
+
+    /// The middle of a wire, where its ƒ button sits (graph coordinates).
+    fn middle(&self, wire: &WireView, state: &State) -> Point {
+        let (a, b) = self.wire_ends(wire, state);
+        curve_points(a, b)[12]
+    }
+
+    /// The input pin of card `j` nearest to `g` (function cards only).
+    fn nearest_input(&self, j: usize, state: &State, g: Point) -> Option<usize> {
+        let card = &self.cards[j];
+        if card.kind != CardKind::Function {
+            return None;
+        }
+        let pos = self.card_rect(j, state).position();
+        (0..card.pins_in.len()).min_by(|&a, &b| {
+            let da = (card.pin_at(pos, false, a).y - g.y).abs();
+            let db = (card.pin_at(pos, false, b).y - g.y).abs();
+            da.total_cmp(&db)
+        })
     }
 
     fn hit(&self, state: &State, view: View, p: Point) -> Option<Hover> {
         let g = view.graph(p);
+        // The ƒ button: on every wire with a function, and on the hovered
+        // wire.
+        let reach = 10.0 * view.zoom.max(0.6);
+        for (i, w) in self.visible_wires() {
+            let shown = w.label.is_some() || matches!(state.hover, Some(Hover::Wire(h) | Hover::Button(h)) if h == i);
+            if shown && view.screen(self.middle(w, state)).distance(p) <= reach {
+                return Some(Hover::Button(i));
+            }
+        }
         // Cards on top of wires; later cards on top of earlier ones.
         for i in (0..self.cards.len()).rev() {
             let r = self.card_rect(i, state);
-            let handle = Point::new(r.x + r.width, r.y + r.height.min(HEADER + 40.0) / 2.0);
-            if self.cards[i].kind != CardKind::Function && view.screen(handle).distance(p) <= 8.0 {
+            let card = &self.cards[i];
+            if card.kind == CardKind::Function {
+                for k in 0..card.pins_out.len() {
+                    if view.screen(card.pin_at(r.position(), true, k)).distance(p) <= 8.0 {
+                        return Some(Hover::Pin(i, true, k));
+                    }
+                }
+                for k in 0..card.pins_in.len() {
+                    if view.screen(card.pin_at(r.position(), false, k)).distance(p) <= 8.0 {
+                        return Some(Hover::Pin(i, false, k));
+                    }
+                }
+            } else if view.screen(handle(r)).distance(p) <= 8.0 {
                 return Some(Hover::Handle(i));
             }
             if r.contains(g) {
@@ -415,9 +588,24 @@ impl canvas::Program<Message> for Graph {
                 let hit = self.hit(state, view, p);
                 match hit {
                     Some(Hover::Handle(i)) => {
-                        state.interaction = Interaction::Wiring { from: i, to: view.graph(p) };
+                        state.interaction = Interaction::Wiring {
+                            from: i,
+                            pin: None,
+                            to: view.graph(p),
+                        };
                     }
-                    Some(Hover::Card(i)) => {
+                    Some(Hover::Pin(i, true, k)) => {
+                        state.interaction = Interaction::Wiring {
+                            from: i,
+                            pin: Some(k),
+                            to: view.graph(p),
+                        };
+                    }
+                    Some(Hover::Button(i)) => {
+                        state.selected = Some(Selected::Wire(i));
+                        return Some(canvas::Action::publish(Message::Function(i)).and_capture());
+                    }
+                    Some(Hover::Card(i) | Hover::Pin(i, false, _)) => {
                         state.selected = Some(Selected::Card(i));
                         let now = Instant::now();
                         let double = state
@@ -480,13 +668,17 @@ impl canvas::Program<Message> for Graph {
                     Interaction::Dragging { card, at, moved: true, .. } => {
                         Some(canvas::Action::publish(Message::Moved(card, at)))
                     }
-                    Interaction::Wiring { from, .. } => {
+                    Interaction::Wiring { from, pin, .. } => {
                         let target = point.and_then(|p| match self.hit(state, view, p) {
-                            Some(Hover::Card(i) | Hover::Handle(i)) if i != from => Some(i),
+                            Some(Hover::Pin(i, false, k)) if i != from => Some(PinRef { card: i, pin: Some(k) }),
+                            Some(Hover::Card(i) | Hover::Handle(i) | Hover::Pin(i, true, _)) if i != from => Some(PinRef {
+                                card: i,
+                                pin: self.nearest_input(i, state, view.graph(p)),
+                            }),
                             _ => None,
                         });
                         Some(match target {
-                            Some(to) => canvas::Action::publish(Message::Connect(from, to)),
+                            Some(to) => canvas::Action::publish(Message::Connect(PinRef { card: from, pin }, to)),
                             None => canvas::Action::request_redraw(),
                         })
                     }
@@ -523,8 +715,9 @@ impl canvas::Program<Message> for Graph {
             }
             Event::Window(iced::window::Event::RedrawRequested(_)) => {
                 // Marching ants on the hovered or selected wire only.
-                let animated = matches!(state.hover, Some(Hover::Wire(_)))
-                    || matches!(state.selected, Some(Selected::Wire(_)));
+                let animated = matches!(state.hover, Some(Hover::Wire(_) | Hover::Button(_)))
+                    || matches!(state.selected, Some(Selected::Wire(_)))
+                    || self.animating();
                 animated.then(|| canvas::Action::request_redraw_at(Instant::now() + std::time::Duration::from_millis(50)))
             }
             _ => None,
@@ -545,6 +738,7 @@ impl canvas::Program<Message> for Graph {
             Interaction::Dragging { card, .. } => Some(card),
             _ => None,
         };
+        let growing = self.wires.iter().filter(|w| progress(w) < 1.0).count();
         let key = DrawKey {
             pan: state.pan,
             zoom,
@@ -552,6 +746,7 @@ impl canvas::Program<Message> for Graph {
             version: self.version,
             lifted,
             links: self.show_links,
+            growing,
         };
         if self.drawn.get() != Some(key) {
             self.cache.clear();
@@ -562,11 +757,11 @@ impl canvas::Program<Message> for Graph {
         let still = self.cache.draw(renderer, bounds.size(), |frame| {
             draw_grid(frame, view);
             for (_, wire) in self.visible_wires() {
-                if lifted.is_some_and(|c| wire.from == c || wire.to == c) {
+                if lifted.is_some_and(|c| wire.from == c || wire.to == c) || progress(wire) < 1.0 {
                     continue;
                 }
                 let (a, b) = self.wire_ends(wire, state);
-                draw_wire(frame, view, a, b, wire, false, 0, screen);
+                draw_wire(frame, view, a, b, wire, Look::default(), screen);
             }
             for (i, card) in self.cards.iter().enumerate() {
                 if Some(i) != lifted {
@@ -581,11 +776,18 @@ impl canvas::Program<Message> for Graph {
             .started
             .map_or(0, |s| (s.elapsed().as_millis() / 50) as usize % 11);
         for (i, wire) in self.visible_wires() {
-            let lit = state.hover == Some(Hover::Wire(i)) || state.selected == Some(Selected::Wire(i));
+            let lit = matches!(state.hover, Some(Hover::Wire(h) | Hover::Button(h)) if h == i)
+                || state.selected == Some(Selected::Wire(i));
             let moving = lifted.is_some_and(|c| wire.from == c || wire.to == c);
-            if lit || moving {
+            if lit || moving || progress(wire) < 1.0 {
                 let (a, b) = self.wire_ends(wire, state);
-                draw_wire(&mut frame, view, a, b, wire, lit, if lit { 11 - ants } else { 0 }, screen);
+                let look = Look {
+                    lit,
+                    ants: if lit { 11 - ants } else { 0 },
+                    button: lit,
+                    pressed: state.hover == Some(Hover::Button(i)),
+                };
+                draw_wire(&mut frame, view, a, b, wire, look, screen);
             }
         }
         if let Some(i) = lifted {
@@ -606,17 +808,22 @@ impl canvas::Program<Message> for Graph {
         if let Some(Hover::Card(i) | Hover::Handle(i)) = state.hover
             && self.cards[i].kind != CardKind::Function
         {
-            let r = self.card_rect(i, state);
-            let handle = view.screen(Point::new(r.x + r.width, r.y + r.height.min(HEADER + 40.0) / 2.0));
             let lit = state.hover == Some(Hover::Handle(i));
             frame.fill(
-                &Path::circle(handle, if lit { 6.0 } else { 4.5 }),
+                &Path::circle(view.screen(handle(self.card_rect(i, state))), if lit { 6.0 } else { 4.5 }),
                 if lit { theme::ACCENT } else { theme::MUTED },
             );
         }
-        if let Interaction::Wiring { from, to } = state.interaction {
+        if let Some(Hover::Pin(i, output, k)) = state.hover {
+            let pos = self.card_rect(i, state).position();
+            frame.fill(&Path::circle(view.screen(self.cards[i].pin_at(pos, output, k)), 6.0), theme::ACCENT);
+        }
+        if let Interaction::Wiring { from, pin, to } = state.interaction {
             let r = self.card_rect(from, state);
-            let a = Point::new(r.x + r.width, r.y + r.height.min(HEADER + 40.0) / 2.0);
+            let a = match pin {
+                Some(k) => self.cards[from].pin_at(r.position(), true, k),
+                None => handle(r),
+            };
             let segments = [6.0 * zoom, 5.0 * zoom];
             frame.stroke(
                 &curve(view, a, to),
@@ -640,15 +847,126 @@ impl canvas::Program<Message> for Graph {
         }
         match state.hover {
             Some(Hover::Card(_)) => mouse::Interaction::Grab,
-            Some(Hover::Handle(_)) => mouse::Interaction::Crosshair,
-            Some(Hover::Wire(_)) => mouse::Interaction::Pointer,
+            Some(Hover::Handle(_) | Hover::Pin(..)) => mouse::Interaction::Crosshair,
+            Some(Hover::Wire(_) | Hover::Button(_)) => mouse::Interaction::Pointer,
             None => mouse::Interaction::None,
         }
     }
 }
 
+/// Out of the right side of a card (mid-header), where its handle is.
+fn handle(r: Rectangle) -> Point {
+    Point::new(r.x + r.width, r.y + r.height.min(HEADER + 40.0) / 2.0)
+}
+
+/// How far a wire is from dashed (0) to solid (1).
+fn progress(w: &WireView) -> f32 {
+    w.solid_since
+        .map_or(1.0, |t| (t.elapsed().as_secs_f32() * 1000.0 / SOLID_MS).min(1.0))
+}
+
+/// What a wire end takes: a note is a File, `#^id` a Task, `#Heading` a
+/// Section.
+fn end_kind(end: &End) -> Option<PortKind> {
+    match end {
+        End::Note { sub: None, .. } => Some(PortKind::File),
+        End::Note { sub: Some(s), .. } if s.starts_with('^') => Some(PortKind::Task),
+        End::Note { .. } => Some(PortKind::Section),
+        End::Pin { .. } => None,
+    }
+}
+
+/// Whether a `## Wires` wire is plain, solid or broken (and why).
+fn wire_state(
+    w: &nodes::Wire,
+    a: &Card,
+    b: &Card,
+    from_pin: Option<usize>,
+    to_pin: Option<usize>,
+    library: &Library,
+) -> WireState {
+    use func::check::port_end;
+    // A wire to or from a function card's pin.
+    if a.kind == CardKind::Function || b.kind == CardKind::Function {
+        if a.kind == b.kind {
+            return WireState::Broken("Wire a function's pins to notes, not to another function".into());
+        }
+        if w.function.is_some() {
+            return WireState::Broken("A wire to a function's pin can't have a function of its own".into());
+        }
+        let (card, pins, pin, note, end) = if a.kind == CardKind::Function {
+            (a, &a.pins_out, from_pin, &w.to, &w.from)
+        } else {
+            (b, &b.pins_in, to_pin, &w.from, &w.to)
+        };
+        if let Some(problem) = &card.problem {
+            return WireState::Broken(problem.clone());
+        }
+        let Some(k) = pin else {
+            let name = match end {
+                End::Pin { pin, .. } => pin.as_str(),
+                End::Note { .. } => "",
+            };
+            return WireState::Broken(format!("{} has no pin `{name}`", card.title));
+        };
+        let (name, want) = &pins[k];
+        if end_kind(note) != Some(*want) {
+            return WireState::Broken(format!("`{name}` wants {}", port_end(*want)));
+        }
+        return WireState::Solid;
+    }
+    let Some(call) = &w.function else {
+        return WireState::Plain;
+    };
+    let (name, args) = match func::parse_call(call) {
+        Ok(parsed) => parsed,
+        Err(e) => return WireState::Broken(e),
+    };
+    let Some((block, _, _)) = library.find(&name) else {
+        return WireState::Broken(format!("No function called {name}"));
+    };
+    let f = &block.function;
+    let Some((kin, kout)) = f.wire_shape() else {
+        return WireState::Broken(format!(
+            "{name} has {} in and {} out: list it in ## Nodes as `fn {name}` and wire its pins",
+            f.inputs.len(),
+            f.outputs.len()
+        ));
+    };
+    if end_kind(&w.from) != Some(kin) {
+        return WireState::Broken(format!("{name}'s `{}` wants {}", f.inputs[0].name, port_end(kin)));
+    }
+    if end_kind(&w.to) != Some(kout) {
+        return WireState::Broken(format!("{name}'s `{}` wants {}", f.outputs[0].name, port_end(kout)));
+    }
+    let checked = func::check::check(f);
+    if let Some(p) = checked.first_problem() {
+        return WireState::Broken(format!("{name}: {p}"));
+    }
+    if let Some(p) = func::check::check_call(f, &args).into_iter().next() {
+        return WireState::Broken(p);
+    }
+    WireState::Solid
+}
+
+/// A pin's colour by what it carries.
+pub fn pin_color(kind: PortKind) -> Color {
+    match kind {
+        PortKind::File => theme::LINK,
+        PortKind::Task => theme::SUCCESS,
+        PortKind::Section => theme::TAG,
+    }
+}
+
 /// One node's card: the note's name, folder and tasks.
-fn card(node: &nodes::Node, rel: &str, vault: &Vault, store: &mut Store, team: Option<&Format>) -> Card {
+fn card(
+    node: &nodes::Node,
+    rel: &str,
+    vault: &Vault,
+    store: &mut Store,
+    team: Option<&Format>,
+    library: &Library,
+) -> Card {
     let blank = |kind, title: &str, folder: &str| Card {
         key: node.key.clone(),
         rel: None,
@@ -658,10 +976,25 @@ fn card(node: &nodes::Node, rel: &str, vault: &Vault, store: &mut Store, team: O
         tasks: Vec::new(),
         done: 0,
         pos: Point::ORIGIN,
+        pins_in: Vec::new(),
+        pins_out: Vec::new(),
+        problem: None,
         accent: accent(folder),
     };
     let target = match &node.kind {
-        NodeKind::Function { name } => return blank(CardKind::Function, name, ""),
+        NodeKind::Function { name } => {
+            let mut card = blank(CardKind::Function, name, "");
+            match library.find(name) {
+                Some((block, _, _)) => {
+                    let f = &block.function;
+                    card.pins_in = f.inputs.iter().map(|p| (p.name.clone(), p.kind)).collect();
+                    card.pins_out = f.outputs.iter().map(|p| (p.name.clone(), p.kind)).collect();
+                    card.problem = func::check::check(f).first_problem().map(str::to_owned);
+                }
+                None => card.problem = Some(format!("No function called {name}")),
+            }
+            return card;
+        }
         NodeKind::File { target } => target,
     };
     let (entry, kind) = match vault.resolve_from(target, Some(rel)) {
@@ -790,7 +1123,7 @@ fn auto_place(cards: &mut [Card], placed: &[bool], wires: &[WireView]) {
     }
 }
 
-fn draw_grid(frame: &mut Frame, view: View) {
+pub fn draw_grid(frame: &mut Frame, view: View) {
     let size = frame.size();
     frame.fill_rectangle(Point::ORIGIN, size, theme::BG);
     let step = if view.zoom < 0.5 { GRID * 4.0 } else { GRID } * view.zoom;
@@ -827,7 +1160,7 @@ fn curve_points(a: Point, b: Point) -> Vec<Point> {
         .collect()
 }
 
-fn curve(view: View, a: Point, b: Point) -> Path {
+pub fn curve(view: View, a: Point, b: Point) -> Path {
     let dx = ((b.x - a.x).abs() / 2.0).max(60.0);
     Path::new(|p| {
         p.move_to(view.screen(a));
@@ -849,32 +1182,59 @@ fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     p.distance(Point::new(a.x + ab.x * t, a.y + ab.y * t))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView, lit: bool, ants: usize, screen: Rectangle) {
+#[derive(Debug, Clone, Copy, Default)]
+struct Look {
+    lit: bool,
+    ants: usize,
+    /// Show the ƒ button (a hovered wire).
+    button: bool,
+    /// The mouse is on the button.
+    pressed: bool,
+}
+
+fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView, look: Look, screen: Rectangle) {
     // Skip wires entirely off screen.
     let (sa, sb) = (view.screen(a), view.screen(b));
     let reach = ((sb.x - sa.x).abs() / 2.0).max(60.0 * view.zoom);
     let bbox = Rectangle::new(
-        Point::new(sa.x.min(sb.x) - reach, sa.y.min(sb.y) - 10.0),
-        Size::new((sa.x - sb.x).abs() + 2.0 * reach, (sa.y - sb.y).abs() + 20.0),
+        Point::new(sa.x.min(sb.x) - reach, sa.y.min(sb.y) - 30.0),
+        Size::new((sa.x - sb.x).abs() + 2.0 * reach, (sa.y - sb.y).abs() + 60.0),
     );
     if !bbox.intersects(&screen) {
         return;
     }
+    let lit = look.lit;
+    let solid = wire.state == WireState::Solid;
     let color = if lit {
         theme::ACCENT
     } else if wire.link {
         Color { a: 0.55, ..theme::MUTED }
+    } else if solid {
+        theme::MENTION
     } else {
         theme::MUTED
     };
     let z = view.zoom.max(0.4);
-    let segments = [6.0 * z, 5.0 * z];
+    let grown = progress(wire);
+    // A wire turning solid closes its gaps.
+    let gap = if solid { 5.0 * z * (1.0 - grown) } else { 5.0 * z };
+    let segments = [6.0 * z, gap.max(0.01)];
+    let dash = if solid && grown >= 1.0 && !lit {
+        LineDash::default()
+    } else {
+        LineDash { segments: &segments, offset: look.ants }
+    };
     frame.stroke(
         &curve(view, a, b),
         Stroke {
-            line_dash: LineDash { segments: &segments, offset: ants },
-            ..Stroke::default().with_color(color).with_width(if lit { 2.2 } else { 1.5 })
+            line_dash: dash,
+            ..Stroke::default().with_color(color).with_width(if lit {
+                2.2
+            } else if solid {
+                1.8
+            } else {
+                1.5
+            })
         },
     );
     // Arrowhead.
@@ -888,25 +1248,75 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         }),
         color,
     );
-    if let Some(label) = &wire.label
-        && view.zoom >= DETAIL_ZOOM
-    {
-        let mid = curve_points(a, b)[12];
-        let name = label.split('(').next().unwrap_or(label).trim();
+    let mid = view.screen(curve_points(a, b)[12]);
+    let broken = match &wire.state {
+        WireState::Broken(why) => Some(why.as_str()),
+        _ => None,
+    };
+    // The ƒ dot: on wires with a function, and on a hovered wire.
+    if wire.label.is_some() || look.button {
+        let k = z.min(1.2);
+        let ring = if broken.is_some() {
+            theme::WARNING
+        } else if lit {
+            theme::ACCENT
+        } else {
+            color
+        };
+        let circle = Path::circle(mid, 8.0 * k);
+        frame.fill(&circle, if look.pressed { theme::ACCENT } else { theme::RAISED });
+        frame.stroke(&circle, Stroke::default().with_color(ring).with_width(1.2));
         frame.fill_text(Text {
-            content: format!("ƒ {name}"),
-            position: view.screen(Point::new(mid.x, mid.y - 16.0)),
-            color: if lit { theme::ACCENT } else { theme::MUTED },
-            size: Pixels(11.0 * view.zoom),
+            content: "ƒ".into(),
+            position: Point::new(mid.x, mid.y - 7.0 * k),
+            color: if look.pressed { theme::BG } else { ring },
+            size: Pixels(11.0 * k),
             font: theme::UI_FONT,
             align_x: iced::widget::text::Alignment::Center,
             ..Text::default()
         });
     }
+    if view.zoom < DETAIL_ZOOM {
+        return;
+    }
+    let mut above = match &wire.label {
+        Some(label) => format!("ƒ {}", label.split('(').next().unwrap_or(label).trim()),
+        None if look.button => "Add a function".to_owned(),
+        None => String::new(),
+    };
+    if broken.is_some() {
+        above.push_str("  ⚠");
+    }
+    let caption = |frame: &mut Frame, content: String, y: f32, color: Color| {
+        frame.fill_text(Text {
+            content,
+            position: Point::new(mid.x, mid.y + y * view.zoom),
+            color,
+            size: Pixels(11.0 * view.zoom),
+            font: theme::UI_FONT,
+            align_x: iced::widget::text::Alignment::Center,
+            ..Text::default()
+        });
+    };
+    if !above.is_empty() {
+        let tint = if broken.is_some() {
+            theme::WARNING
+        } else if lit {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        };
+        caption(frame, above, -27.0, tint);
+    }
+    if let Some(why) = broken
+        && lit
+    {
+        caption(frame, fit(why, 440.0, 11.0), 13.0, theme::WARNING);
+    }
 }
 
 /// Cuts `text` to about `width` pixels at `size`, with an ellipsis.
-fn fit(text: &str, width: f32, size: f32) -> String {
+pub fn fit(text: &str, width: f32, size: f32) -> String {
     let max = (width / (size * 0.52)).max(1.0) as usize;
     if text.chars().count() <= max {
         return text.to_owned();
@@ -944,15 +1354,43 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
 
     if card.kind == CardKind::Function {
         frame.fill(&body, theme::RAISED);
-        frame.stroke(&body, Stroke::default().with_color(theme::MENTION).with_width(1.2));
+        let ring = if card.problem.is_some() { theme::WARNING } else { theme::MENTION };
+        frame.stroke(&body, Stroke::default().with_color(ring).with_width(1.2));
         label(
             frame,
             fit(&format!("ƒ  {}", card.title), size.width - 24.0, 14.0),
-            Point::new(p.x + 12.0 * z, p.y + 13.0 * z),
+            Point::new(p.x + 12.0 * z, p.y + 11.0 * z),
             14.0 * z,
             theme::MENTION,
             semibold,
         );
+        if z < DETAIL_ZOOM {
+            return;
+        }
+        let (sub, color) = match &card.problem {
+            Some(why) => (format!("⚠ {why}"), theme::WARNING),
+            None => ("function · double-click to edit".to_owned(), theme::FAINT),
+        };
+        label(frame, fit(&sub, size.width - 24.0, 11.0), Point::new(p.x + 12.0 * z, p.y + 31.0 * z), 11.0 * z, color, theme::UI_FONT);
+        for (output, pins) in [(false, &card.pins_in), (true, &card.pins_out)] {
+            for (k, (name, kind)) in pins.iter().enumerate() {
+                let at = view.screen(card.pin_at(pos, output, k));
+                frame.fill(&Path::circle(at, 4.5 * z), pin_color(*kind));
+                frame.fill_text(Text {
+                    content: fit(&format!("{name}: {}", kind.name()), size.width / 2.0 - 16.0, 12.0),
+                    position: Point::new(if output { at.x - 10.0 * z } else { at.x + 10.0 * z }, at.y - 7.5 * z),
+                    color: theme::TEXT,
+                    size: Pixels(12.0 * z),
+                    font: theme::UI_FONT,
+                    align_x: if output {
+                        iced::widget::text::Alignment::Right
+                    } else {
+                        iced::widget::text::Alignment::Left
+                    },
+                    ..Text::default()
+                });
+            }
+        }
         return;
     }
 
