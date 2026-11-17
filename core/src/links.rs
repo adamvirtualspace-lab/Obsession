@@ -323,6 +323,10 @@ pub struct Backlink {
 struct Indexed {
     links: Vec<IndexedLink>,
     outline: Outline,
+    /// `@name`s on task lines, with the task's status.
+    mentions: Vec<(String, char)>,
+    /// The note's own `statuses:`, if it has them.
+    format: Option<crate::status::Format>,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +408,8 @@ impl LinkIndex {
             Indexed {
                 links: found,
                 outline: outline(text),
+                mentions: crate::crew::task_mentions(text),
+                format: crate::status::from_frontmatter(text.lines()).and_then(|l| l.format),
             },
         );
     }
@@ -429,6 +435,30 @@ impl LinkIndex {
             .get(rel)
             .into_iter()
             .flat_map(|n| n.links.iter().map(|l| &*l.target))
+    }
+
+    /// Mentions per person on unfinished tasks across the vault (or only in
+    /// `only`), each note judged by its own status format.
+    pub fn mention_counts(&self, team: Option<&crate::status::Format>, only: Option<&[&str]>) -> HashMap<String, u32> {
+        let builtin = crate::status::Format::builtin();
+        let mut out: HashMap<String, u32> = HashMap::new();
+        for (rel, note) in &self.notes {
+            if only.is_some_and(|o| !o.contains(&&**rel)) {
+                continue;
+            }
+            let format = note.format.as_ref().or(team).unwrap_or(&builtin);
+            for (name, ch) in &note.mentions {
+                if !format.is_finished(*ch) {
+                    *out.entry(name.clone()).or_default() += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every name mentioned on a task anywhere.
+    pub fn mentioned(&self) -> std::collections::BTreeSet<&str> {
+        self.notes.values().flat_map(|n| n.mentions.iter().map(|(m, _)| m.as_str())).collect()
     }
 
     pub fn outline(&self, rel: &str) -> Option<&Outline> {

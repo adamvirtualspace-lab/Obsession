@@ -34,6 +34,7 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
 use obsession_core::links::{self, Backlink, LinkIndex};
+use obsession_core::crew::{self, Member};
 use obsession_core::func::{self, Library, Origin};
 use obsession_core::func::eval::Bind;
 use obsession_core::nodes::{self, End, Section};
@@ -76,6 +77,11 @@ enum Message {
     /// Show the open `_nodes.md` as a graph (or as text).
     ToggleGraph,
     ToggleLinkWires,
+    /// Show or hide the crew hand in the graph.
+    ToggleHand,
+    Settings(SettingsMessage),
+    /// From the "assign to which task" box: (node card, task row), or close.
+    AssignTo(Option<(usize, usize)>),
     /// Pick a note to add to the open graph.
     AddNode,
     /// Pick a function to add to the open graph as a node.
@@ -110,6 +116,9 @@ enum Message {
     RunDone(Arc<RunResult>),
     Runs(runs::Message),
     ToggleRuns,
+    /// Complete the `@name` being typed (with this crew key, or the first
+    /// suggestion).
+    CompleteMention(Option<String>),
     /// Run the open graph's out-of-date functions.
     RunGraph,
     #[cfg(debug_assertions)]
@@ -145,6 +154,64 @@ struct Workspace {
     backlinks: Vec<Backlink>,
     /// Functions: what runs when, and the run log.
     runs: runs::Runs,
+    /// The crew folder (`crew:` in `_settings.md`, else `_crew`).
+    crew_folder: String,
+    /// The crew, by name: cards in the crew folder, and people's folders.
+    crew: Vec<Member>,
+    /// Open `@mentions` per person across the vault.
+    mentions: HashMap<String, u32>,
+}
+
+impl Workspace {
+    /// Reads the crew folder: each card note in it (through the store),
+    /// and each person's folder (with or without its card yet).
+    fn load_crew(&mut self) {
+        let seats = crew::seats(
+            &self.crew_folder,
+            self.vault.entries.iter().map(|e| (&*e.rel, e.kind == Kind::Folder)),
+        );
+        let mut crew: Vec<Member> = Vec::new();
+        for seat in seats {
+            let exists = self.vault.note(&seat.card).is_some();
+            let text = if exists { self.store.get(&seat.card).ok().map(str::to_owned) } else { None };
+            let mut m = match text {
+                Some(text) => crew::card(&seat.card, &text),
+                None => {
+                    let mut m = crew::card(&seat.card, "");
+                    m.exists = false;
+                    m
+                }
+            };
+            // A person's folder names them unless their card does.
+            if let Some(folder) = &seat.folder_name
+                && m.name.eq_ignore_ascii_case(folder)
+            {
+                m.name = folder.clone();
+            }
+            m.key = seat.key;
+            crew.push(m);
+        }
+        crew.sort_by_key(|m| m.name.to_lowercase());
+        self.crew = crew;
+    }
+
+    /// Whether people in the crew folder have folders of their own.
+    fn crew_as_folders(&self) -> bool {
+        self.crew.iter().any(|m| m.rel.matches('/').count() > self.crew_folder.matches('/').count() + 1)
+    }
+
+    /// Each crew member's badge from vault-wide open mentions.
+    fn vault_badges(&self) -> Vec<Option<crew::Badge>> {
+        let counts: Vec<u32> = self.crew.iter().map(|m| self.mentions.get(&m.key).copied().unwrap_or(0)).collect();
+        crew::badges(&counts)
+    }
+}
+
+/// `@name` suggestions while typing.
+struct Completion {
+    typed: String,
+    /// (key, name, role)
+    matches: Vec<(String, String, String)>,
 }
 
 /// A finished run, with its summary (made against the index it ran on).
@@ -191,6 +258,11 @@ impl Workspace {
         };
         let lookup = lookup.unwrap_or_default();
         self.team = lookup.format;
+        self.crew_folder = if has_settings {
+            self.store.get(SETTINGS_NOTE).map(crew::folder_setting).unwrap_or_else(|_| crew::FOLDER.to_owned())
+        } else {
+            crew::FOLDER.to_owned()
+        };
         lookup.warnings
     }
 }
@@ -221,6 +293,40 @@ struct App {
     editor_fit: u64,
     /// Choosing a function for a wire or a function node.
     picker: Option<(Picker, PickTarget)>,
+    /// `@name` suggestions for what's being typed.
+    completion: Option<Completion>,
+    show_hand: bool,
+    /// A crew card dropped on a node: choosing which task.
+    assigning: Option<Assigning>,
+    /// The Settings page, while open.
+    settings: Option<SettingsForm>,
+}
+
+/// The Settings page: vault-wide settings, saved in `_settings.md`.
+struct SettingsForm {
+    crew: String,
+    /// Why the picked folder can't be used.
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SettingsMessage {
+    Open,
+    Crew(String),
+    /// Open the folder picker.
+    Browse,
+    /// The folder picker closed.
+    Picked(Option<PathBuf>),
+    Save,
+    Close,
+}
+
+struct Assigning {
+    member: String,
+    card: usize,
+    /// (row, task text, already mentions them)
+    tasks: Vec<(usize, String, bool)>,
+    title: String,
 }
 
 /// What the function picker is choosing for.
@@ -271,6 +377,10 @@ impl App {
             editor: None,
             editor_fit: 0,
             picker: None,
+            completion: None,
+            show_hand: true,
+            assigning: None,
+            settings: None,
         };
         let start = std::env::args_os()
             .nth(1)
@@ -365,10 +475,14 @@ impl App {
                     indexed: false,
                     backlinks: Vec::new(),
                     runs,
+                    crew_folder: crew::FOLDER.to_owned(),
+                    crew: Vec::new(),
+                    mentions: HashMap::new(),
                 };
                 if let Some(warning) = ws.load_team().into_iter().next() {
                     self.status = Some(format!("_settings.md: {warning}"));
                 }
+                ws.load_crew();
                 self.workspace = Some(ws);
                 self.rebuild_index();
                 self.menu = None;
@@ -409,6 +523,25 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Settings(message) => self.settings_message(message),
+            Message::ToggleHand => {
+                self.show_hand = !self.show_hand;
+                if let Some(graph) = &mut self.graph {
+                    graph.show_hand = self.show_hand;
+                    graph.touch();
+                }
+                Task::none()
+            }
+            Message::AssignTo(None) => {
+                self.assigning = None;
+                Task::none()
+            }
+            Message::AssignTo(Some((card, row))) => {
+                let Some(a) = self.assigning.take() else {
+                    return Task::none();
+                };
+                self.assign(&a.member, card, row)
+            }
             Message::ToggleLinkWires => {
                 self.show_link_wires = !self.show_link_wires;
                 if let Some(graph) = &mut self.graph {
@@ -446,6 +579,7 @@ impl App {
                     Ok(vault) if vault.root == ws.vault.root => {
                         ws.vault = vault;
                         ws.tree.refresh(&ws.vault);
+                        ws.load_crew();
                         // A new note: empty, so nothing to read for its links.
                         if ws.links.outline(&rel).is_none() {
                             ws.links.update(&rel, "");
@@ -504,7 +638,30 @@ impl App {
                 if performed.message.is_some() {
                     self.status = performed.message;
                 }
+                self.update_completion();
                 start_timers(id, performed.timers)
+            }
+            Message::CompleteMention(key) => {
+                let Some(done) = self.completion.take() else {
+                    return Task::none();
+                };
+                let Some(key) = key.or_else(|| done.matches.first().map(|m| m.0.clone())) else {
+                    return Task::none();
+                };
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                let Some(note) = &mut ws.note else {
+                    return Task::none();
+                };
+                note.set_completing(false);
+                let performed = note.complete_mention(done.typed.chars().count(), &key, ws.team.as_ref());
+                let id = note.id;
+                let focus = match self.mode {
+                    Mode::Source | Mode::Split => Task::none(),
+                    _ => operation::focus(live::editor_id()),
+                };
+                Task::batch([start_timers(id, performed.timers), focus])
             }
             Message::EditorRightClick(local, window) => {
                 let Some(note) = self.note_mut() else {
@@ -571,6 +728,7 @@ impl App {
                 }
                 ws.vault = vault;
                 ws.tree.refresh(&ws.vault);
+                ws.load_crew();
                 self.rebuild_index();
                 self.refresh_links();
                 self.rebuild_graph();
@@ -647,44 +805,14 @@ impl App {
                 self.show_graph = false;
                 self.set_mode(mode)
             }
+            Message::Live(live::Message::Key(live::Intent::Complete)) => self.handle(Message::CompleteMention(None)),
             Message::Live(message) => {
-                let Some(ws) = &mut self.workspace else {
-                    return Task::none();
-                };
-                let Some(note) = &mut ws.note else {
-                    return Task::none();
-                };
-                let outcome = note.live_message(message, ws.team.as_ref());
-                if self.mode.shows_preview() {
-                    note.refresh_preview_if_stale();
+                let typing = matches!(message, live::Message::Edit(_) | live::Message::Key(_) | live::Message::Press { .. });
+                let task = self.live_message(message);
+                if typing {
+                    self.update_completion();
                 }
-                let id = note.id;
-                if outcome.performed.message.is_some() {
-                    self.status = outcome.performed.message;
-                }
-                let mut tasks = vec![start_timers(id, outcome.performed.timers)];
-                if outcome.focus {
-                    tasks.push(operation::focus(live::editor_id()));
-                }
-                if outcome.settle {
-                    tasks.push(Task::perform(
-                        timer::after(std::time::Duration::from_millis(20)),
-                        |()| Message::Settle,
-                    ));
-                }
-                if let Some(dy) = outcome.scroll {
-                    tasks.push(operation::scroll_by(
-                        live::scroll_id(),
-                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy },
-                    ));
-                }
-                if let Some((task, at)) = outcome.menu {
-                    self.menu = Some(StatusMenu { task, at });
-                }
-                if let Some(uri) = outcome.open {
-                    tasks.push(self.follow_link(&uri));
-                }
-                Task::batch(tasks)
+                task
             }
             Message::Shortcut(shortcut) => self.shortcut(shortcut),
             Message::Switcher(message) => self.switcher_message(message),
@@ -769,6 +897,20 @@ impl App {
         if self.picker.is_some() && matches!(shortcut, Shortcut::Escape) {
             self.picker = None;
             return Task::none();
+        }
+        if self.settings.is_some() && matches!(shortcut, Shortcut::Escape) {
+            self.settings = None;
+            return Task::none();
+        }
+        if self.assigning.is_some() && matches!(shortcut, Shortcut::Escape) {
+            self.assigning = None;
+            return Task::none();
+        }
+        if self.completion.is_some() && matches!(shortcut, Shortcut::Escape) {
+            self.completion = None;
+            if let Some(note) = self.note_mut() {
+                note.set_completing(false);
+            }
         }
         if self.new_note.is_some() {
             if matches!(shortcut, Shortcut::Escape | Shortcut::NewNote) {
@@ -992,6 +1134,8 @@ impl App {
         for c in &mut graph.cards {
             c.stale = c.line.and_then(|l| ws.runs.out_of_date.get(&(rel.to_string(), l)).cloned());
         }
+        graph.set_crew(&ws.crew);
+        graph.show_hand = self.show_hand;
         self.functions = library;
         self.graph = Some(graph);
         self.refresh_editor();
@@ -1495,6 +1639,43 @@ impl App {
                 let item = format!("{start} → {end}");
                 self.edit_graph(|text| nodes::add_item(text, Section::Wires, &item), true)
             }
+            graph::Message::OpenCrew(m) => {
+                let Some(key) = graph.hand.get(m).map(|h| h.key.clone()) else {
+                    return Task::none();
+                };
+                self.open_crew(&key)
+            }
+            graph::Message::Assign { member, card, task } => {
+                let (Some(h), Some(c)) = (graph.hand.get(member), graph.cards.get(card)) else {
+                    return Task::none();
+                };
+                let key = h.key.clone();
+                if c.rel.is_none() {
+                    self.status = Some(format!("⚠ {} isn't a note yet: double-click it to create it first", c.title));
+                    return Task::none();
+                }
+                match task {
+                    Some(row) => self.assign(&key, card, row),
+                    None if c.tasks.is_empty() => {
+                        self.status = Some(format!("{} has no tasks to give @{key}", c.title));
+                        Task::none()
+                    }
+                    None => {
+                        self.assigning = Some(Assigning {
+                            member: key.clone(),
+                            card,
+                            tasks: c
+                                .tasks
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| (i, t.text.clone(), t.people.contains(&key)))
+                                .collect(),
+                            title: c.title.clone(),
+                        });
+                        Task::none()
+                    }
+                }
+            }
             graph::Message::Function(wire) => {
                 let Some(w) = graph.wires.get(wire).cloned() else {
                     return Task::none();
@@ -1665,8 +1846,17 @@ impl App {
             return;
         };
         let text = note.text();
-        let states = links::link_states(&text, &note.rel, &ws.vault, &ws.links);
+        let mut states = links::link_states(&text, &note.rel, &ws.vault, &ws.links);
+        for line in text.lines() {
+            for (_, name) in crew::mentions(line) {
+                let known = ws.crew.iter().any(|m| m.key == name);
+                states.insert(format!("@{name}"), if known { links::LinkState::Ok } else { links::LinkState::Missing });
+            }
+        }
         note.set_link_states(LinkStates::new(states));
+        if ws.indexed {
+            ws.mentions = ws.links.mention_counts(ws.team.as_ref(), None);
+        }
         ws.backlinks = if ws.indexed {
             ws.links.backlinks(&note.rel, &ws.vault)
         } else {
@@ -1813,6 +2003,21 @@ impl App {
     /// A note's text changed (here or in another app): functions that read
     /// it run, and a changed graph or `_funct.md` changes the functions.
     fn note_changed(&mut self, rel: &str) -> Task<Message> {
+        let card = self.workspace.as_ref().is_some_and(|ws| crew::is_card(rel, &ws.crew_folder));
+        let settings = rel.eq_ignore_ascii_case(SETTINGS_NOTE);
+        if (card || settings)
+            && let Some(ws) = &mut self.workspace
+        {
+            if settings {
+                ws.load_team();
+            }
+            ws.load_crew();
+            self.refresh_links();
+            if !settings {
+                self.rebuild_graph();
+                return Task::none();
+            }
+        }
         if nodes::is_graph(rel) || rel.eq_ignore_ascii_case(func::SAVED) || rel.eq_ignore_ascii_case(SETTINGS_NOTE) {
             self.rebuild_index();
             return Task::none();
@@ -2139,7 +2344,364 @@ impl App {
         }
     }
 
+    /// A message from Live Preview.
+    fn live_message(&mut self, message: live::Message) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let Some(note) = &mut ws.note else {
+            return Task::none();
+        };
+        let outcome = note.live_message(message, ws.team.as_ref());
+        if self.mode.shows_preview() {
+            note.refresh_preview_if_stale();
+        }
+        let id = note.id;
+        if outcome.performed.message.is_some() {
+            self.status = outcome.performed.message;
+        }
+        let mut tasks = vec![start_timers(id, outcome.performed.timers)];
+        if outcome.focus {
+            tasks.push(operation::focus(live::editor_id()));
+        }
+        if outcome.settle {
+            tasks.push(Task::perform(
+                timer::after(std::time::Duration::from_millis(20)),
+                |()| Message::Settle,
+            ));
+        }
+        if let Some(dy) = outcome.scroll {
+            tasks.push(operation::scroll_by(
+                live::scroll_id(),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy },
+            ));
+        }
+        if let Some((task, at)) = outcome.menu {
+            self.menu = Some(StatusMenu { task, at });
+        }
+        if let Some(uri) = outcome.open {
+            tasks.push(self.follow_link(&uri));
+        }
+        Task::batch(tasks)
+    }
+
+    fn settings_message(&mut self, message: SettingsMessage) -> Task<Message> {
+        match message {
+            SettingsMessage::Open => {
+                let Some(ws) = &self.workspace else {
+                    return Task::none();
+                };
+                self.settings = Some(SettingsForm {
+                    crew: ws.crew_folder.clone(),
+                    error: None,
+                });
+                Task::none()
+            }
+            SettingsMessage::Close => {
+                self.settings = None;
+                Task::none()
+            }
+            SettingsMessage::Crew(value) => {
+                if let Some(form) = &mut self.settings {
+                    form.crew = value;
+                    form.error = None;
+                }
+                Task::none()
+            }
+            SettingsMessage::Browse => {
+                let Some(ws) = &self.workspace else {
+                    return Task::none();
+                };
+                // Start in the folder already set, if it's there.
+                let current = self.settings.as_ref().map(|f| f.crew.trim().trim_matches('/').to_owned()).unwrap_or_default();
+                let start = Some(ws.vault.path(&current)).filter(|p| !current.is_empty() && p.is_dir()).unwrap_or_else(|| ws.vault.root.clone());
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose the crew folder (inside the vault)")
+                            .set_directory(start)
+                            .pick_folder()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    |picked| Message::Settings(SettingsMessage::Picked(picked)),
+                )
+            }
+            SettingsMessage::Picked(None) => Task::none(),
+            SettingsMessage::Picked(Some(path)) => {
+                let Some(ws) = &self.workspace else {
+                    return Task::none();
+                };
+                let Some(form) = &mut self.settings else {
+                    return Task::none();
+                };
+                let root = std::fs::canonicalize(&ws.vault.root).unwrap_or_else(|_| ws.vault.root.clone());
+                let picked = std::fs::canonicalize(&path).unwrap_or(path);
+                match picked.strip_prefix(&root) {
+                    Ok(rel) if rel.as_os_str().is_empty() => {
+                        form.error = Some("That's the vault itself; pick a folder inside it".into());
+                    }
+                    Ok(rel) => {
+                        form.crew = rel.to_string_lossy().replace('\\', "/");
+                        form.error = None;
+                    }
+                    Err(_) => {
+                        form.error = Some(format!("That folder isn't inside this vault ({})", ws.vault.root.display()));
+                    }
+                }
+                Task::none()
+            }
+            SettingsMessage::Save => {
+                let Some(form) = self.settings.take() else {
+                    return Task::none();
+                };
+                let folder = form.crew.replace('\\', "/").trim().trim_matches('/').to_owned();
+                let folder = if folder.is_empty() { crew::FOLDER.to_owned() } else { folder };
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                if folder == ws.crew_folder {
+                    return Task::none();
+                }
+                let exists = ws.vault.note(SETTINGS_NOTE).is_some();
+                let task = if exists {
+                    let Some(text) = self.current_text(SETTINGS_NOTE) else {
+                        self.status = Some("⚠ Couldn't read _settings.md".into());
+                        return Task::none();
+                    };
+                    let new = crew::set_frontmatter(&text, crew::SETTING, &folder);
+                    let save = self.put_text(SETTINGS_NOTE, &new);
+                    Task::batch([save, self.note_changed(SETTINGS_NOTE)])
+                } else {
+                    let path = ws.vault.path(SETTINGS_NOTE);
+                    let text = crew::set_frontmatter("", crew::SETTING, &folder);
+                    if let Err(error) = obsession_core::write::atomic_write(&path, text.as_bytes()) {
+                        self.status = Some(format!("⚠ Couldn't create _settings.md: {error}"));
+                        return Task::none();
+                    }
+                    let root = ws.vault.root.clone();
+                    Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
+                };
+                let Some(ws) = &mut self.workspace else {
+                    return task;
+                };
+                ws.crew_folder = folder.clone();
+                ws.load_crew();
+                let n = ws.crew.len();
+                self.status = Some(format!(
+                    "Crew folder: {folder} · {n} {} · saved in _settings.md",
+                    if n == 1 { "person" } else { "people" }
+                ));
+                self.refresh_links();
+                self.rebuild_graph();
+                task
+            }
+        }
+    }
+
+    fn view_settings<'a>(&'a self, form: &'a SettingsForm, ws: &'a Workspace) -> Element<'a, Message> {
+        let wanted = form.crew.replace('\\', "/").trim().trim_matches('/').to_lowercase();
+        // Folders to pick from: those whose path contains what's typed.
+        let folders: Vec<&str> = ws
+            .vault
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Folder)
+            .map(|e| &*e.rel)
+            .filter(|rel| wanted.is_empty() || rel.to_lowercase().contains(&wanted))
+            .take(8)
+            .collect();
+        let folder = if wanted.is_empty() { crew::FOLDER.to_owned() } else { form.crew.trim().trim_matches('/').to_owned() };
+        let seats = crew::seats(&folder, ws.vault.entries.iter().map(|e| (&*e.rel, e.kind == Kind::Folder)));
+        let found = ws.vault.entries.iter().any(|e| e.kind == Kind::Folder && e.rel.eq_ignore_ascii_case(&folder));
+        let preview = match (found, seats.len()) {
+            (false, _) => format!("No folder {folder} yet: crew cards will be created there"),
+            (true, 0) => "No one in it yet".to_owned(),
+            (true, n) => {
+                let names: Vec<String> = seats.iter().take(6).map(|s| format!("@{}", s.key)).collect();
+                let more = if n > 6 { format!(" and {} more", n - 6) } else { String::new() };
+                format!("{n} {}: {}{more}", if n == 1 { "person" } else { "people" }, names.join(", "))
+            }
+        };
+        let mut picks = column![].spacing(2);
+        if !folders.is_empty() {
+            picks = picks.push(text("Or pick one of these:").size(11).color(theme::FAINT));
+        }
+        for rel in folders {
+            picks = picks.push(
+                button(text(rel).size(theme::SMALL).color(theme::TEXT))
+                    .on_press(Message::Settings(SettingsMessage::Crew(rel.to_owned())))
+                    .padding([4, 10])
+                    .width(Fill)
+                    .style(theme::row(rel.eq_ignore_ascii_case(&folder))),
+            );
+        }
+        let panel = column![
+            text("Settings").size(18).color(theme::HEADING),
+            text("Saved in _settings.md at the vault root, so everyone using this vault shares them.")
+                .size(theme::SMALL)
+                .color(theme::MUTED),
+            rule::horizontal(1),
+            text("Crew folder").size(theme::TEXT_SIZE).color(theme::HEADING),
+            text("Each note in it is a person (Members/ika.md), and so is each folder in it (Members/Adam/, whose card is Members/Adam/Adam.md).")
+                .size(theme::SMALL)
+                .color(theme::MUTED),
+            row![
+                iced::widget::text_input("_crew", &form.crew)
+                    .on_input(|v| Message::Settings(SettingsMessage::Crew(v)))
+                    .on_submit(Message::Settings(SettingsMessage::Save))
+                    .padding(8)
+                    .size(theme::SMALL)
+                    .style(theme::search),
+                button(text("Browse…").size(theme::SMALL))
+                    .on_press(Message::Settings(SettingsMessage::Browse))
+                    .padding([7, 14])
+                    .style(theme::tool(false)),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            match &form.error {
+                Some(e) => text(format!("⚠ {e}")).size(theme::SMALL).color(theme::WARNING),
+                None => text(preview).size(theme::SMALL).color(theme::MENTION),
+            },
+            picks,
+            row![
+                Space::new().width(Fill),
+                button(text("Cancel").size(theme::SMALL))
+                    .on_press(Message::Settings(SettingsMessage::Close))
+                    .padding([5, 14])
+                    .style(theme::tool(false)),
+                button(text("Save").size(theme::SMALL))
+                    .on_press(Message::Settings(SettingsMessage::Save))
+                    .padding([5, 14])
+                    .style(theme::tool(true)),
+            ]
+            .spacing(8),
+        ]
+        .spacing(10);
+        let popup = container(panel).padding(18).width(iced::Length::Fixed(560.0)).style(theme::popup);
+        iced::widget::opaque(
+            iced::widget::mouse_area(
+                container(iced::widget::opaque(popup))
+                    .padding(iced::Padding::new(0.0).top(80.0))
+                    .center_x(Fill)
+                    .height(Fill)
+                    .style(theme::backdrop),
+            )
+            .on_press(Message::Settings(SettingsMessage::Close)),
+        )
+    }
+
+    /// Adds `@member` to the end of task `row` on node card `card`.
+    fn assign(&mut self, member: &str, card: usize, row: usize) -> Task<Message> {
+        let Some(graph) = &self.graph else {
+            return Task::none();
+        };
+        let Some(c) = graph.cards.get(card) else {
+            return Task::none();
+        };
+        let (Some(rel), Some(t)) = (c.rel.clone(), c.tasks.get(row)) else {
+            return Task::none();
+        };
+        let (line, title) = (t.line, t.text.clone());
+        let Some(text) = self.current_text(&rel) else {
+            return Task::none();
+        };
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        let Some(old) = lines.get(line).copied() else {
+            return Task::none();
+        };
+        let Some(new) = crew::add_mention(old, member) else {
+            self.status = Some(format!("@{member} is already on “{title}”"));
+            return Task::none();
+        };
+        lines[line] = &new;
+        let changed = lines.join("\n");
+        let save = self.put_text(&rel, &changed);
+        self.status = Some(format!("Added @{member} to “{title}” in {}", rel.trim_end_matches(".md")));
+        let runs = self.note_changed(&rel);
+        self.refresh_links();
+        self.rebuild_graph();
+        Task::batch([save, runs])
+    }
+
+    /// A click on `@name`: open their crew card, or create it.
+    fn open_crew(&mut self, name: &str) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let key = crew::key_of(name);
+        let known = ws.crew.iter().find(|m| m.key == key);
+        if let Some(m) = known.filter(|m| m.exists) {
+            let rel: Box<str> = m.rel.clone().into();
+            return self.open(rel);
+        }
+        // A person's folder without its card yet gets one named like the
+        // folder; someone new gets one in the crew folder's style.
+        let (rel, name) = match known {
+            Some(m) => (m.rel.clone(), m.name.clone()),
+            None => (crew::new_card_rel(&ws.crew_folder, name, ws.crew_as_folders()), name.to_owned()),
+        };
+        let name = name.as_str();
+        let path = ws.vault.path(&rel);
+        let created = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::OpenOptions::new().write(true).create_new(true).open(&path))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, crew::template(name).as_bytes()));
+        if let Err(error) = created {
+            self.status = Some(format!("Couldn't create a card for @{name}: {error}"));
+            return Task::none();
+        }
+        self.status = Some(format!("Created a crew card for @{name}"));
+        let root = ws.vault.root.clone();
+        let rel: Box<str> = rel.into();
+        let save = self.save_now();
+        Task::batch([
+            save,
+            Task::perform(
+                async move { Vault::scan(root).map_err(|e| e.to_string()) },
+                move |result| Message::Rescanned(result, rel.clone()),
+            ),
+        ])
+    }
+
+    /// Shows `@name` suggestions when the caret is right after `@` or a
+    /// partly typed name.
+    fn update_completion(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        let Some(note) = &mut ws.note else { return };
+        let matches: Vec<(String, String, String)> = match note.mention_prefix() {
+            Some(typed) => {
+                let t = typed.to_lowercase();
+                let mut found: Vec<(String, String, String)> = ws
+                    .crew
+                    .iter()
+                    .filter(|m| m.key.starts_with(&t) || m.name.to_lowercase().split_whitespace().any(|w| w.starts_with(&t)))
+                    .map(|m| (m.key.clone(), m.name.clone(), m.role.clone()))
+                    .collect();
+                // An exact, finished name needs no suggestion.
+                if found.len() == 1 && found[0].0 == t {
+                    found.clear();
+                }
+                found.truncate(6);
+                self.completion = Some(Completion { typed, matches: Vec::new() });
+                found
+            }
+            None => Vec::new(),
+        };
+        let on = !matches.is_empty();
+        note.set_completing(on);
+        match (&mut self.completion, on) {
+            (Some(c), true) => c.matches = matches,
+            _ => self.completion = None,
+        }
+    }
+
     fn follow_link(&mut self, uri: &str) -> Task<Message> {
+        if let Some(name) = uri.strip_prefix('@') {
+            return self.open_crew(name);
+        }
         if let Some(dest) = uri.strip_prefix(obsession_core::preview::WIKI_SCHEME) {
             let dest = dest.split('|').next().unwrap_or(dest);
             let (target, sub) = match dest.split_once('#') {
@@ -2282,7 +2844,10 @@ impl App {
                         let editor = || {
                             note.view_editor().map(|editor| -> Element<'_, Message> {
                                 right_click::right_click(
-                                    editor.map(Message::Edit),
+                                    editor.map(|event| match event {
+                                        note::SourceEvent::Action(action) => Message::Edit(action),
+                                        note::SourceEvent::Complete => Message::CompleteMention(None),
+                                    }),
                                     Message::EditorRightClick,
                                 )
                                 .into()
@@ -2320,6 +2885,40 @@ impl App {
                 };
 
                 let page = container(body).style(theme::page).width(Fill).height(Fill);
+                // `@name` suggestions, at the bottom of the page.
+                let page: Element<'_, Message> = match &self.completion {
+                    Some(c) if !c.matches.is_empty() => {
+                        let mut list = column![
+                            text(format!("@{}…  Tab picks the first, or click", c.typed))
+                                .size(11)
+                                .color(theme::FAINT)
+                        ]
+                        .spacing(2);
+                        for (k, (key, name, role)) in c.matches.iter().enumerate() {
+                            list = list.push(
+                                button(
+                                    row![
+                                        text(format!("@{key}")).size(theme::SMALL).color(theme::MENTION),
+                                        text(name.clone()).size(theme::SMALL).color(theme::TEXT),
+                                        text(role.clone()).size(theme::SMALL).color(theme::MUTED),
+                                    ]
+                                    .spacing(10),
+                                )
+                                .on_press(Message::CompleteMention(Some(key.clone())))
+                                .padding([3, 8])
+                                .width(Fill)
+                                .style(theme::row(k == 0)),
+                            );
+                        }
+                        let popup = container(list).padding(8).width(iced::Length::Fixed(380.0)).style(theme::popup);
+                        stack![
+                            page,
+                            container(popup).align_bottom(Fill).padding(iced::Padding::new(16.0).left(24.0)),
+                        ]
+                        .into()
+                    }
+                    _ => page.into(),
+                };
                 let mut middle = row![sidebar, page].height(Fill);
                 if ws.runs.show {
                     middle = middle.push(rule::vertical(1)).push(ws.runs.view().map(Message::Runs));
@@ -2344,6 +2943,33 @@ impl App {
         }
         if let Some((picker, _)) = &self.picker {
             return stack![main, picker.view().map(Message::Picker)].into();
+        }
+        if let (Some(form), Some(ws)) = (&self.settings, &self.workspace) {
+            return stack![main, self.view_settings(form, ws)].into();
+        }
+        if let Some(a) = &self.assigning {
+            let mut list = column![
+                text(format!("Give @{} which task in {}?", a.member, a.title)).size(theme::TEXT_SIZE).color(theme::HEADING)
+            ]
+            .spacing(4);
+            for (row, task, has) in &a.tasks {
+                let label = if *has { format!("{task}  · already theirs") } else { task.clone() };
+                let b = button(text(label).size(theme::SMALL).color(if *has { theme::FAINT } else { theme::TEXT }))
+                    .padding([5, 10])
+                    .width(Fill)
+                    .style(theme::row(false));
+                list = list.push(if *has { b } else { b.on_press(Message::AssignTo(Some((a.card, *row)))) });
+            }
+            let popup = container(list).padding(14).width(iced::Length::Fixed(480.0)).style(theme::popup);
+            let backdrop = iced::widget::mouse_area(
+                container(iced::widget::opaque(popup))
+                    .padding(iced::Padding::new(0.0).top(90.0))
+                    .center_x(Fill)
+                    .height(Fill)
+                    .style(theme::backdrop),
+            )
+            .on_press(Message::AssignTo(None));
+            return stack![main, iced::widget::opaque(backdrop)].into();
         }
         match (&self.switcher, &self.workspace) {
             (Some(switcher), Some(ws)) => {
@@ -2371,6 +2997,10 @@ impl App {
                     .on_press(Message::PickFolder)
                     .padding([4, 12])
                     .style(theme::tool(false)),
+                button(text("Settings").size(theme::SMALL))
+                    .on_press(Message::Settings(SettingsMessage::Open))
+                    .padding([4, 12])
+                    .style(theme::tool(self.settings.is_some())),
                 button(text("+ New note").size(theme::SMALL))
                     .on_press(Message::StartNewNote)
                     .padding([4, 12])
@@ -2395,6 +3025,12 @@ impl App {
                             .on_press(Message::AddFunctionNode)
                             .padding([4, 12])
                             .style(theme::tool(false))
+                    }))
+                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none() && !ws.crew.is_empty()).then(|| {
+                        button(text("Crew").size(theme::SMALL))
+                            .on_press(Message::ToggleHand)
+                            .padding([4, 12])
+                            .style(theme::tool(self.show_hand))
                     }))
                     .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("Link wires").size(theme::SMALL))
@@ -2469,11 +3105,20 @@ impl App {
             stats.skipped_writes,
         );
         let message = self.status.as_deref().unwrap_or("Ctrl+N new · Ctrl+P find · Ctrl+E view · Ctrl+O open");
+        // On a crew card: their open mentions across the vault.
+        let person = ws.note.as_ref().filter(|n| crew::is_card(&n.rel, &ws.crew_folder)).and_then(|n| {
+            let i = ws.crew.iter().position(|m| *m.rel == *n.rel)?;
+            let m = &ws.crew[i];
+            let count = ws.mentions.get(&m.key).copied().unwrap_or(0);
+            let badge = ws.vault_badges()[i].map_or(String::new(), |b| format!(" · {}", b.label()));
+            Some(format!("@{} · {count} open task{} in the vault{badge}", m.key, if count == 1 { "" } else { "s" }))
+        });
 
         container(
             row![
                 text(message).size(theme::SMALL),
                 Space::new().width(Fill),
+                text(person.unwrap_or_default()).size(theme::SMALL).color(theme::MENTION),
                 text(statuses).size(theme::SMALL).color(theme::MUTED),
                 text(info).size(theme::SMALL).color(theme::FAINT),
                 text(saved).size(theme::SMALL),

@@ -74,6 +74,20 @@ live value, read from the real notes the wire connects. The panel also holds
 the wire's own values (`task`, `target`…). **+ Function** adds a function with
 several ins or outs as a node; wire notes to its pins.
 
+**Crew:** one note per person (or bot) in the crew folder (`_crew/ika.md`,
+with `name`, `role`, `color` in its frontmatter; Syntax.md section 4), or one
+folder per person (`Members/Adam/`, card `Members/Adam/Adam.md`). **Settings**
+in the toolbar picks the crew folder (type it, pick it, or **Browse…**); it's saved in `_settings.md` for the
+whole team. Type `@` in a
+note for suggestions (Tab or click picks one). A click on `@ika` opens Ika's
+card; an `@name` without a card shows in amber, and clicking it creates the
+card. In a graph the crew is a hand of cards along the bottom (**Crew** hides
+it): hover a card to light up the nodes and tasks that mention them, drag it
+onto a task to add their `@name`, or onto a node to pick the task. Cards show
+**OVERLOADED** or **POWERHOUSE** when someone has 2× or 1.5× the open tasks of
+the rest of the crew (the median); on a crew card note, the status bar shows
+their open tasks across the vault.
+
 **Runs:** a function runs when a note it reads changes, whether you edit it
 here or in Obsidian, VS Code or a `git pull`. If its changes change a note
 another function reads, that one runs too (each line changes at most once per

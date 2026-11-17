@@ -151,6 +151,8 @@ pub enum Action {
     Url(String),
     /// The task's status chip.
     Status,
+    /// `@name` (lower case): opens their crew card.
+    Mention(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,7 +694,7 @@ fn inline(raw: &str, start: usize, end: usize, style: Style, out: &mut Vec<Seg>)
         if (b == b'#' || b == b'@') && word_start(bytes, i) {
             let len = raw[i + 1..end]
                 .bytes()
-                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'/'))
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-') || (b == b'#' && *c == b'/'))
                 .count();
             let all_digits = raw[i + 1..i + 1 + len].bytes().all(|c| c.is_ascii_digit());
             if len > 0 && !(b == b'#' && all_digits) {
@@ -703,7 +705,7 @@ fn inline(raw: &str, start: usize, end: usize, style: Style, out: &mut Vec<Seg>)
                     raw: i..i + 1 + len,
                     verbatim: true,
                     style: style.with(flag),
-                    action: None,
+                    action: (b == b'@').then(|| Action::Mention(raw[i + 1..i + 1 + len].to_lowercase())),
                 });
                 i += 1 + len;
                 plain = i;

@@ -117,6 +117,8 @@ pub enum Intent {
     JoinPrev,
     JoinNext,
     Escape,
+    /// Tab with `@name` suggestions showing.
+    Complete,
 }
 
 /// How a line is drawn, decided by the block it's in.
@@ -162,6 +164,8 @@ pub struct Live {
     drag: Option<Drag>,
     /// The button went down in the editor (a drag may leave it).
     editor_pressed: bool,
+    /// `@name` suggestions are showing: Tab completes.
+    pub completing: bool,
 }
 
 impl Live {
@@ -180,6 +184,7 @@ impl Live {
             links: LinkStates::default(),
             drag: None,
             editor_pressed: false,
+            completing: false,
         };
         live.rebuild(format);
         live
@@ -343,6 +348,8 @@ impl Live {
         };
         let (line, column) = self.cursor();
         match intent {
+            // The app completes the `@name`; it never gets here.
+            Intent::Complete => false,
             Intent::Escape => {
                 self.deactivate();
                 false
@@ -884,6 +891,7 @@ impl Live {
         let heading = if single { heading_level(first_line) } else { 0 };
         let mono = !plain;
 
+        let completing = self.completing;
         let cursor = self.content.cursor();
         let last = self.content.line_count().saturating_sub(1);
         let line_len = self
@@ -929,6 +937,7 @@ impl Live {
                         custom(Intent::Right)
                     }
                     Key::Named(Named::Escape) => custom(Intent::Escape),
+                    Key::Named(Named::Tab) if completing => custom(Intent::Complete),
                     _ => Binding::from_key_press(press),
                 }
             })
@@ -1291,7 +1300,13 @@ fn styled<'a>(
         color = theme::TAG;
     }
     if s.has(Style::MENTION) {
-        color = theme::MENTION;
+        // An `@name` without a crew card shows as a warning.
+        color = match &seg.action {
+            Some(live::Action::Mention(name)) if links.get(&format!("@{name}")) == obsession_core::links::LinkState::Missing => {
+                theme::WARNING
+            }
+            _ => theme::MENTION,
+        };
     }
     if s.has(Style::MARKER) || s.has(Style::FAINT) {
         color = theme::MUTED;

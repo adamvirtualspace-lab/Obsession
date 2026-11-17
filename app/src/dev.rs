@@ -174,6 +174,22 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 Some("run") => Message::RunGraph,
                 Some("runs") => Message::ToggleRuns,
                 Some("undorun") => Message::Dev(Step::UndoRun),
+                // Crew: `assign,member,card[,row]` (a crew card dropped on a
+                // node card, or one of its task rows), `hand` (show/hide).
+                Some("assign") => Message::Graph(G::Assign {
+                    member: n(1) as usize,
+                    card: n(2) as usize,
+                    task: parts.get(3).and_then(|v| v.parse().ok()),
+                }),
+                Some("assignto") => Message::AssignTo(Some((n(1) as usize, n(2) as usize))),
+                Some("hand") => Message::ToggleHand,
+                // Settings: `settings` opens the page; `crew,folder` types the
+                // crew folder; `save` saves.
+                Some("settings") => Message::Settings(crate::SettingsMessage::Open),
+                Some("crew") => Message::Settings(crate::SettingsMessage::Crew(parts[1..].join(","))),
+                Some("save") => Message::Settings(crate::SettingsMessage::Save),
+                // As if the folder picker returned this path.
+                Some("picked") => Message::Settings(crate::SettingsMessage::Picked(Some(parts[1..].join(",").into()))),
                 // The function picker: `pick,Name`, `create,Name`.
                 Some("pick") => Message::Picker(crate::func_editor::PickerMessage::Pick(parts.get(1).unwrap_or(&"").to_string())),
                 Some("create") => {
@@ -293,6 +309,8 @@ fn live_script(script: &str) -> Vec<Message> {
                 "left" => L::Key(Intent::Left),
                 "right" => L::Key(Intent::Right),
                 "esc" => L::Key(Intent::Escape),
+                // Tab with `@name` suggestions showing.
+                "tab" => L::Key(Intent::Complete),
                 "back" => L::Edit(Action::Edit(Edit::Backspace)),
                 "undo" => {
                     out.push(Message::Shortcut(crate::Shortcut::Undo));

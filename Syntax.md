@@ -125,7 +125,27 @@ checkboxes for them.
 
 ### Crew cards
 
-One markdown file per person (or bot) in `_crew/` at the vault root:
+One markdown file per person (or bot) in the **crew folder**: `_crew/` at the
+vault root, or the folder `crew:` names in `_settings.md` (the app's
+**Settings** page sets it: type the path, pick from the list, or **Browse…**):
+
+```yaml
+---
+crew: 01_Project_Planning_and_Assignments/Members
+---
+```
+
+In the crew folder:
+
+- Each note is a person: `Members/ika.md` is `@ika`.
+- Each folder is a person too: `Members/Adam/` is `@adam`, and their card is
+  the note named like the folder, `Members/Adam/Adam.md`. The folder's other
+  notes are left alone. If the card doesn't exist yet, the app creates it the
+  first time it's needed (clicking `@adam`).
+- A name with spaces becomes `@` with dashes: `Members/Ika Putri/` is
+  `@ika-putri`.
+
+A card looks like this:
 
 ```md
 ---
@@ -158,6 +178,7 @@ The crew appears as a hand of cards in the graph view.
 - **Drag** a card onto a task to add their `@name` to the end of the task text.
   Drop it onto a node card to choose which tasks.
 - Each card shows the portrait, name, role and how many nodes mention them.
+- Double-click a card to open its note.
 
 ### Badges
 

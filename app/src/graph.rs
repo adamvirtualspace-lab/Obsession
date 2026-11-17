@@ -16,6 +16,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, LineDash, Path, Stroke, Text};
 use iced::{Color, Element, Fill, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
 
+use obsession_core::crew::{self, Badge, Member};
 use obsession_core::func::{self, Library, PortKind};
 use obsession_core::links::LinkIndex;
 use obsession_core::nodes::{self, End, NodeKind};
@@ -37,6 +38,10 @@ const DETAIL_ZOOM: f32 = 0.5;
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 2.5;
 const GRID: f32 = 40.0;
+/// The card hand: card size, and how much of a resting card shows.
+const HAND_W: f32 = 150.0;
+const HAND_H: f32 = 132.0;
+const HAND_PEEK: f32 = 74.0;
 /// How long a wire takes to go from dashed to solid.
 const SOLID_MS: f32 = 450.0;
 
@@ -53,6 +58,31 @@ pub enum Message {
     Delete(Selected),
     /// The ƒ button on a wire was clicked.
     Function(usize),
+    /// A crew card was dropped on a node card (and on one of its task rows,
+    /// or on the card as a whole).
+    Assign {
+        member: usize,
+        card: usize,
+        task: Option<usize>,
+    },
+    /// Double-click on a crew card: open it.
+    OpenCrew(usize),
+}
+
+/// One crew card in the hand.
+#[derive(Debug, Clone)]
+pub struct HandCard {
+    pub key: String,
+    pub name: String,
+    pub role: String,
+    pub initials: String,
+    pub color: Color,
+    pub bot: bool,
+    /// Node cards with a task that mentions them.
+    pub nodes: usize,
+    /// Their open tasks in this graph.
+    pub open: u32,
+    pub badge: Option<Badge>,
 }
 
 /// A card, and on a function card, one of its pins (an output pin at the
@@ -86,6 +116,10 @@ pub struct TaskRow {
     pub text: String,
     pub done: bool,
     pub unknown: bool,
+    /// `@names` on the task (lower case).
+    pub people: Vec<String>,
+    /// Its line in the note.
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +203,9 @@ pub struct Graph {
     pub cards: Vec<Card>,
     pub wires: Vec<WireView>,
     pub show_links: bool,
+    /// The crew, as a hand of cards along the bottom.
+    pub hand: Vec<HandCard>,
+    pub show_hand: bool,
     /// Changed when a different graph is opened, so the view fits it.
     pub fit: u64,
     cache: Cache,
@@ -218,6 +255,8 @@ pub struct State {
     started: Option<Instant>,
     /// The graph the view was last fitted to.
     fitted: Option<u64>,
+    /// The canvas size, for the hand.
+    size: Size,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -239,6 +278,11 @@ enum Interaction {
         pin: Option<usize>,
         to: Point,
     },
+    /// A crew card being dragged (screen point).
+    Dealing {
+        member: usize,
+        at: Point,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +294,8 @@ enum Hover {
     Wire(usize),
     /// The ƒ button in the middle of a hovered wire.
     Button(usize),
+    /// A crew card in the hand.
+    Hand(usize),
 }
 
 impl Graph {
@@ -413,11 +459,100 @@ impl Graph {
             cards,
             wires,
             show_links,
+            hand: Vec::new(),
+            show_hand: true,
             fit: 0,
             cache: Cache::new(),
             drawn: Cell::new(None),
             version: 0,
         }
+    }
+
+    /// Deals the crew: who appears where in this graph, and the badges
+    /// from open mentions among its nodes.
+    pub fn set_crew(&mut self, crew: &[Member]) {
+        let mut hand: Vec<HandCard> = crew
+            .iter()
+            .map(|m| {
+                let mentions = |c: &Card| c.tasks.iter().filter(|t| t.people.contains(&m.key)).count();
+                HandCard {
+                    key: m.key.clone(),
+                    name: m.name.clone(),
+                    role: m.role.clone(),
+                    initials: crew::initials(&m.name),
+                    color: m.color.map_or(accent(&m.key), |[r, g, b]| Color::from_rgb8(r, g, b)),
+                    bot: m.bot,
+                    nodes: self.cards.iter().filter(|c| mentions(c) > 0).count(),
+                    open: self
+                        .cards
+                        .iter()
+                        .flat_map(|c| &c.tasks)
+                        .filter(|t| !t.done && t.people.contains(&m.key))
+                        .count() as u32,
+                    badge: None,
+                }
+            })
+            .collect();
+        let counts: Vec<u32> = hand.iter().map(|h| h.open).collect();
+        for (h, b) in hand.iter_mut().zip(crew::badges(&counts)) {
+            h.badge = b;
+        }
+        self.hand = hand;
+        self.touch();
+    }
+
+    fn hand_shown(&self) -> bool {
+        self.show_hand && !self.hand.is_empty()
+    }
+
+    /// A crew card's place on screen; the hovered one rises.
+    fn hand_rect(&self, i: usize, size: Size, raised: bool) -> Rectangle {
+        let n = self.hand.len() as f32;
+        let step = (HAND_W + 12.0).min((size.width - 80.0 - HAND_W) / (n - 1.0).max(1.0)).max(24.0);
+        let total = HAND_W + step * (n - 1.0);
+        let x = size.width / 2.0 - total / 2.0 + i as f32 * step;
+        let y = if raised { size.height - HAND_H - 10.0 } else { size.height - HAND_PEEK };
+        Rectangle::new(Point::new(x, y), Size::new(HAND_W, HAND_H))
+    }
+
+    /// The crew card under a screen point (the raised one first).
+    fn hit_hand(&self, state: &State, p: Point) -> Option<usize> {
+        if !self.hand_shown() {
+            return None;
+        }
+        let raised = match state.hover {
+            Some(Hover::Hand(h)) => Some(h),
+            _ => None,
+        };
+        if let Some(h) = raised
+            && self.hand_rect(h, state.size, true).contains(p)
+        {
+            return Some(h);
+        }
+        (0..self.hand.len()).rev().find(|&i| self.hand_rect(i, state.size, false).contains(p))
+    }
+
+    /// Where a crew card dropped at `p` would go: (node card, task row).
+    fn drop_target(&self, state: &State, view: View, p: Point) -> Option<(usize, Option<usize>)> {
+        let g = view.graph(p);
+        let i = (0..self.cards.len()).rev().find(|&i| {
+            self.cards[i].kind != CardKind::Function && self.card_rect(i, state).contains(g)
+        })?;
+        let card = &self.cards[i];
+        if card.kind == CardKind::Missing {
+            return Some((i, None));
+        }
+        let y = g.y - card.pos.y - HEADER;
+        let row = (view.zoom >= DETAIL_ZOOM && y >= 0.0)
+            .then(|| (y / ROW) as usize)
+            .filter(|&r| r < card.tasks.len().min(MAX_ROWS));
+        Some((i, row))
+    }
+
+    /// Whether a card mentions crew member `m` on any task.
+    fn mentions(&self, card: usize, m: usize) -> bool {
+        let key = &self.hand[m].key;
+        self.cards[card].tasks.iter().any(|t| t.people.contains(key))
     }
 
     /// Whether a wire is still turning solid.
@@ -492,6 +627,9 @@ impl Graph {
     }
 
     fn hit(&self, state: &State, view: View, p: Point) -> Option<Hover> {
+        if let Some(m) = self.hit_hand(state, p) {
+            return Some(Hover::Hand(m));
+        }
         let g = view.graph(p);
         // The ƒ button: on every wire with a function, and on the hovered
         // wire.
@@ -581,6 +719,7 @@ impl canvas::Program<Message> for Graph {
             pan: state.pan,
             zoom: state.zoom,
         };
+        state.size = bounds.size();
         let point = cursor.position_in(bounds);
 
         match event {
@@ -594,6 +733,20 @@ impl canvas::Program<Message> for Graph {
                     return None;
                 }
                 let hit = self.hit(state, view, p);
+                if let Some(Hover::Hand(m)) = hit {
+                    let now = Instant::now();
+                    let key = usize::MAX - m;
+                    let double = state
+                        .last_click
+                        .is_some_and(|(c, at)| c == key && now.duration_since(at).as_millis() < 450);
+                    state.last_click = Some((key, now));
+                    if double {
+                        state.last_click = None;
+                        return Some(canvas::Action::publish(Message::OpenCrew(m)).and_capture());
+                    }
+                    state.interaction = Interaction::Dealing { member: m, at: p };
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
                 match hit {
                     Some(Hover::Handle(i)) => {
                         state.interaction = Interaction::Wiring {
@@ -633,6 +786,8 @@ impl canvas::Program<Message> for Graph {
                         };
                     }
                     Some(Hover::Wire(i)) => state.selected = Some(Selected::Wire(i)),
+                    // Handled above.
+                    Some(Hover::Hand(_)) => {}
                     None => {
                         state.selected = None;
                         state.interaction = Interaction::Panning { from: p, pan: state.pan };
@@ -660,6 +815,10 @@ impl canvas::Program<Message> for Graph {
                         *to = view.graph(p);
                         Some(canvas::Action::request_redraw())
                     }
+                    Interaction::Dealing { at, .. } => {
+                        *at = p;
+                        Some(canvas::Action::request_redraw())
+                    }
                     Interaction::Idle => {
                         let hover = point.and_then(|p| self.hit(state, view, p));
                         if hover != state.hover {
@@ -672,6 +831,14 @@ impl canvas::Program<Message> for Graph {
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left | mouse::Button::Middle)) => {
                 let done = std::mem::take(&mut state.interaction);
+                if let Interaction::Dealing { member, at } = done {
+                    // Dropped back on the hand, or on nothing: put it back.
+                    let on_hand = self.hit_hand(state, at).is_some();
+                    return Some(match (on_hand, self.drop_target(state, view, at)) {
+                        (false, Some((card, task))) => canvas::Action::publish(Message::Assign { member, card, task }),
+                        _ => canvas::Action::request_redraw(),
+                    });
+                }
                 match done {
                     Interaction::Dragging { card, at, moved: true, .. } => {
                         Some(canvas::Action::publish(Message::Moved(card, at)))
@@ -841,6 +1008,7 @@ impl canvas::Program<Message> for Graph {
                 },
             );
         }
+        self.draw_crew(&mut frame, state, view, bounds.size());
         vec![still, frame.into_geometry()]
     }
 
@@ -848,17 +1016,190 @@ impl canvas::Program<Message> for Graph {
         match state.interaction {
             Interaction::Panning { .. } | Interaction::Dragging { .. } => return mouse::Interaction::Grabbing,
             Interaction::Wiring { .. } => return mouse::Interaction::Crosshair,
+            Interaction::Dealing { .. } => return mouse::Interaction::Grabbing,
             Interaction::Idle => {}
         }
         if !cursor.is_over(bounds) {
             return mouse::Interaction::None;
         }
         match state.hover {
-            Some(Hover::Card(_)) => mouse::Interaction::Grab,
+            Some(Hover::Card(_) | Hover::Hand(_)) => mouse::Interaction::Grab,
             Some(Hover::Handle(_) | Hover::Pin(..)) => mouse::Interaction::Crosshair,
             Some(Hover::Wire(_) | Hover::Button(_)) => mouse::Interaction::Pointer,
             None => mouse::Interaction::None,
         }
+    }
+}
+
+impl Graph {
+    /// The crew: highlights for the hovered (or dragged) person, the hand,
+    /// and the card being dragged.
+    fn draw_crew(&self, frame: &mut Frame, state: &State, view: View, size: Size) {
+        if !self.hand_shown() {
+            return;
+        }
+        let zoom = view.zoom;
+        let focus = match (state.interaction, state.hover) {
+            (Interaction::Dealing { member, .. }, _) => Some(member),
+            (Interaction::Idle, Some(Hover::Hand(m))) => Some(m),
+            _ => None,
+        };
+        let screen = Rectangle::new(Point::ORIGIN, size);
+        // Where this person appears.
+        if let Some(m) = focus {
+            let color = self.hand[m].color;
+            let key = &self.hand[m].key;
+            for (i, card) in self.cards.iter().enumerate() {
+                if !self.mentions(i, m) {
+                    continue;
+                }
+                let r = self.card_rect(i, state);
+                let p = view.screen(r.position());
+                if !Rectangle::new(p, r.size() * zoom).intersects(&screen) {
+                    continue;
+                }
+                frame.stroke(
+                    &Path::rounded_rectangle(p, r.size() * zoom, (8.0 * zoom).into()),
+                    Stroke::default().with_color(color).with_width(2.5),
+                );
+                if zoom >= DETAIL_ZOOM {
+                    for (k, t) in card.tasks.iter().take(MAX_ROWS).enumerate() {
+                        if t.people.contains(key) {
+                            let y = r.y + HEADER + k as f32 * ROW - 3.0;
+                            frame.fill(
+                                &Path::rounded_rectangle(
+                                    view.screen(Point::new(r.x + 6.0, y)),
+                                    Size::new((r.width - 12.0) * zoom, ROW * zoom),
+                                    (4.0 * zoom).into(),
+                                ),
+                                Color { a: 0.18, ..color },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The drop target while dragging.
+        if let Interaction::Dealing { member, at } = state.interaction
+            && self.hit_hand(state, at).is_none()
+            && let Some((card, row)) = self.drop_target(state, view, at)
+        {
+            let color = self.hand[member].color;
+            let r = self.card_rect(card, state);
+            let (pos, sz) = match row {
+                Some(k) => (Point::new(r.x + 4.0, r.y + HEADER + k as f32 * ROW - 4.0), Size::new(r.width - 8.0, ROW + 2.0)),
+                None => (r.position(), r.size()),
+            };
+            frame.stroke(
+                &Path::rounded_rectangle(view.screen(pos), sz * zoom, (6.0 * zoom).into()),
+                Stroke::default().with_color(color).with_width(2.0),
+            );
+        }
+        // The hand: resting cards first, the raised one on top.
+        let raised = match (state.interaction, state.hover) {
+            (Interaction::Idle, Some(Hover::Hand(h))) => Some(h),
+            _ => None,
+        };
+        for i in (0..self.hand.len()).filter(|&i| Some(i) != raised) {
+            self.draw_hand_card(frame, i, self.hand_rect(i, size, false));
+        }
+        if let Some(h) = raised {
+            self.draw_hand_card(frame, h, self.hand_rect(h, size, true));
+        }
+        // The card being dragged: a small token under the cursor.
+        if let Interaction::Dealing { member, at } = state.interaction {
+            let c = &self.hand[member];
+            frame.fill(&Path::circle(at, 18.0), c.color);
+            frame.stroke(&Path::circle(at, 18.0), Stroke::default().with_color(theme::HEADING).with_width(1.5));
+            let semibold = Font {
+                weight: iced::font::Weight::Semibold,
+                ..theme::UI_FONT
+            };
+            frame.fill_text(Text {
+                content: c.initials.clone(),
+                position: Point::new(at.x, at.y - 8.0),
+                color: theme::BG,
+                size: Pixels(13.0),
+                font: semibold,
+                align_x: iced::widget::text::Alignment::Center,
+                ..Text::default()
+            });
+            frame.fill_text(Text {
+                content: format!("@{}", c.key),
+                position: Point::new(at.x + 24.0, at.y - 8.0),
+                color: theme::HEADING,
+                size: Pixels(13.0),
+                font: theme::UI_FONT,
+                ..Text::default()
+            });
+        }
+    }
+
+    fn draw_hand_card(&self, frame: &mut Frame, i: usize, r: Rectangle) {
+        let c = &self.hand[i];
+        let body = Path::rounded_rectangle(r.position(), r.size(), 10.0.into());
+        frame.fill(&body, theme::RAISED);
+        frame.stroke(&body, Stroke::default().with_color(Color { a: 0.8, ..c.color }).with_width(1.5));
+        frame.fill(&Path::rounded_rectangle(r.position(), Size::new(r.width, 5.0), 10.0.into()), c.color);
+        let semibold = Font {
+            weight: iced::font::Weight::Semibold,
+            ..theme::UI_FONT
+        };
+        let text = |frame: &mut Frame, content: String, x: f32, y: f32, size: f32, color: Color, font: Font| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(r.x + x, r.y + y),
+                color,
+                size: Pixels(size),
+                font,
+                ..Text::default()
+            });
+        };
+        // The part that shows while resting: portrait, name, role, badge.
+        let face = Point::new(r.x + 27.0, r.y + 29.0);
+        if c.bot {
+            frame.fill(&Path::rounded_rectangle(Point::new(face.x - 17.0, face.y - 17.0), Size::new(34.0, 34.0), 7.0.into()), c.color);
+        } else {
+            frame.fill(&Path::circle(face, 17.0), c.color);
+        }
+        frame.fill_text(Text {
+            content: c.initials.clone(),
+            position: Point::new(face.x, face.y - 8.5),
+            color: theme::BG,
+            size: Pixels(14.0),
+            font: semibold,
+            align_x: iced::widget::text::Alignment::Center,
+            ..Text::default()
+        });
+        text(frame, fit(&c.name, r.width - 60.0, 13.0), 52.0, 13.0, 13.0, theme::HEADING, semibold);
+        let role = if c.role.is_empty() { format!("@{}", c.key) } else { c.role.clone() };
+        text(frame, fit(&role, r.width - 60.0, 11.0), 52.0, 31.0, 11.0, theme::MUTED, theme::UI_FONT);
+        if let Some(badge) = c.badge {
+            let color = match badge {
+                Badge::Overloaded => theme::DANGER,
+                Badge::Powerhouse => theme::MENTION,
+            };
+            let pill = Rectangle::new(Point::new(r.x + 10.0, r.y + 51.0), Size::new(r.width - 20.0, 17.0));
+            frame.fill(&Path::rounded_rectangle(pill.position(), pill.size(), 8.5.into()), Color { a: 0.22, ..color });
+            frame.fill_text(Text {
+                content: badge.label().to_owned(),
+                position: Point::new(r.x + r.width / 2.0, r.y + 53.0),
+                color,
+                size: Pixels(10.5),
+                font: semibold,
+                align_x: iced::widget::text::Alignment::Center,
+                ..Text::default()
+            });
+        }
+        // Shown when it rises.
+        let nodes = match c.nodes {
+            0 => "Not in this graph".to_owned(),
+            1 => "In 1 node".to_owned(),
+            n => format!("In {n} nodes"),
+        };
+        text(frame, nodes, 12.0, 80.0, 11.5, theme::TEXT, theme::UI_FONT);
+        text(frame, format!("{} open task{} here", c.open, if c.open == 1 { "" } else { "s" }), 12.0, 96.0, 11.5, theme::MUTED, theme::UI_FONT);
+        text(frame, "Drag onto a task".to_owned(), 12.0, 112.0, 10.5, theme::FAINT, theme::UI_FONT);
     }
 }
 
@@ -1038,6 +1379,8 @@ fn card(
             text: after.to_owned(),
             done,
             unknown: format.index_of(ch).is_none(),
+            people: crew::mentions(raw).into_iter().map(|(_, n)| n).collect(),
+            line,
         });
     }
     card

@@ -164,6 +164,16 @@ pub struct Note {
     /// Tasks whose character isn't in the format, as of the last full read
     /// (open, preview, save).
     pub unknown: usize,
+    /// `@name` suggestions are showing: Tab picks one.
+    completing: bool,
+}
+
+/// What the Source editor sends: an editor action, or Tab while `@name`
+/// suggestions are showing.
+#[derive(Debug, Clone)]
+pub enum SourceEvent {
+    Action(Action),
+    Complete,
 }
 
 impl Note {
@@ -197,6 +207,7 @@ impl Note {
             warnings: Vec::new(),
             frontmatter_end: 0,
             unknown: 0,
+            completing: false,
         };
         note.refresh_format(team);
         note.analyze(text);
@@ -723,6 +734,9 @@ impl Note {
                     Some(obsession_core::live::Action::Url(url)) if !press.right => {
                         outcome.open = Some(url);
                     }
+                    Some(obsession_core::live::Action::Mention(name)) if !press.right => {
+                        outcome.open = Some(format!("@{name}"));
+                    }
                     _ if press.right => {
                         if let Some(task) = self.task_at_line(line) {
                             outcome.menu = Some((task, press.window));
@@ -996,7 +1010,54 @@ impl Note {
         self.mirror.as_ref().map(|mirror| mirror.view(&self.statuses))
     }
 
-    pub fn view_editor(&self) -> Option<Element<'_, Action>> {
+    /// The `@name` being typed right before the caret (without the `@`;
+    /// empty just after typing `@`), if any.
+    pub fn mention_prefix(&self) -> Option<String> {
+        let (content, active) = match &self.body {
+            Body::Live(live) => (&live.content, live.active.is_some()),
+            Body::Source(content) => (content, true),
+        };
+        if !active {
+            return None;
+        }
+        let cursor = content.cursor();
+        if cursor.selection.is_some() {
+            return None;
+        }
+        let line = content.line(cursor.position.line)?;
+        let before: String = line.text.chars().take(cursor.position.column).collect();
+        let at = before.rfind('@')?;
+        let typed = &before[at + 1..];
+        let word_start = at == 0 || !before[..at].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        let name_chars = typed.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        (word_start && name_chars).then(|| typed.to_owned())
+    }
+
+    /// Shows or hides `@name` suggestions (Tab then completes instead of
+    /// indenting).
+    pub fn set_completing(&mut self, on: bool) {
+        self.completing = on;
+        if let Body::Live(live) = &mut self.body {
+            live.completing = on;
+        }
+    }
+
+    /// Replaces the `@typed` before the caret with `@name `.
+    pub fn complete_mention(&mut self, typed: usize, name: &str, team: Option<&Format>) -> Performed {
+        let mut actions: Vec<Action> = (0..=typed).map(|_| Action::Select(text_editor::Motion::Left)).collect();
+        actions.push(Action::Edit(Edit::Paste(std::sync::Arc::new(format!("@{name} ")))));
+        let mut out = Performed::default();
+        for action in actions {
+            let performed = match &self.body {
+                Body::Live(_) => self.live_message(live::Message::Edit(action), team).performed,
+                Body::Source(_) => self.perform(action, team),
+            };
+            out.timers.extend(performed.timers);
+        }
+        out
+    }
+
+    pub fn view_editor(&self) -> Option<Element<'_, SourceEvent>> {
         let Body::Source(content) = &self.body else {
             return None;
         };
@@ -1011,8 +1072,19 @@ impl Note {
                 let side = ((size.width - live::TEXT_WIDTH) / 2.0).max(EDITOR_PADDING.1);
                 inset.set(side);
                 editor_size.set(size);
+                let completing = self.completing;
                 iced::widget::text_editor(content)
-                    .on_action(|action| action)
+                    .on_action(SourceEvent::Action)
+                    .key_binding(move |press| {
+                        let focused = matches!(press.status, text_editor::Status::Focused { .. });
+                        if completing
+                            && focused
+                            && press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab)
+                        {
+                            return Some(text_editor::Binding::Custom(SourceEvent::Complete));
+                        }
+                        text_editor::Binding::from_key_press(press)
+                    })
                     .highlight_with::<crate::highlight::Markdown>(
                         statuses.clone(),
                         crate::highlight::format,

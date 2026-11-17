@@ -15,7 +15,9 @@
 //! - [`runner`]: which functions a change affects, runs with chains and the
 //!   loop guard, undo.
 //! - [`log`]: the run log in `.obsessed/log/`.
+//! - [`crew`]: `@mentions`, crew cards in `_crew/`, badges.
 
+pub mod crew;
 pub mod doc;
 pub mod func;
 pub mod fuzzy;

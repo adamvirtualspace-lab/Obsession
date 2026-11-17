@@ -80,7 +80,7 @@ obsession/
         check.rs        type checking: decides dashed vs solid
         eval.rs         runs functions in memory: live values, patches
         edit.rs         editor changes as one-line text edits
-      crew.rs           _crew/*.md, mention counts, badges
+      crew.rs           _crew/*.md cards, @mentions, add_mention, badges
       runner.rs         function index, runs with chains and loop guard, apply/revert
       log.rs            run log in .obsessed/log/ (one file per run)
       write.rs          atomic writes, retry on locked files
@@ -105,7 +105,6 @@ obsession/
       graph.rs          graph view: cards, pins, wires, pan, zoom, drag, hit testing
       func_editor.rs    function editor (canvas + panel) and the function picker
       runs.rs           file watcher, run state (1 run/s, one pending), Runs panel
-      crew_hand.rs      the card hand
 ```
 
 > The core package can't be named `core`, because that clashes with Rust's own
@@ -446,6 +445,46 @@ Known limits, for later:
 - The link index is still built in full at startup (no cache in
   `.obsessed/cache/` yet).
 
+### Crew (milestone 7)
+
+| What | Measured |
+|---|---|
+| Idle CPU, graph with the crew hand | **0 ms** (one 16 ms blip in 6 s) |
+| Core tests | 82 (crew 4 new) |
+
+How it works:
+
+- **Cards** (`core/src/crew.rs`) are read from `_crew/*.md` through the store
+  when the vault opens, after rescans, and when a card changes.
+- **Mentions** are counted by the link index as it reads each note: every
+  `@name` on a task line with the task's status, plus the note's own
+  `statuses:`. Open counts (not in the last status) for the whole vault are a
+  quick pass over the index, done when links refresh. In a graph they come
+  from the node cards' tasks.
+- **Badges:** each person against the median of everyone else (2×
+  OVERLOADED, 1.5× POWERHOUSE; none under 3 people or with a median of 0).
+- **The hand** is drawn on the graph canvas (overlay layer), so dragging a
+  card onto a task row is plain hit testing. Dropping adds `@name` to that
+  line (`crew::add_mention`, before a trailing `^id`), saves the note once and
+  lets functions run as for any edit.
+- **`@` autocomplete:** after each keystroke the note reports the `@name`
+  being typed before the caret; suggestions come from the crew. Tab (bound in
+  both editors only while suggestions show) replaces the typed part with
+  `@name `.
+- **`@names` in Live Preview** link to their card. Names without a card are
+  drawn in amber (they go in the same state map as `[[links]]`).
+
+Known limits, for later:
+
+- Portraits aren't drawn yet: every card shows initials in its colour (bots a
+  square face). `portrait:` is read and kept for when images arrive.
+- Highlighting and drop targets cover the first 8 task rows a card shows.
+- Hover highlighting was checked by reading the code, not by an automated
+  screenshot (the dev hooks can't hover the canvas).
+- `@` suggestions only list people in the crew folder.
+- The Settings page has one setting so far (the crew folder). Status formats
+  are still edited in `_settings.md` itself.
+
 ### Drawing: only when something changes
 
 - **Reactive rendering.** iced redraws only after an event. When nothing moves,
@@ -652,7 +691,7 @@ performance budgets checked.
 | 4 | **Graph** ✅ | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** ✅ | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
-| 7 | **Crew** | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
+| 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** | Animation pass, compact mode, vault search, performance on large vaults |
 
 ## Risks
