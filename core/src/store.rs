@@ -67,6 +67,20 @@ pub enum Error {
     NotUtf8,
 }
 
+/// What [`Store::check_outside`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outside {
+    /// Nothing changed, or it was the app's own write.
+    Same,
+    /// Another program changed it; the store now holds the new text.
+    Changed,
+    /// Another program changed it, but unsaved changes here win.
+    Conflict,
+    Deleted,
+    /// The store doesn't hold it, so it can't tell.
+    NotLoaded,
+}
+
 /// A write prepared by [`Store::take_save`]. Run it on any thread.
 #[derive(Debug, Clone)]
 pub struct SaveJob {
@@ -228,6 +242,55 @@ impl Store {
         Ok(meta.len() != doc.disk.len || meta.modified().ok() != doc.disk.modified)
     }
 
+    /// After the watcher reports `rel`: did another program change it?
+    /// Costs a metadata call; the file is read only when its modified time
+    /// or size moved. The app's own writes (matched by content hash) and
+    /// touches without a content change are recognised and absorbed.
+    pub fn check_outside(&mut self, rel: &str) -> Outside {
+        let path = self.root.join(rel);
+        let Some(doc) = self.docs.get_mut(rel) else {
+            return if path.exists() { Outside::NotLoaded } else { Outside::Deleted };
+        };
+        let meta = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Outside::Deleted,
+            Err(_) => return Outside::Same,
+        };
+        if meta.len() == doc.disk.len && meta.modified().ok() == doc.disk.modified {
+            return Outside::Same;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return Outside::Same;
+        };
+        self.stats.reads += 1;
+        self.stats.bytes_read += bytes.len() as u64;
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Outside::Same;
+        };
+        let disk_hash = hash(&text);
+        let disk = DiskState {
+            modified: meta.modified().ok(),
+            len: text.len() as u64,
+            hash: disk_hash,
+        };
+        // Our own write (finished or in flight), or what we already hold.
+        if Some(disk_hash) == doc.saving || disk_hash == doc.disk.hash || disk_hash == doc.hash {
+            if doc.saving.is_none() {
+                doc.disk = disk;
+            }
+            return Outside::Same;
+        }
+        let dirty = doc.hash != doc.saving.unwrap_or(doc.disk.hash);
+        doc.disk = disk;
+        if dirty {
+            // Unsaved changes here win; they're written over it next.
+            return Outside::Conflict;
+        }
+        doc.text = text;
+        doc.hash = disk_hash;
+        Outside::Changed
+    }
+
     /// Re-reads a note after another program changed it.
     pub fn reload(&mut self, rel: &str) -> Result<&str, Error> {
         let pins = self.docs.get(rel).map_or(0, |d| d.pins);
@@ -320,6 +383,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn tells_outside_edits_from_own_writes() {
+        let dir = temp_vault("own-writes");
+        fs::write(dir.join("a.md"), "one").unwrap();
+        let mut store = Store::new(&dir);
+        store.get("a.md").unwrap();
+        assert_eq!(store.check_outside("a.md"), Outside::Same);
+
+        // Our own write is recognised.
+        store.set("a.md", "two".into());
+        let result = store.take_save("a.md").unwrap().run();
+        assert_eq!(store.check_outside("a.md"), Outside::Same);
+        store.finish_save(&result);
+        assert_eq!(store.check_outside("a.md"), Outside::Same);
+
+        // Someone else's isn't (a different length, so no clock games).
+        fs::write(dir.join("a.md"), "three!").unwrap();
+        assert_eq!(store.check_outside("a.md"), Outside::Changed);
+        assert_eq!(store.get("a.md").unwrap(), "three!");
+        assert_eq!(store.check_outside("a.md"), Outside::Same);
+
+        // Unsaved changes here win.
+        store.set("a.md", "mine".into());
+        fs::write(dir.join("a.md"), "theirs!!").unwrap();
+        assert_eq!(store.check_outside("a.md"), Outside::Conflict);
+        assert_eq!(store.get("a.md").unwrap(), "mine");
+
+        fs::write(dir.join("b.md"), "b").unwrap();
+        assert_eq!(store.check_outside("b.md"), Outside::NotLoaded);
+        fs::remove_file(dir.join("a.md")).unwrap();
+        assert_eq!(store.check_outside("a.md"), Outside::Deleted);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -9,3 +9,4 @@ obsession-core.workspace = true
 iced = { workspace = true, features = ["wgpu", "thread-pool", "advanced", "canvas", "crisp", "web-colors"] }
 rfd.workspace = true
 anyhow.workspace = true
+notify = { version = "8.2.2", default-features = false }

@@ -30,7 +30,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 |---|---|---|
 | `lib.rs` | 30 | Module list. |
 | `vault.rs` | 470 | `Vault` (flat sorted `Vec<Entry>`; `scan`, `note(rel)`, `path(rel)`, `notes()`), Obsidian link resolution `resolve` / `resolve_from` → `Resolved::{One, Ambiguous, NotFound, Attachment}` (`.entry()`), `note_rel_from_input`, `create_note`. |
-| `store.rs` | 420 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `Stats` for the status bar. |
+| `store.rs` | 520 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
 | `history.rs` | 150 | `History`: undo/redo snapshots, grouped, capped at 8 MB. |
@@ -46,13 +46,15 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `func/library.rs` | 210 | `NODES`: every node (`Spec { name, category, inputs, output, help }`), `find(name)`. Add a node here *and* in `eval.rs`'s `apply`. |
 | `func/check.rs` | 380 | `check(f)` → `Checked { types, bound, order, problems }` (`ok()`, `first_problem`, `source(name)`), `bind(spec, args)`, `check_call` (a wire's param values), `port_end`. |
 | `func/eval.rs` | 820 | `eval(f, checked, binds, params, team)` → `Run { values, patches }`. `Bind { rel, text, sub }` per port, `Val`, `Patch { port, rel, line, old, new }`, `apply_patches`, `section_range`, `Val::show` (hover text). |
+| `runner.rs` | 560 | `Index::build(vault, graphs, saved)` → `jobs: Vec<Job>` (`Job { graph, line, function, checked, params, ports }`), `affected(changed)`, `files()`, `reads(rel)`, `find(graph, line)`. `run(index, files, start, team)` → `Outcome { texts, changes, ran, blocked, warnings }` (chains, loop guard), `pending` (out of date), `apply` / `revert` (`Change { rel, line, old, new, by }`), `params_from`, `end_kind`. |
+| `log.rs` | 250 | `.obsessed/log/`: `Record { id, time, kind: Kind::{Run, Outside}, summary, changes, undone }`, `append` (keeps 500), `load`, `mark_undone`, `ensure` (folder + `.gitignore`). |
 | `func/edit.rs` | 330 | Editor changes as one-line edits: `set_pos`, `set_arg`, `args_for`, `add_step`, `remove_step`, `add_header`, `remove_line`, `fresh_id`, `wire_call`. |
 
 ## app/src
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 2100 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window). See the flows below for which methods do what. |
+| `main.rs` | 2600 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window). See the flows below for which methods do what. |
 | `note.rs` | 1050 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
@@ -66,6 +68,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `backlinks.rs` | 70 | Backlinks panel. |
 | `graph.rs` | 1510 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire)}`. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
 | `func_editor.rs` | 1480 | Function editor (`Editor`: canvas + panel), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
+| `runs.rs` | 280 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `watch(root)` subscription → `Vec<FsEvent>`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
 | `theme.rs` | 230 | Colours, fonts, widget styles. |
 | `timer.rs` | 20 | One-shot delay future. |
 | `settings.rs` | 30 | Last vault path in `%APPDATA%\Obsession`. |
@@ -108,6 +111,19 @@ through `edit_graph`, or `_funct.md` through the store and a save; then
 `rebuild_graph` → `refresh_editor`, which finds the block again, gathers the
 wire's values and the wired notes (`Bind`s), and calls `Editor::refresh`
 (check + eval → live values).
+
+**Runs.** `rebuild_index` (on scan, and when a graph, `_funct.md` or
+`_settings.md` changes) → `Index::build`, pins job files, `check_out_of_date`
+(`runner::pending` → `runs.out_of_date`, drawn by `rebuild_graph` as
+`WireView::stale` / `Card::stale`). A changed note → `note_changed` (from
+`save_now`, or from `files_changed` on watcher events after
+`Store::check_outside`) → `runs.pending` → `schedule_run` (timer, 1 s gap) →
+`Message::RunNow` (saves the open note, `index.affected`) → `start_run`
+(`runner::run` off-thread) → `Message::RunDone` → `run_done` (`runner::apply`
+to current texts, `put_text` + save each note once, `runs.record`, recheck).
+`RunGraph` runs the open graph's out-of-date jobs. Undo:
+`runs::Message::Undo` → `undo_run` (`runner::revert`, `log::mark_undone`).
+Files created or deleted → `Vault::scan` → `Message::VaultRefreshed`.
 
 ## Conventions
 

@@ -12,15 +12,20 @@
 //! - [`nodes`]: graph files (`_nodes.md`): nodes, wires, layout.
 //! - [`func`]: functions: the text format, node library, type checking,
 //!   evaluation.
+//! - [`runner`]: which functions a change affects, runs with chains and the
+//!   loop guard, undo.
+//! - [`log`]: the run log in `.obsessed/log/`.
 
 pub mod doc;
 pub mod func;
 pub mod fuzzy;
 pub mod history;
 pub mod links;
+pub mod log;
 pub mod live;
 pub mod nodes;
 pub mod preview;
+pub mod runner;
 pub mod status;
 pub mod store;
 pub mod syntax;

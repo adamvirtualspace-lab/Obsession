@@ -562,7 +562,8 @@ Set Status(dst, s, find: target)
   new text. A whole run undoes as one step, newest first. Undo only reverts a
   line that still holds what the run wrote. If someone changed it since, that
   line is skipped with a warning.
-- **Outside edits** show in the log but can't be undone from the app.
+- **Outside edits** show in the log (the **Runs** panel) but can't be undone
+  from the app.
 
 ## 11. The `.obsessed/` folder
 

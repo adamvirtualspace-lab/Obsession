@@ -81,8 +81,8 @@ obsession/
         eval.rs         runs functions in memory: live values, patches
         edit.rs         editor changes as one-line text edits
       crew.rs           _crew/*.md, mention counts, badges
-      runner.rs         throttle (1 run/s), one pending run, loop guard
-      log.rs            undo log in .obsessed/
+      runner.rs         function index, runs with chains and loop guard, apply/revert
+      log.rs            run log in .obsessed/log/ (one file per run)
       write.rs          atomic writes, retry on locked files
   app/                  package "obsession": the iced app
     src/
@@ -104,6 +104,7 @@ obsession/
       dev.rs            debug-only hooks: open a note, screenshot, quit
       graph.rs          graph view: cards, pins, wires, pan, zoom, drag, hit testing
       func_editor.rs    function editor (canvas + panel) and the function picker
+      runs.rs           file watcher, run state (1 run/s, one pending), Runs panel
       crew_hand.rs      the card hand
 ```
 
@@ -399,6 +400,52 @@ Known limits, for later:
 - An `id` can't be renamed from the editor (edit the text).
 - `Find Task` and `Set Status`'s `find` ignore case (Syntax.md says so now).
 
+### Running functions (milestone 6)
+
+Measured on a scratch vault (a graph with three functions, one of them a
+`fn` node with pins):
+
+| What | Measured |
+|---|---|
+| Opening the vault | **0 writes**; 2 wires shown out of date |
+| Outside edit → run → saved | under 2 s (watcher, 1 s gap, one write per note) |
+| Chain: anim → Check Lighting → lighting → Wait For Done → comp | one run, 2 changes, logged once |
+| Idle CPU, watcher on | **0 ms** over 6 s |
+| Core tests | 78 (runner 3, log 1, store 1 new) |
+
+How it works:
+
+- **The index** (`core/src/runner.rs`, `Index::build`) reads every graph file
+  and `_funct.md` when the vault opens and whenever one of them is saved or
+  changed outside. Each wire with a function, and each `fn` node with every pin
+  wired, becomes a `Job`: compiled and checked once, its ports resolved to
+  notes. Functions that don't check out are left out (their wires are dashed
+  with ⚠). Every note a job touches is pinned in the store.
+- **Triggers.** A note saved here (autosave, status clicks) or changed outside
+  (`notify` watcher → `Store::check_outside`, which tells our own writes apart
+  by content hash) adds it to a pending set. If a job reads it, a timer starts
+  the run once a second has passed since the last one. Changes that arrive
+  meanwhile join that one pending run.
+- **A run** gathers the pinned texts (the open note's editor text included),
+  runs `runner::run` off the UI thread, then applies the changes to what each
+  note holds *now* (`runner::apply`: a change applies only where its old lines
+  still are), saves each changed note once, updates the open note in place
+  (undoable there too) and logs the run.
+- **Editing a function or a wire doesn't run anything.** Its wire shows "out of
+  date" instead, until you run it or a note it reads changes.
+- **Undo** (`runner::revert`) goes newest change first and skips lines that
+  changed since. It doesn't start chains.
+
+Known limits, for later:
+
+- The index and the out-of-date check run on the UI thread. Fine for dozens of
+  functions; a vault with hundreds should move them to the background.
+- Only the newest run can be undone, from the Runs panel (not Ctrl+Z).
+- A note changed in another app while it has unsaved edits here keeps the
+  edits here (with a warning), and they are saved over the other change.
+- The link index is still built in full at startup (no cache in
+  `.obsessed/cache/` yet).
+
 ### Drawing: only when something changes
 
 - **Reactive rendering.** iced redraws only after an event. When nothing moves,
@@ -604,7 +651,7 @@ performance budgets checked.
 | 3 | **Links** ✅ | Shortest-name resolution matching Obsidian, ⚠ on ambiguous links, backlinks panel, renaming a file updates links |
 | 4 | **Graph** ✅ | Read and write `_nodes.md`, node cards (like the Possess mockup), pan, zoom, drag, layout saved, dashed wires from `_nodes.md` and from `[[links]]` |
 | 5 | **Function editor** ✅ | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
-| 6 | **Running functions** | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
+| 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** | Animation pass, compact mode, vault search, performance on large vaults |
 

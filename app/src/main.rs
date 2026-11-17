@@ -13,6 +13,7 @@ mod live_text;
 mod new_note;
 mod note;
 mod right_click;
+mod runs;
 mod settings;
 mod sidebar;
 mod status_menu;
@@ -20,6 +21,7 @@ mod switcher;
 mod theme;
 mod timer;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,6 +37,8 @@ use obsession_core::links::{self, Backlink, LinkIndex};
 use obsession_core::func::{self, Library, Origin};
 use obsession_core::func::eval::Bind;
 use obsession_core::nodes::{self, End, Section};
+use obsession_core::runner::{self, Change, Index, Outcome};
+use obsession_core::store::Outside;
 
 use crate::highlight::LinkStates;
 use obsession_core::vault::{self, Kind, Resolved, Vault};
@@ -97,6 +101,17 @@ enum Message {
     StatusMenu(status_menu::Message),
     Resized(Size),
     CloseRequested(window::Id),
+    /// The watcher saw files change.
+    Fs(Vec<runs::FsEvent>),
+    /// The vault's list was read again after files came or went.
+    VaultRefreshed(Result<Vault, String>),
+    /// Time for the pending run.
+    RunNow,
+    RunDone(Arc<RunResult>),
+    Runs(runs::Message),
+    ToggleRuns,
+    /// Run the open graph's out-of-date functions.
+    RunGraph,
     #[cfg(debug_assertions)]
     Dev(dev::Step),
 }
@@ -128,6 +143,34 @@ struct Workspace {
     indexed: bool,
     /// Links to the open note.
     backlinks: Vec<Backlink>,
+    /// Functions: what runs when, and the run log.
+    runs: runs::Runs,
+}
+
+/// A finished run, with its summary (made against the index it ran on).
+#[derive(Debug)]
+pub struct RunResult {
+    outcome: Outcome,
+    summary: String,
+    /// What each blocked job is (for messages).
+    names: HashMap<usize, String>,
+}
+
+/// The note texts a run reads: every note the index touches.
+fn run_files(ws: &mut Workspace) -> HashMap<String, String> {
+    let open = ws.note.as_ref().map(|n| (n.rel.to_string(), n.text()));
+    ws.runs
+        .index
+        .files()
+        .into_iter()
+        .filter_map(|rel| {
+            let text = match &open {
+                Some((r, t)) if *r == rel => t.clone(),
+                _ => ws.store.get(&rel).ok()?.to_owned(),
+            };
+            Some((rel, text))
+        })
+        .collect()
 }
 
 /// The vault-root settings note.
@@ -300,6 +343,7 @@ impl App {
                 settings::remember_vault(&vault.root);
                 let store = Store::new(&vault.root);
                 let tree = Tree::new(&vault);
+                let runs = runs::Runs::new(&vault.root);
                 self.status = Some(format!("{} notes", vault.notes().count()));
                 // Read every note's links on a background thread.
                 let root = vault.root.clone();
@@ -320,11 +364,13 @@ impl App {
                     links: LinkIndex::default(),
                     indexed: false,
                     backlinks: Vec::new(),
+                    runs,
                 };
                 if let Some(warning) = ws.load_team().into_iter().next() {
                     self.status = Some(format!("_settings.md: {warning}"));
                 }
                 self.workspace = Some(ws);
+                self.rebuild_index();
                 self.menu = None;
                 self.switcher = None;
                 self.new_note = None;
@@ -386,6 +432,9 @@ impl App {
                 operation::focus(switcher::input_id())
             }
             Message::ToggleBacklinks => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.runs.show = false;
+                }
                 self.show_backlinks = !self.show_backlinks;
                 Task::none()
             }
@@ -512,6 +561,79 @@ impl App {
                     },
                 }
             }
+            Message::Fs(events) => self.files_changed(events),
+            Message::VaultRefreshed(Ok(vault)) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                if ws.vault.root != vault.root {
+                    return Task::none();
+                }
+                ws.vault = vault;
+                ws.tree.refresh(&ws.vault);
+                self.rebuild_index();
+                self.refresh_links();
+                self.rebuild_graph();
+                Task::none()
+            }
+            Message::VaultRefreshed(Err(error)) => {
+                self.status = Some(format!("Couldn't re-read the folder: {error}"));
+                Task::none()
+            }
+            Message::RunNow => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                ws.runs.scheduled = false;
+                ws.runs.running = true;
+                // Typing in the open note goes into this run.
+                let save = self.save_now();
+                let Some(ws) = &mut self.workspace else {
+                    return save;
+                };
+                let changed = std::mem::take(&mut ws.runs.pending);
+                let start = ws.runs.index.affected(changed.iter().map(String::as_str));
+                if start.is_empty() {
+                    ws.runs.running = false;
+                    return save;
+                }
+                Task::batch([save, self.start_run(start)])
+            }
+            Message::RunDone(result) => self.run_done(&result),
+            Message::Runs(runs::Message::Undo(id)) => self.undo_run(id),
+            Message::Runs(runs::Message::Close) | Message::ToggleRuns => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.runs.show = !ws.runs.show;
+                }
+                Task::none()
+            }
+            Message::RunGraph => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                if ws.runs.running {
+                    self.status = Some("A run is going; try again in a moment".into());
+                    return Task::none();
+                }
+                let Some(graph) = ws.note.as_ref().map(|n| n.rel.to_string()) else {
+                    return Task::none();
+                };
+                let start: Vec<usize> = ws
+                    .runs
+                    .index
+                    .jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, j)| ws.runs.out_of_date.contains_key(&(graph.clone(), j.line)) && j.graph == graph)
+                    .map(|(i, _)| i)
+                    .collect();
+                if start.is_empty() {
+                    return Task::none();
+                }
+                ws.runs.running = true;
+                let save = self.save_now();
+                Task::batch([save, self.start_run(start)])
+            }
             Message::Saved(result) => {
                 if let Some(ws) = &mut self.workspace {
                     ws.store.finish_save(&result);
@@ -574,6 +696,11 @@ impl App {
             Message::Dev(dev::Step::Later(message)) => self.update(*message),
             #[cfg(debug_assertions)]
             Message::Dev(dev::Step::Follow(uri)) => self.follow_link(&uri),
+            #[cfg(debug_assertions)]
+            Message::Dev(dev::Step::UndoRun) => match self.workspace.as_ref().and_then(|ws| ws.runs.undoable()) {
+                Some(id) => self.undo_run(id),
+                None => Task::none(),
+            },
             #[cfg(debug_assertions)]
             Message::Dev(dev::Step::AddNode(name)) => {
                 let index = self.workspace.as_ref().and_then(|ws| {
@@ -859,6 +986,12 @@ impl App {
             self.show_link_wires,
         );
         graph.fit = self.graph_fit;
+        for w in &mut graph.wires {
+            w.stale = w.line.and_then(|l| ws.runs.out_of_date.get(&(rel.to_string(), l)).cloned());
+        }
+        for c in &mut graph.cards {
+            c.stale = c.line.and_then(|l| ws.runs.out_of_date.get(&(rel.to_string(), l)).cloned());
+        }
         self.functions = library;
         self.graph = Some(graph);
         self.refresh_editor();
@@ -988,6 +1121,7 @@ impl App {
                     Some(job) => Task::perform(async move { job.run() }, Message::Saved),
                     None => Task::none(),
                 };
+                self.rebuild_index();
                 self.rebuild_graph();
                 task
             }
@@ -1646,10 +1780,14 @@ impl App {
         let Some(note) = &mut ws.note else {
             return Task::none();
         };
+        let mut changed = None;
         if note.unsynced {
             let text = note.text();
             note.analyze(&text);
             ws.links.update(&note.rel, &text);
+            if ws.store.get(&note.rel).ok() != Some(text.as_str()) {
+                changed = Some(note.rel.to_string());
+            }
             ws.store.set(&note.rel, text);
             note.unsynced = false;
             if &*note.rel == SETTINGS_NOTE {
@@ -1662,10 +1800,329 @@ impl App {
         let Some(note) = &ws.note else {
             return Task::none();
         };
-        match ws.store.take_save(&note.rel) {
+        let save = match ws.store.take_save(&note.rel) {
             Some(job) => Task::perform(async move { job.run() }, Message::Saved),
             None => Task::none(),
+        };
+        match changed {
+            Some(rel) => Task::batch([save, self.note_changed(&rel)]),
+            None => save,
         }
+    }
+
+    /// A note's text changed (here or in another app): functions that read
+    /// it run, and a changed graph or `_funct.md` changes the functions.
+    fn note_changed(&mut self, rel: &str) -> Task<Message> {
+        if nodes::is_graph(rel) || rel.eq_ignore_ascii_case(func::SAVED) || rel.eq_ignore_ascii_case(SETTINGS_NOTE) {
+            self.rebuild_index();
+            return Task::none();
+        }
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        if !ws.runs.index.reads(rel) {
+            // Not an input, but maybe an output: what's out of date moves.
+            if ws.runs.pinned.iter().any(|p| p == rel) && !ws.runs.running {
+                self.check_out_of_date();
+                self.rebuild_graph();
+            }
+            return Task::none();
+        }
+        ws.runs.pending.insert(rel.to_owned());
+        self.schedule_run()
+    }
+
+    /// Re-reads every graph and `_funct.md` into the run index, keeps the
+    /// notes it touches in RAM, then checks what's out of date.
+    fn rebuild_index(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        let rels: Vec<String> = ws
+            .vault
+            .notes()
+            .filter(|e| nodes::is_graph(&e.rel))
+            .map(|e| e.rel.to_string())
+            .collect();
+        let graphs: Vec<(String, String)> = rels
+            .into_iter()
+            .filter_map(|rel| {
+                let text = ws.store.get(&rel).ok()?.to_owned();
+                Some((rel, text))
+            })
+            .collect();
+        let saved = if ws.vault.note(func::SAVED).is_some() {
+            ws.store.get(func::SAVED).map(func::blocks).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let index = Index::build(&ws.vault, &graphs, &saved);
+        let files = index.files();
+        for rel in &files {
+            let _ = ws.store.pin(rel);
+        }
+        for rel in std::mem::replace(&mut ws.runs.pinned, files) {
+            ws.store.unpin(&rel);
+        }
+        ws.runs.index = Arc::new(index);
+        self.check_out_of_date();
+    }
+
+    /// Which functions would change something if they ran now. Opening a
+    /// vault never changes files: those wires show "out of date" instead.
+    fn check_out_of_date(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        let files = run_files(ws);
+        let index = ws.runs.index.clone();
+        ws.runs.out_of_date = runner::pending(&index, &files, ws.team.as_ref())
+            .into_iter()
+            .map(|(j, summary)| ((index.jobs[j].graph.clone(), index.jobs[j].line), summary))
+            .collect();
+    }
+
+    /// Starts the pending run when its time comes (at most one a second).
+    fn schedule_run(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let runs = &mut ws.runs;
+        if runs.running || runs.scheduled || runs.pending.is_empty() {
+            return Task::none();
+        }
+        runs.scheduled = true;
+        Task::perform(timer::after(runs.wait()), |()| Message::RunNow)
+    }
+
+    /// Runs `start` (and their chains) off the UI thread. The open note's
+    /// typing is saved into the run first.
+    fn start_run(&mut self, start: Vec<usize>) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        ws.runs.running = true;
+        let files = run_files(ws);
+        let index = ws.runs.index.clone();
+        let team = ws.team.clone();
+        Task::perform(
+            async move {
+                let outcome = runner::run(&index, &files, &start, team.as_ref());
+                let summary = outcome.summary(&index);
+                let names = outcome.blocked.keys().map(|&j| (j, index.jobs[j].name().to_owned())).collect();
+                Arc::new(RunResult { outcome, summary, names })
+            },
+            Message::RunDone,
+        )
+    }
+
+    /// Puts new text in a note: the open note (undoable there) or the
+    /// store, then saves it once.
+    fn put_text(&mut self, rel: &str, text: &str) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let mut timers = Task::none();
+        if let Some(note) = &mut ws.note
+            && &*note.rel == rel
+        {
+            let id = note.id;
+            let t = note.apply_text(text);
+            note.unsynced = false;
+            note.analyze(text);
+            timers = start_timers(id, t);
+        }
+        ws.links.update(rel, text);
+        ws.store.set(rel, text.to_owned());
+        let save = match ws.store.take_save(rel) {
+            Some(job) => Task::perform(async move { job.run() }, Message::Saved),
+            None => Task::none(),
+        };
+        Task::batch([timers, save])
+    }
+
+    /// The current text of a note (the open note's editor, or the store).
+    fn current_text(&mut self, rel: &str) -> Option<String> {
+        let ws = self.workspace.as_mut()?;
+        match &ws.note {
+            Some(note) if &*note.rel == rel => Some(note.text()),
+            _ => ws.store.get(rel).ok().map(str::to_owned),
+        }
+    }
+
+    /// A run finished: apply its changes to what the notes hold now, save
+    /// each changed note once, and log it for undo.
+    fn run_done(&mut self, result: &RunResult) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        ws.runs.running = false;
+        ws.runs.last = Some(std::time::Instant::now());
+        let outcome = &result.outcome;
+        let mut rels: Vec<String> = Vec::new();
+        for c in &outcome.changes {
+            if !rels.contains(&c.rel) {
+                rels.push(c.rel.clone());
+            }
+        }
+        let mut tasks = Vec::new();
+        let mut applied: Vec<Change> = Vec::new();
+        let mut skipped = 0;
+        for rel in &rels {
+            let mine: Vec<&Change> = outcome.changes.iter().filter(|c| &c.rel == rel).collect();
+            let Some(current) = self.current_text(rel) else {
+                skipped += mine.len();
+                continue;
+            };
+            let (new, done) = runner::apply(&current, &mine);
+            skipped += mine.len() - done.len();
+            applied.extend(done.into_iter().cloned());
+            if new != current {
+                tasks.push(self.put_text(rel, &new));
+            }
+        }
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let root = ws.vault.root.clone();
+        let mut notes: Vec<String> = Vec::new();
+        if !applied.is_empty() {
+            match ws.runs.record(&root, obsession_core::log::Kind::Run, result.summary.clone(), applied) {
+                Ok(_) => notes.push(format!("{} · Undo in Runs", result.summary)),
+                Err(e) => notes.push(format!("{} · ⚠ {e}", result.summary)),
+            }
+        }
+        if skipped > 0 {
+            notes.push(format!("⚠ {skipped} change{} skipped: the note changed meanwhile", if skipped == 1 { "" } else { "s" }));
+        }
+        notes.extend(outcome.warnings.iter().map(|w| format!("⚠ {w}")));
+        for (j, why) in &outcome.blocked {
+            let name = result.names.get(j).map_or("A function", String::as_str);
+            notes.push(format!("⚠ {name} didn't change anything: {why}"));
+        }
+        if !notes.is_empty() {
+            self.status = Some(notes.join(" · "));
+        }
+        self.check_out_of_date();
+        self.rebuild_graph();
+        tasks.push(self.schedule_run());
+        Task::batch(tasks)
+    }
+
+    /// Undoes a run: each change whose lines still hold what it wrote.
+    fn undo_run(&mut self, id: u64) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let Some(rec) = ws.runs.log.iter().find(|r| r.id == id).cloned() else {
+            return Task::none();
+        };
+        let mut rels: Vec<String> = Vec::new();
+        for c in &rec.changes {
+            if !rels.contains(&c.rel) {
+                rels.push(c.rel.clone());
+            }
+        }
+        let mut tasks = Vec::new();
+        let mut skipped = 0;
+        for rel in &rels {
+            let mine: Vec<&Change> = rec.changes.iter().filter(|c| &c.rel == rel).collect();
+            let Some(current) = self.current_text(rel) else {
+                skipped += mine.len();
+                continue;
+            };
+            let (old, missed) = runner::revert(&current, &mine);
+            skipped += missed;
+            if old != current {
+                tasks.push(self.put_text(rel, &old));
+            }
+        }
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let _ = obsession_core::log::mark_undone(&ws.vault.root, id);
+        if let Some(r) = ws.runs.log.iter_mut().find(|r| r.id == id) {
+            r.undone = true;
+        }
+        self.status = Some(match skipped {
+            0 => format!("Undid: {}", rec.summary),
+            n => format!(
+                "Undid: {} · ⚠ {n} line{} left alone: changed since the run",
+                rec.summary,
+                if n == 1 { "" } else { "s" }
+            ),
+        });
+        self.check_out_of_date();
+        self.rebuild_graph();
+        Task::batch(tasks)
+    }
+
+    /// Files changed on disk: tell other apps' edits from our own writes.
+    fn files_changed(&mut self, events: Vec<runs::FsEvent>) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let root = ws.vault.root.clone();
+        let mut structural = false;
+        let mut outside: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for event in events {
+            structural |= event.structural;
+            let Some(rel) = runs::rel_of(&root, &event.path) else { continue };
+            match ws.store.check_outside(&rel) {
+                Outside::Same => {}
+                Outside::Changed => {
+                    let text = ws.store.get(&rel).map(str::to_owned).unwrap_or_default();
+                    ws.links.update(&rel, &text);
+                    if let Some(note) = &mut ws.note
+                        && *note.rel == *rel
+                    {
+                        if note.unsynced {
+                            warnings.push(format!(
+                                "⚠ {} changed in another app; your unsaved edits here will be saved over it",
+                                rel.trim_end_matches(".md")
+                            ));
+                        } else {
+                            note.replace_text(&text);
+                            note.analyze(&text);
+                        }
+                    }
+                    outside.push(rel);
+                }
+                Outside::Conflict => warnings.push(format!(
+                    "⚠ {} changed in another app while it had unsaved changes here; keeping these",
+                    rel.trim_end_matches(".md")
+                )),
+                Outside::Deleted => {
+                    ws.links.remove(&rel);
+                    structural = true;
+                }
+                Outside::NotLoaded => {
+                    if let Ok(text) = std::fs::read_to_string(&event.path) {
+                        ws.links.update(&rel, &text);
+                        outside.push(rel);
+                    }
+                }
+            }
+        }
+        let mut tasks = Vec::new();
+        if !outside.is_empty() {
+            let names: Vec<&str> = outside.iter().take(3).map(|r| r.trim_end_matches(".md")).collect();
+            let more = if outside.len() > 3 { format!(" and {} more", outside.len() - 3) } else { String::new() };
+            let summary = format!("Changed in another app: {}{more}", names.join(", "));
+            let _ = ws.runs.record(&root, obsession_core::log::Kind::Outside, summary, Vec::new());
+            for rel in outside {
+                tasks.push(self.note_changed(&rel));
+            }
+            self.refresh_links();
+            self.rebuild_graph();
+        }
+        if !warnings.is_empty() {
+            self.status = Some(warnings.join(" · "));
+        }
+        if structural {
+            tasks.push(Task::perform(
+                async move { Vault::scan(&root).map_err(|e| e.to_string()) },
+                Message::VaultRefreshed,
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Used when closing: write on this thread so nothing is lost.
@@ -1784,7 +2241,12 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let watch = self
+            .workspace
+            .as_ref()
+            .map_or_else(Subscription::none, |ws| runs::watch(ws.vault.root.clone()).map(Message::Fs));
         Subscription::batch([
+            watch,
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
@@ -1859,7 +2321,9 @@ impl App {
 
                 let page = container(body).style(theme::page).width(Fill).height(Fill);
                 let mut middle = row![sidebar, page].height(Fill);
-                if self.show_backlinks && ws.note.is_some() && !(self.editor.is_some() && self.show_graph) {
+                if ws.runs.show {
+                    middle = middle.push(rule::vertical(1)).push(ws.runs.view().map(Message::Runs));
+                } else if self.show_backlinks && ws.note.is_some() && !(self.editor.is_some() && self.show_graph) {
                     middle = middle.push(rule::vertical(1)).push(
                         backlinks::view(&ws.backlinks, ws.indexed).map(Message::Backlinks),
                     );
@@ -1939,10 +2403,29 @@ impl App {
                             .style(theme::tool(self.show_link_wires))
                     }))
                     .spacing(10),
+                row![]
+                    .push({
+                        let stale = ws
+                            .note
+                            .as_ref()
+                            .filter(|_| self.graph.is_some() && self.show_graph)
+                            .map_or(0, |n| ws.runs.stale_in(&n.rel));
+                        (stale > 0).then(|| {
+                            button(text(format!("⚠ Run {stale} out of date")).size(theme::SMALL).color(theme::WARNING))
+                                .on_press(Message::RunGraph)
+                                .padding([4, 12])
+                                .style(theme::tool(false))
+                        })
+                    })
+                    .spacing(10),
+                button(text(if ws.runs.running { "Runs ●" } else { "Runs" }).size(theme::SMALL))
+                    .on_press(Message::ToggleRuns)
+                    .padding([4, 12])
+                    .style(theme::tool(ws.runs.show)),
                 button(text("Backlinks").size(theme::SMALL))
                     .on_press(Message::ToggleBacklinks)
                     .padding([4, 12])
-                    .style(theme::tool(self.show_backlinks)),
+                    .style(theme::tool(self.show_backlinks && !ws.runs.show)),
                 Space::new().width(8),
                 mode_button("Live", Mode::Live),
                 mode_button("Source", Mode::Source),

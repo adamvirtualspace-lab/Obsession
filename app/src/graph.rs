@@ -105,6 +105,10 @@ pub struct Card {
     pub pins_out: Vec<(String, PortKind)>,
     /// Why a function card isn't ready (shown with ⚠).
     pub problem: Option<String>,
+    /// Its line in the graph file.
+    pub line: Option<usize>,
+    /// A function node that would change something if it ran now.
+    pub stale: Option<String>,
     accent: Color,
 }
 
@@ -147,6 +151,8 @@ pub struct WireView {
     pub state: WireState,
     /// When it turned solid (for the dashed-to-solid animation).
     pub solid_since: Option<Instant>,
+    /// Its function would change something if it ran now: what.
+    pub stale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +313,7 @@ impl Graph {
                 to_pin,
                 state,
                 solid_since: None,
+                stale: None,
             });
         }
 
@@ -366,6 +373,7 @@ impl Graph {
                         to_pin: None,
                         state: WireState::Plain,
                         solid_since: None,
+                        stale: None,
                     });
                 }
             }
@@ -979,6 +987,8 @@ fn card(
         pins_in: Vec::new(),
         pins_out: Vec::new(),
         problem: None,
+        line: Some(node.line),
+        stale: None,
         accent: accent(folder),
     };
     let target = match &node.kind {
@@ -1253,10 +1263,11 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         WireState::Broken(why) => Some(why.as_str()),
         _ => None,
     };
+    let stale = wire.stale.as_deref().filter(|_| broken.is_none());
     // The ƒ dot: on wires with a function, and on a hovered wire.
     if wire.label.is_some() || look.button {
         let k = z.min(1.2);
-        let ring = if broken.is_some() {
+        let ring = if broken.is_some() || stale.is_some() {
             theme::WARNING
         } else if lit {
             theme::ACCENT
@@ -1287,6 +1298,9 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
     if broken.is_some() {
         above.push_str("  ⚠");
     }
+    if stale.is_some() {
+        above.push_str("  ⚠ out of date");
+    }
     let caption = |frame: &mut Frame, content: String, y: f32, color: Color| {
         frame.fill_text(Text {
             content,
@@ -1299,7 +1313,7 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         });
     };
     if !above.is_empty() {
-        let tint = if broken.is_some() {
+        let tint = if broken.is_some() || stale.is_some() {
             theme::WARNING
         } else if lit {
             theme::ACCENT
@@ -1308,7 +1322,7 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         };
         caption(frame, above, -27.0, tint);
     }
-    if let Some(why) = broken
+    if let Some(why) = broken.or(stale)
         && lit
     {
         caption(frame, fit(why, 440.0, 11.0), 13.0, theme::WARNING);
@@ -1367,9 +1381,10 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
         if z < DETAIL_ZOOM {
             return;
         }
-        let (sub, color) = match &card.problem {
-            Some(why) => (format!("⚠ {why}"), theme::WARNING),
-            None => ("function · double-click to edit".to_owned(), theme::FAINT),
+        let (sub, color) = match (&card.problem, &card.stale) {
+            (Some(why), _) => (format!("⚠ {why}"), theme::WARNING),
+            (None, Some(what)) => (format!("⚠ out of date: {what}"), theme::WARNING),
+            (None, None) => ("function · double-click to edit".to_owned(), theme::FAINT),
         };
         label(frame, fit(&sub, size.width - 24.0, 11.0), Point::new(p.x + 12.0 * z, p.y + 31.0 * z), 11.0 * z, color, theme::UI_FONT);
         for (output, pins) in [(false, &card.pins_in), (true, &card.pins_out)] {

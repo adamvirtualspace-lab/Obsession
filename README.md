@@ -72,8 +72,18 @@ remove it. **+ Node** (or double-click the canvas) adds a node from the
 library. Click a node to set its values in the panel; hover a pin to see its
 live value, read from the real notes the wire connects. The panel also holds
 the wire's own values (`task`, `target`…). **+ Function** adds a function with
-several ins or outs as a node; wire notes to its pins. Nothing runs yet:
-functions only show what they would change (milestone 6 runs them).
+several ins or outs as a node; wire notes to its pins.
+
+**Runs:** a function runs when a note it reads changes, whether you edit it
+here or in Obsidian, VS Code or a `git pull`. If its changes change a note
+another function reads, that one runs too (each line changes at most once per
+run). Runs happen at most once a second, and every changed note is saved once.
+Opening a vault never changes anything: functions that would change something
+show **⚠ out of date** on their wire, and **Run N out of date** in the toolbar
+runs them. **Runs** opens the log: every run with the lines it changed, notes
+changed in other apps, and **Undo** for the newest run (it puts back only lines
+that still hold what the run wrote). The log lives in `.obsessed/log/` at the
+vault root, which has its own `.gitignore`.
 
 **Links** resolve as in Obsidian: `[[sh040]]` finds the note by name wherever
 it is, `[[anim/sh040]]` narrows it by folder, `./` and `../` are relative, and

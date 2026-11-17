@@ -43,6 +43,8 @@ pub enum Step {
     Follow(String),
     /// Add the note with this name to the open graph.
     AddNode(String),
+    /// Undo the newest run.
+    UndoRun,
 }
 
 fn later(ms: u64, message: Message) -> Task<Message> {
@@ -167,6 +169,11 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 }
                 // The ƒ button on wire `n`.
                 Some("fn") => Message::Graph(G::Function(n(1) as usize)),
+                // Runs: run the graph's out-of-date functions, show the
+                // Runs panel, undo the newest run.
+                Some("run") => Message::RunGraph,
+                Some("runs") => Message::ToggleRuns,
+                Some("undorun") => Message::Dev(Step::UndoRun),
                 // The function picker: `pick,Name`, `create,Name`.
                 Some("pick") => Message::Picker(crate::func_editor::PickerMessage::Pick(parts.get(1).unwrap_or(&"").to_string())),
                 Some("create") => {
@@ -309,7 +316,7 @@ fn live_script(script: &str) -> Vec<Message> {
 
 pub fn update(step: Step) -> Task<Message> {
     match step {
-        Step::Later(_) | Step::Follow(_) | Step::AddNode(_) => Task::none(),
+        Step::Later(_) | Step::Follow(_) | Step::AddNode(_) | Step::UndoRun => Task::none(),
         Step::ScrollView(y) => iced::widget::operation::scroll_to(
             crate::live::scroll_id(),
             iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
