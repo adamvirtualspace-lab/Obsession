@@ -914,6 +914,10 @@ impl Live {
             .id(editor_id())
             .on_action(Message::Edit)
             .key_binding(move |press: KeyPress| {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("OBSESSION_DEV_KEYS").is_some() {
+                    eprintln!("live binding {:?} {:?} completing={completing}", press.key, press.status);
+                }
                 if !matches!(press.status, text_editor::Status::Focused { .. }) {
                     return Binding::from_key_press(press);
                 }

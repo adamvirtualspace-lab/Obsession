@@ -1008,7 +1008,13 @@ impl canvas::Program<Message> for Editor {
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left | mouse::Button::Middle)) => {
-                match std::mem::take(&mut state.interaction) {
+                let done = std::mem::take(&mut state.interaction);
+                // A pin's value box follows the cursor, not the pin a drag
+                // started from.
+                if !matches!(done, Interaction::Idle) {
+                    state.hover = point.and_then(|p| self.hit(state, view, p));
+                }
+                match done {
                     Interaction::Dragging { step, at, moved: true, .. } => Some(canvas::Action::publish(Message::Moved(step, at))),
                     Interaction::Wiring { source, detached, .. } => {
                         let target = point.and_then(|p| self.hit(state, view, p));

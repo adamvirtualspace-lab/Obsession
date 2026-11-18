@@ -56,8 +56,8 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3450 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window). See the flows below for which methods do what. |
-| `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode`. `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
+| `main.rs` | 3500 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
 | `highlight.rs` | 200 | iced highlighter over `core::syntax`; status and link colours. |
@@ -69,13 +69,13 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `find.rs` | 150 | Vault search popup (Ctrl+Shift+F): `Find` (query, results, selection), `Message::{Query, Submit, Pick, Close}`. |
 | `new_note.rs` | 105 | New-note box (Ctrl+N), also the rename box (F2). |
 | `backlinks.rs` | 70 | Backlinks panel. |
-| `graph.rs` | 1950 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`, drawn by `draw_crew` in the overlay. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
+| `graph.rs` | 1950 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`, drawn by `draw_crew` in the overlay. `takes_function(wire)`: no ƒ on wires to or from a function node's pin. Hover is worked out again when a drag ends. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
 | `func_editor.rs` | 1480 | Function editor (`Editor`: canvas + panel), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
 | `runs.rs` | 280 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `watch(root)` subscription → `Vec<FsEvent>`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
 | `theme.rs` | 260 | Colours, fonts, widget styles. Compact layout: `set_compact`, `compact`, `row_height`, `tool_pad`, `tool_gap`, `bar_pad`. |
 | `timer.rs` | 20 | One-shot delay future. |
 | `settings.rs` | 60 | `%APPDATA%\Obsession`: the last vault, and `Prefs { compact }` (`prefs`, `save_prefs`). |
-| `dev.rs` | 350 | Debug-only hooks driven by `OBSESSION_DEV_*` variables (open a note, type, click, run graph/editor steps, screenshot). See its header for the list. |
+| `dev.rs` | 350 | Debug-only hooks driven by `OBSESSION_DEV_*` variables (open a note, type, click, run graph/editor steps, screenshot; `OBSESSION_DEV_KEYS` logs key presses). See its header for the list. |
 
 ## Flows
 
@@ -138,8 +138,13 @@ refreshes `ws.mentions` (vault-wide open counts). `rebuild_graph` →
 the `Assigning` box → `AssignTo` → `assign` → `put_text` + `note_changed`.
 `@name` click → `follow_link("@name")` → `open_crew` (opens or creates
 `_crew/name.md`). Typing → `update_completion` → `Completion`; Tab
-(`live::Intent::Complete` / `SourceEvent::Complete`) or a click →
-`Message::CompleteMention` → `Note::complete_mention`.
+(`live::Intent::Complete` / `SourceEvent::Complete`, or `Shortcut::Tab` if the
+editor didn't take it) or a click → `Message::CompleteMention` →
+`Note::complete_mention`. `App::open` clears the suggestions.
+
+**Files the app creates** (a crew card, a new note, `_funct.md`) are read
+through `store.get` right after, so the watcher's events for them count as
+the app's own writes, not as "Changed in another app".
 
 **Search.** `Shortcut::FindInVault` → `open_find` (saves the open note;
 builds `SearchIndex` off-thread the first time → `Message::SearchBuilt`) →
@@ -160,4 +165,6 @@ with `.obsessed/cache/links.txt` → `save_cache` if anything was read.
 - Draw only when something changes; canvases cache their still layer and keep
   hover, drag and animation in an overlay. Idle CPU is measured at 0.
 - Tests for anything in core; the app is checked with the `dev.rs` hooks and
-  screenshots.
+  screenshots, and by hand (PLAN.md, "Checked by hand").
+- Overlays go on a `stack!` that's always there; don't swap a widget for a
+  `stack!` only when something shows, or the widgets under it lose their state.

@@ -24,6 +24,8 @@
 //! - `OBSESSION_DEV_SIZE=w,h`  start with this window size (read at startup)
 //! - `OBSESSION_DEV_TIMING=1`  print how long the link index and search took (stderr)
 //! - `OBSESSION_DEV_PULSE_MS=8000`  slow down the run glow to look at it
+//! - `OBSESSION_DEV_KEYS=1`  print each key press, whether a widget used it,
+//!   and what the Live and Source editors' key bindings saw (stderr)
 
 use std::time::Duration;
 

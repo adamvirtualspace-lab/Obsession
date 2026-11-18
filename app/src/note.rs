@@ -235,6 +235,10 @@ impl Note {
             (Body::Source(content), false) => {
                 let cursor = content.cursor().position;
                 let mut live = Live::new(&content.text(), &self.format);
+                // A fresh Live knows nothing of links or suggestions yet;
+                // `set_link_states` skips it when the states haven't changed.
+                live.links = self.statuses.links.clone();
+                live.completing = self.completing;
                 if mode == Mode::Live {
                     live.activate(cursor.line, cursor.column);
                 }
@@ -989,6 +993,7 @@ impl Note {
             None => {
                 let mut mirror = Live::new(&text, &self.format);
                 mirror.read_only = true;
+                mirror.links = self.statuses.links.clone();
                 self.mirror = Some(mirror);
             }
         }
@@ -1077,6 +1082,10 @@ impl Note {
                     .on_action(SourceEvent::Action)
                     .key_binding(move |press| {
                         let focused = matches!(press.status, text_editor::Status::Focused { .. });
+                        #[cfg(debug_assertions)]
+                        if std::env::var_os("OBSESSION_DEV_KEYS").is_some() {
+                            eprintln!("source binding {:?} focused={focused} completing={completing}", press.key);
+                        }
                         if completing
                             && focused
                             && press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab)

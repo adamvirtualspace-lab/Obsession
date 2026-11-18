@@ -419,6 +419,26 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The app creates some files itself (a crew card, a new note,
+    /// `_funct.md`) and reads them through the store right away, so the
+    /// watcher's events for them aren't taken for another app's edits.
+    #[test]
+    fn a_file_read_right_after_creating_it_is_not_an_outside_edit() {
+        let dir = temp_vault("created");
+        let mut store = Store::new(&dir);
+        fs::create_dir_all(dir.join("_crew")).unwrap();
+        fs::write(dir.join("_crew/zed.md"), "---\nname: zed\n---\n").unwrap();
+        assert_eq!(store.check_outside("_crew/zed.md"), Outside::NotLoaded);
+        store.get("_crew/zed.md").unwrap();
+        // The create and the write can each raise an event: both are ours.
+        assert_eq!(store.check_outside("_crew/zed.md"), Outside::Same);
+        assert_eq!(store.check_outside("_crew/zed.md"), Outside::Same);
+        // A real edit afterwards still shows.
+        fs::write(dir.join("_crew/zed.md"), "---\nname: Zed Moss\n---\n").unwrap();
+        assert_eq!(store.check_outside("_crew/zed.md"), Outside::Changed);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn reads_once_then_serves_from_ram() {
         let dir = temp_vault("once");

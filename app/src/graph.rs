@@ -664,6 +664,12 @@ impl Graph {
         })
     }
 
+    /// Whether a function can go on this wire: not on a wire to or from a
+    /// function node's pin, which only carries a file.
+    fn takes_function(&self, w: &WireView) -> bool {
+        self.cards[w.from].kind != CardKind::Function && self.cards[w.to].kind != CardKind::Function
+    }
+
     fn hit(&self, state: &State, view: View, p: Point) -> Option<Hover> {
         if let Some(m) = self.hit_hand(state, p) {
             return Some(Hover::Hand(m));
@@ -673,7 +679,8 @@ impl Graph {
         // wire.
         let reach = 10.0 * view.zoom.max(0.6);
         for (i, w) in self.visible_wires() {
-            let shown = w.label.is_some() || matches!(state.hover, Some(Hover::Wire(h) | Hover::Button(h)) if h == i);
+            let shown = w.label.is_some()
+                || (self.takes_function(w) && matches!(state.hover, Some(Hover::Wire(h) | Hover::Button(h)) if h == i));
             if shown && view.screen(self.middle(w, state)).distance(p) <= reach {
                 return Some(Hover::Button(i));
             }
@@ -873,6 +880,18 @@ impl canvas::Program<Message> for Graph {
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left | mouse::Button::Middle)) => {
                 let done = std::mem::take(&mut state.interaction);
+                // What's under the cursor now: a dropped crew card goes back
+                // down at once instead of waiting for the next mouse move.
+                if !matches!(done, Interaction::Idle) {
+                    let hover = point.and_then(|p| self.hit(state, view, p));
+                    if hover != state.hover {
+                        state.rise = match hover {
+                            Some(Hover::Hand(h)) => Some((h, Instant::now())),
+                            _ => None,
+                        };
+                        state.hover = hover;
+                    }
+                }
                 if let Interaction::Dealing { member, at } = done {
                     // Dropped back on the hand, or on nothing: put it back.
                     let on_hand = self.hit_hand(state, at).is_some();
@@ -1004,7 +1023,7 @@ impl canvas::Program<Message> for Graph {
                 let look = Look {
                     lit,
                     ants: if lit { 11 - ants } else { 0 },
-                    button: lit,
+                    button: lit && self.takes_function(wire),
                     pressed: state.hover == Some(Hover::Button(i)),
                 };
                 draw_wire(&mut frame, view, a, b, wire, look, screen);
@@ -1722,6 +1741,21 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         above.push_str("  ⚠ out of date");
     }
     let caption = |frame: &mut Frame, content: String, y: f32, color: Color| {
+        // A hovered wire is drawn over the cards: give its words a backing
+        // so they stay readable where they cross a card.
+        if look.lit {
+            let size = 11.0 * view.zoom;
+            let width = content.chars().count() as f32 * size * 0.56 + 10.0 * view.zoom;
+            let height = size * 1.5;
+            frame.fill(
+                &Path::rounded_rectangle(
+                    Point::new(mid.x - width / 2.0, mid.y + y * view.zoom - size * 0.2),
+                    Size::new(width, height),
+                    (4.0 * view.zoom).into(),
+                ),
+                Color { a: 0.92, ..theme::BG },
+            );
+        }
         frame.fill_text(Text {
             content,
             position: Point::new(mid.x, mid.y + y * view.zoom),

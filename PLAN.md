@@ -531,6 +531,41 @@ Known limits, for later:
 - Compact layout doesn't change the editor's line spacing or the graph cards.
 - Crew portraits are still initials.
 
+### Checked by hand (November 2026)
+
+The `--profile measure` build was driven with a real mouse and keyboard
+(Computer use) on a small test vault: four crew cards with OVERLOADED and
+POWERHOUSE, a `shots/_nodes.md` with Wait For Done, Copy Status, a broken wire
+and `fn Check Lighting`, and an `@zed` with no card. Everything on the list
+worked, apart from the bugs below, which are fixed:
+
+| Found | Cause | Fix |
+|---|---|---|
+| Tab didn't complete an `@name` (Live and Source); a click did | Showing the suggestions wrapped the page in a `stack!`, so the editor moved in the widget tree, lost its state and its focus, and its Tab binding never ran | The page and the window are always a `stack!` (one layer when nothing is open), so widgets keep focus and scroll when popups open or close. An unused Tab also completes, as a fallback (`Shortcut::Tab`) |
+| Escape took two presses to close search, the quick switcher and the new-note box | A focused text box captures Escape to drop its own focus | Escape always reaches `App::shortcut` |
+| Unknown `@names` lost their amber after Source → Live, and in Split's preview | A new `Live` started with no link states, and `set_link_states` skips unchanged states | `Note::set_mode` and the Split mirror copy the note's link states (and the suggestion flag) into the new `Live` |
+| `@name` suggestions stayed up after opening another note | Not cleared on open | `App::open` clears them |
+| A crew card stayed raised after being dropped on a task, until the mouse moved | Hover was only worked out on mouse moves | Worked out again when a drag ends (graph and function editor, whose pin value box had the same problem) |
+| Hovering a wire to or from a function node's pin offered "Add a function", then refused it | The ƒ button didn't check the wire's ends | No ƒ on those wires (`Graph::takes_function`) |
+| A hovered wire's "out of date" reason was hard to read over a nearby card | Captions were drawn with no background | Captions of the hovered wire get a dark backing |
+| A crew card made by clicking `@name` (and a new note, and `_funct.md`) showed in Runs as "Changed in another app", twice | The file was written outside the store, so the watcher's events looked like another app's | The store reads the file right after the app creates it (core test `a_file_read_right_after_creating_it_is_not_an_outside_edit`) |
+
+Measured after the fixes: idle CPU **0 ms** and **0 bytes** written over 10 s
+each with a note open, the graph with the crew hand, and vault search open. A
+hovered wire draws its marching ants (about 30 ms of CPU a second) and stops
+when the mouse leaves. Core tests: 87.
+
+Still not right, for later:
+
+- With the graph open, the toolbar is wider than a 1138-pixel-wide window
+  (2560 × 1600 at 225 %): the last view buttons are cut off.
+- With six crew cards and the backlinks panel open, the hand overlaps enough
+  that badges run into each other.
+- An unknown `@name` is amber only when its line is drawn, not on the line
+  being edited.
+- The run glow (1.2 s, starting about a second after a change) is easy to miss;
+  `OBSESSION_DEV_PULSE_MS` slows it down to look at.
+
 ### Drawing: only when something changes
 
 - **Reactive rendering.** iced redraws only after an event. When nothing moves,

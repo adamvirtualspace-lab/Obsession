@@ -143,6 +143,8 @@ enum Shortcut {
     Up,
     Down,
     Escape,
+    /// Tab that no widget used: completes an `@name` if suggestions show.
+    Tab,
 }
 
 struct Workspace {
@@ -985,6 +987,16 @@ impl App {
                 note.set_completing(false);
             }
         }
+        // The editors' own Tab binding completes when it sees the key; this
+        // catches a Tab they didn't take.
+        if matches!(shortcut, Shortcut::Tab) {
+            return match &self.completion {
+                Some(c) if !c.matches.is_empty() && self.new_note.is_none() && self.find.is_none() && self.switcher.is_none() => {
+                    self.handle(Message::CompleteMention(None))
+                }
+                _ => Task::none(),
+            };
+        }
         if self.new_note.is_some() {
             if matches!(shortcut, Shortcut::Escape | Shortcut::NewNote) {
                 self.new_note = None;
@@ -1048,7 +1060,7 @@ impl App {
             Shortcut::Redo => self.undo(true),
             Shortcut::Save => self.save_now(),
             Shortcut::OpenFolder => self.update(Message::PickFolder),
-            Shortcut::Up | Shortcut::Down | Shortcut::Escape => Task::none(),
+            Shortcut::Up | Shortcut::Down | Shortcut::Escape | Shortcut::Tab => Task::none(),
         }
     }
 
@@ -1165,7 +1177,7 @@ impl App {
                 }
             };
         }
-        let (Some(form), Some(ws)) = (&mut self.new_note, &self.workspace) else {
+        let (Some(form), Some(ws)) = (&mut self.new_note, &mut self.workspace) else {
             return Task::none();
         };
         match message {
@@ -1188,6 +1200,9 @@ impl App {
                 };
                 match vault::create_note(&ws.vault.root, &rel) {
                     Ok(()) => {
+                        // Known to the store at once, so the watcher's event
+                        // for it isn't taken for another app's edit.
+                        let _ = ws.store.get(&rel);
                         self.new_note = None;
                         self.status = Some(format!("Created {rel}"));
                         let root = ws.vault.root.clone();
@@ -1546,6 +1561,7 @@ impl App {
             self.status = Some(format!("⚠ Couldn't create _funct.md: {error}"));
             return;
         }
+        let _ = ws.store.get(func::SAVED);
         if let Ok(vault) = Vault::scan(&ws.vault.root) {
             ws.vault = vault;
             ws.tree.refresh(&ws.vault);
@@ -1930,6 +1946,8 @@ impl App {
         self.next_note_id += 1;
         self.editor = None;
         self.picker = None;
+        // Suggestions belong to the note they were typed in.
+        self.completion = None;
         let id = self.next_note_id;
 
         let Some(ws) = &mut self.workspace else {
@@ -2843,6 +2861,9 @@ impl App {
             self.status = Some(format!("Couldn't create a card for @{name}: {error}"));
             return Task::none();
         }
+        // Known to the store at once, so the watcher's event for it isn't
+        // taken for another app's edit.
+        let _ = ws.store.get(&rel);
         self.status = Some(format!("Created a crew card for @{name}"));
         let root = ws.vault.root.clone();
         let rel: Box<str> = rel.into();
@@ -2919,7 +2940,7 @@ impl App {
     /// A `[[wiki link]]` to a note that doesn't exist creates it, as in
     /// Obsidian (at the path the link names, from the vault root).
     fn follow_note(&mut self, target: &str, sub: Option<String>, create: bool) -> Task<Message> {
-        let Some(ws) = &self.workspace else {
+        let Some(ws) = &mut self.workspace else {
             return Task::none();
         };
         let from = ws.note.as_ref().map(|n| n.rel.clone());
@@ -2967,6 +2988,7 @@ impl App {
                 };
                 match vault::create_note(&ws.vault.root, &rel) {
                     Ok(()) => {
+                        let _ = ws.store.get(&rel);
                         self.status = Some(format!("Created {rel}"));
                         let root = ws.vault.root.clone();
                         let rel: Box<str> = rel.into();
@@ -3107,7 +3129,9 @@ impl App {
                         ]
                         .into()
                     }
-                    _ => page.into(),
+                    // Always a stack, so the editor keeps its place in the
+                    // widget tree (and its focus) when suggestions appear.
+                    _ => stack![page].into(),
                 };
                 let mut middle = row![sidebar, page].height(Fill);
                 if ws.runs.show {
@@ -3168,7 +3192,9 @@ impl App {
             (Some(switcher), Some(ws)) => {
                 stack![main, switcher.view(&ws.vault).map(Message::Switcher)].into()
             }
-            _ => main,
+            // Always a stack, so the window's widgets keep their state (focus,
+            // scroll) when a popup opens or closes.
+            _ => stack![main].into(),
         }
     }
 
@@ -3422,6 +3448,10 @@ fn shortcut_from_event(
     let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
         return None;
     };
+    #[cfg(debug_assertions)]
+    if std::env::var_os("OBSESSION_DEV_KEYS").is_some() {
+        eprintln!("key {key:?} {status:?}");
+    }
     if key == Key::Named(Named::F2) {
         return Some(Shortcut::Rename);
     }
@@ -3439,13 +3469,19 @@ fn shortcut_from_event(
             _ => None,
         };
     }
+    // Escape always reaches the app: a focused text box (search, the quick
+    // switcher, the new-note box) captures it just to drop its own focus,
+    // which would otherwise take a second press to close the popup.
+    if key == Key::Named(Named::Escape) {
+        return Some(Shortcut::Escape);
+    }
     if status == event::Status::Captured {
         return None;
     }
     match key {
         Key::Named(Named::ArrowUp) => Some(Shortcut::Up),
         Key::Named(Named::ArrowDown) => Some(Shortcut::Down),
-        Key::Named(Named::Escape) => Some(Shortcut::Escape),
+        Key::Named(Named::Tab) if !modifiers.shift() && !modifiers.alt() => Some(Shortcut::Tab),
         _ => None,
     }
 }
