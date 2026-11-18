@@ -51,6 +51,11 @@ pub enum Next {
 }
 
 impl Format {
+    /// A format from its statuses (`None` if there are none).
+    pub fn from_statuses(statuses: Vec<Status>) -> Option<Self> {
+        (!statuses.is_empty()).then_some(Self { statuses })
+    }
+
     pub fn builtin() -> Self {
         Self {
             statuses: vec![

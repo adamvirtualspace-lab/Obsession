@@ -42,6 +42,20 @@ const GRID: f32 = 40.0;
 const HAND_W: f32 = 150.0;
 const HAND_H: f32 = 132.0;
 const HAND_PEEK: f32 = 74.0;
+/// How long a crew card takes to rise.
+const RISE_MS: f32 = 140.0;
+/// How long a wire glows after its function ran.
+const PULSE_MS: f32 = 1200.0;
+
+/// The glow's length (debug builds can slow it down to look at it:
+/// `OBSESSION_DEV_PULSE_MS`).
+fn pulse_ms() -> f32 {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("OBSESSION_DEV_PULSE_MS").ok().and_then(|v| v.parse().ok()) {
+        return ms;
+    }
+    PULSE_MS
+}
 /// How long a wire takes to go from dashed to solid.
 const SOLID_MS: f32 = 450.0;
 
@@ -206,6 +220,9 @@ pub struct Graph {
     /// The crew, as a hand of cards along the bottom.
     pub hand: Vec<HandCard>,
     pub show_hand: bool,
+    /// Wires (and function nodes) whose function just ran, by line in the
+    /// graph file: they glow for a moment.
+    pub pulses: Vec<(usize, Instant)>,
     /// Changed when a different graph is opened, so the view fits it.
     pub fit: u64,
     cache: Cache,
@@ -257,6 +274,8 @@ pub struct State {
     fitted: Option<u64>,
     /// The canvas size, for the hand.
     size: Size,
+    /// The crew card rising, and since when.
+    rise: Option<(usize, Instant)>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -461,6 +480,7 @@ impl Graph {
             show_links,
             hand: Vec::new(),
             show_hand: true,
+            pulses: Vec::new(),
             fit: 0,
             cache: Cache::new(),
             drawn: Cell::new(None),
@@ -507,12 +527,30 @@ impl Graph {
 
     /// A crew card's place on screen; the hovered one rises.
     fn hand_rect(&self, i: usize, size: Size, raised: bool) -> Rectangle {
+        self.hand_rect_at(i, size, if raised { 1.0 } else { 0.0 })
+    }
+
+    /// A crew card `lift` of the way (0 resting, 1 risen) up.
+    fn hand_rect_at(&self, i: usize, size: Size, lift: f32) -> Rectangle {
         let n = self.hand.len() as f32;
         let step = (HAND_W + 12.0).min((size.width - 80.0 - HAND_W) / (n - 1.0).max(1.0)).max(24.0);
         let total = HAND_W + step * (n - 1.0);
         let x = size.width / 2.0 - total / 2.0 + i as f32 * step;
-        let y = if raised { size.height - HAND_H - 10.0 } else { size.height - HAND_PEEK };
-        Rectangle::new(Point::new(x, y), Size::new(HAND_W, HAND_H))
+        let rest = size.height - HAND_PEEK;
+        let top = size.height - HAND_H - 10.0;
+        Rectangle::new(Point::new(x, rest + (top - rest) * lift), Size::new(HAND_W, HAND_H))
+    }
+
+    /// How far each glow has faded (0 just ran, 1 gone), by graph line.
+    fn pulse(&self, line: Option<usize>) -> Option<f32> {
+        let line = line?;
+        let (_, at) = self.pulses.iter().find(|(l, _)| *l == line)?;
+        let t = at.elapsed().as_secs_f32() * 1000.0 / pulse_ms();
+        (t < 1.0).then_some(t)
+    }
+
+    fn pulsing(&self) -> bool {
+        self.pulses.iter().any(|(_, at)| at.elapsed().as_secs_f32() * 1000.0 < pulse_ms())
     }
 
     /// The crew card under a screen point (the raised one first).
@@ -822,6 +860,10 @@ impl canvas::Program<Message> for Graph {
                     Interaction::Idle => {
                         let hover = point.and_then(|p| self.hit(state, view, p));
                         if hover != state.hover {
+                            state.rise = match hover {
+                                Some(Hover::Hand(h)) => Some((h, Instant::now())),
+                                _ => None,
+                            };
                             state.hover = hover;
                             return Some(canvas::Action::request_redraw());
                         }
@@ -890,9 +932,12 @@ impl canvas::Program<Message> for Graph {
             }
             Event::Window(iced::window::Event::RedrawRequested(_)) => {
                 // Marching ants on the hovered or selected wire only.
+                let rising = state.rise.is_some_and(|(_, at)| at.elapsed().as_secs_f32() * 1000.0 < RISE_MS);
                 let animated = matches!(state.hover, Some(Hover::Wire(_) | Hover::Button(_)))
                     || matches!(state.selected, Some(Selected::Wire(_)))
-                    || self.animating();
+                    || self.animating()
+                    || self.pulsing()
+                    || rising;
                 animated.then(|| canvas::Action::request_redraw_at(Instant::now() + std::time::Duration::from_millis(50)))
             }
             _ => None,
@@ -1008,6 +1053,32 @@ impl canvas::Program<Message> for Graph {
                 },
             );
         }
+        // Wires whose function just ran glow, then fade.
+        for (_, wire) in self.visible_wires() {
+            if let Some(t) = self.pulse(wire.line) {
+                let (a, b) = self.wire_ends(wire, state);
+                let fade = 1.0 - t;
+                frame.stroke(
+                    &curve(view, a, b),
+                    Stroke::default()
+                        .with_color(Color { a: 0.55 * fade, ..theme::SUCCESS })
+                        .with_width(2.0 + 6.0 * fade),
+                );
+            }
+        }
+        for (i, card) in self.cards.iter().enumerate() {
+            if card.kind == CardKind::Function
+                && let Some(t) = self.pulse(card.line)
+            {
+                let r = self.card_rect(i, state);
+                frame.stroke(
+                    &Path::rounded_rectangle(view.screen(r.position()), r.size() * zoom, (8.0 * zoom).into()),
+                    Stroke::default()
+                        .with_color(Color { a: 0.7 * (1.0 - t), ..theme::SUCCESS })
+                        .with_width(2.0 + 4.0 * (1.0 - t)),
+                );
+            }
+        }
         self.draw_crew(&mut frame, state, view, bounds.size());
         vec![still, frame.into_geometry()]
     }
@@ -1104,7 +1175,13 @@ impl Graph {
             self.draw_hand_card(frame, i, self.hand_rect(i, size, false));
         }
         if let Some(h) = raised {
-            self.draw_hand_card(frame, h, self.hand_rect(h, size, true));
+            // Eases up over RISE_MS.
+            let t = state
+                .rise
+                .filter(|(r, _)| *r == h)
+                .map_or(1.0, |(_, at)| (at.elapsed().as_secs_f32() * 1000.0 / RISE_MS).min(1.0));
+            let lift = 1.0 - (1.0 - t) * (1.0 - t);
+            self.draw_hand_card(frame, h, self.hand_rect_at(h, size, lift));
         }
         // The card being dragged: a small token under the cursor.
         if let Interaction::Dealing { member, at } = state.interaction {

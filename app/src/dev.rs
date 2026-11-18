@@ -22,6 +22,8 @@
 //! - `OBSESSION_DEV_SHOT=C:\path\shot.bmp`  screenshot after `OBSESSION_DEV_WAIT` ms (default 1500)
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
 //! - `OBSESSION_DEV_SIZE=w,h`  start with this window size (read at startup)
+//! - `OBSESSION_DEV_TIMING=1`  print how long the link index and search took (stderr)
+//! - `OBSESSION_DEV_PULSE_MS=8000`  slow down the run glow to look at it
 
 use std::time::Duration;
 
@@ -188,6 +190,12 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 Some("settings") => Message::Settings(crate::SettingsMessage::Open),
                 Some("crew") => Message::Settings(crate::SettingsMessage::Crew(parts[1..].join(","))),
                 Some("save") => Message::Settings(crate::SettingsMessage::Save),
+                Some("compact") => Message::Settings(crate::SettingsMessage::Compact(parts.get(1) != Some(&"off"))),
+                // Vault search: `search` opens it, `query,words` types, `pickhit`
+                // opens the selected line.
+                Some("search") => Message::Shortcut(crate::Shortcut::FindInVault),
+                Some("query") => Message::Find(crate::find::Message::Query(parts[1..].join(","))),
+                Some("pickhit") => Message::Find(crate::find::Message::Submit),
                 // As if the folder picker returned this path.
                 Some("picked") => Message::Settings(crate::SettingsMessage::Picked(Some(parts[1..].join(",").into()))),
                 // The function picker: `pick,Name`, `create,Name`.

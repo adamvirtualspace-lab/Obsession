@@ -56,6 +56,9 @@ pub struct Runs {
     pub out_of_date: HashMap<(String, usize), String>,
     /// Newest first.
     pub log: Vec<Record>,
+    /// (graph, line) of the functions the last run ran, and when: their
+    /// wires glow for a moment.
+    pub glow: Vec<((String, usize), Instant)>,
     pub next_id: u64,
     pub show: bool,
 }
@@ -72,6 +75,7 @@ impl Runs {
             last: None,
             out_of_date: HashMap::new(),
             log,
+            glow: Vec::new(),
             next_id,
             show: false,
         }

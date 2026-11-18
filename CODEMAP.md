@@ -37,9 +37,10 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `syntax.rs` | 380 | Line tokenizer for highlighting: `scan_line(LineState, line)`, `LineState::{Start, Normal, Frontmatter, Fence, Comment}`, `can_hold_task`. Used by everything that must skip code and frontmatter. |
 | `status.rs` | 440 | Tasks and status formats: `task_box(line)`, `tasks(text)` → `(line, byte of [, char)`, `Format` (`builtin`, `index_of`, `get`, `next`, `is_finished`), `from_frontmatter`, `resolve(note, team)`. |
 | `live.rs` | 910 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s with raw-byte mapping, `table_cells`, `trailing_block_id`. |
-| `links.rs` | 620 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `link_states`, `rewrite_links` for renames. |
+| `links.rs` | 910 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `build_cached` + `to_cache` + `save_cache` (`.obsessed/cache/links.txt`), `stamp`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `link_states`, `rewrite_links` for renames. |
 | `preview.rs` | 430 | Obsidian → plain markdown (unused by the app now; kept for export). |
 | `fuzzy.rs` | 70 | `score(query, candidate)` for the quick switcher. |
+| `search.rs` | 230 | Vault search: `SearchIndex::build(root, notes)`, `update`, `remove`, `query(words, limit)` → `Results { hits: Vec<Hit { rel, line, text, ranges }>, total, notes }`. |
 | `nodes.rs` | 600 | Graph files (any `…_nodes.md`, `is_graph(rel)`): `parse(text)` → `Graph { nodes, wires, layout }`, `Node`/`NodeKind::{File, Function}`, `Wire { from, to, function, line }`, `End::{Note{target, sub}, Pin{function, pin}}`. Edits: `set_layout`, `add_item`, `remove_lines`, `add_block`, `set_wire_function`, `section_lines`. |
 | `func/mod.rs` | 640 | Function text format: `parse`, `blocks(text)` / `local_blocks(graph)` → `Block { open, close, function }`, `Function { name, inputs, outputs, params, steps, errors }`, `Step { id, op, args, pos, line }`, `Value::{Ref, Lit}`, `Literal`, `parse_call`, `parse_value`, `write_step`. `Library { local, saved }` (`find`, `all`), `SAVED` = `_funct.md`, `SAVED_DEFAULT`. |
 | `func/types.rs` | 140 | `Type` (File, Section, Task, Text, Number, Bool, TextList, TaskList) and `Want` (what an argument accepts; `accepts`, `describe`). |
@@ -55,7 +56,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3190 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window). See the flows below for which methods do what. |
+| `main.rs` | 3450 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar`, `view_status`; `subscription` (keys, window). See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode`. `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
@@ -65,14 +66,15 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `status_menu.rs` | 85 | Right-click status menu. |
 | `sidebar.rs` | 160 | File tree as a virtual list (`Tree`). |
 | `switcher.rs` | 135 | Quick switcher (Ctrl+P). |
+| `find.rs` | 150 | Vault search popup (Ctrl+Shift+F): `Find` (query, results, selection), `Message::{Query, Submit, Pick, Close}`. |
 | `new_note.rs` | 105 | New-note box (Ctrl+N), also the rename box (F2). |
 | `backlinks.rs` | 70 | Backlinks panel. |
-| `graph.rs` | 1870 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`, drawn by `draw_crew` in the overlay. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
+| `graph.rs` | 1950 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`, drawn by `draw_crew` in the overlay. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
 | `func_editor.rs` | 1480 | Function editor (`Editor`: canvas + panel), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
 | `runs.rs` | 280 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `watch(root)` subscription → `Vec<FsEvent>`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
-| `theme.rs` | 230 | Colours, fonts, widget styles. |
+| `theme.rs` | 260 | Colours, fonts, widget styles. Compact layout: `set_compact`, `compact`, `row_height`, `tool_pad`, `tool_gap`, `bar_pad`. |
 | `timer.rs` | 20 | One-shot delay future. |
-| `settings.rs` | 30 | Last vault path in `%APPDATA%\Obsession`. |
+| `settings.rs` | 60 | `%APPDATA%\Obsession`: the last vault, and `Prefs { compact }` (`prefs`, `save_prefs`). |
 | `dev.rs` | 350 | Debug-only hooks driven by `OBSESSION_DEV_*` variables (open a note, type, click, run graph/editor steps, screenshot). See its header for the list. |
 
 ## Flows
@@ -138,6 +140,17 @@ the `Assigning` box → `AssignTo` → `assign` → `put_text` + `note_changed`.
 `_crew/name.md`). Typing → `update_completion` → `Completion`; Tab
 (`live::Intent::Complete` / `SourceEvent::Complete`) or a click →
 `Message::CompleteMention` → `Note::complete_mention`.
+
+**Search.** `Shortcut::FindInVault` → `open_find` (saves the open note;
+builds `SearchIndex` off-thread the first time → `Message::SearchBuilt`) →
+`find::Find`. Typing → `find_message` → `SearchIndex::query`. Enter or a click
+→ `open_at(rel, Jump::Line)`. Every `ws.links.update` is followed by
+`ws.search.update`, so search stays current.
+
+**Startup cache.** `Message::Scanned` → background `LinkIndex::build_cached`
+with `.obsessed/cache/links.txt` → `save_cache` if anything was read.
+`Message::Saved` → `links.stamp`; `save_blocking` (close) writes the cache if
+`links_dirty`.
 
 ## Conventions
 

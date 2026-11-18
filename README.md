@@ -74,6 +74,16 @@ live value, read from the real notes the wire connects. The panel also holds
 the wire's own values (`task`, `target`…). **+ Function** adds a function with
 several ins or outs as a node; wire notes to its pins.
 
+**Search:** Ctrl+Shift+F (or **Search** in the toolbar) finds every line that
+has all the words you type, in every note, ignoring case. Matches are
+highlighted; Enter or a click opens the note at that line. The first search
+reads every note once (about a second for 10,000 notes); after that it's
+instant and kept up to date as notes change.
+
+**Settings** (toolbar): the crew folder, shared through `_settings.md`, and
+**compact layout** for this computer only (a tighter toolbar, file tree and
+panels).
+
 **Crew:** one note per person (or bot) in the crew folder (`_crew/ika.md`,
 with `name`, `role`, `color` in its frontmatter; Syntax.md section 4), or one
 folder per person (`Members/Adam/`, card `Members/Adam/Adam.md`). **Settings**

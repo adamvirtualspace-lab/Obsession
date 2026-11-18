@@ -115,9 +115,46 @@ fn read(dir: &Path) -> Result<(), String> {
 fn links(dir: &Path) -> Result<(), String> {
     let vault = Vault::scan(dir).map_err(|e| e.to_string())?;
     let rels: Vec<&str> = vault.notes().map(|e| &*e.rel).collect();
+    use obsession_core::links::LinkIndex;
+    // Where the time goes: reading, then each part of indexing a note.
     let start = Instant::now();
-    let index = obsession_core::links::LinkIndex::build(dir, rels.iter().copied());
-    println!("indexed {} notes in {:.0?}", index.len(), start.elapsed());
+    let texts: Vec<(&str, String)> = rels
+        .iter()
+        .filter_map(|r| Some((*r, fs::read_to_string(dir.join(r)).ok()?)))
+        .collect();
+    println!("read {} notes in {:.0?}", texts.len(), start.elapsed());
+    let time = |label: &str, f: &dyn Fn(&str)| {
+        let start = Instant::now();
+        for (_, t) in &texts {
+            f(t);
+        }
+        println!("  {label}: {:.0?}", start.elapsed());
+    };
+    time("links", &|t| drop(obsession_core::links::links(t)));
+    time("outline", &|t| drop(obsession_core::links::outline(t)));
+    time("task mentions", &|t| drop(obsession_core::crew::task_mentions(t)));
+    time("frontmatter", &|t| drop(obsession_core::status::from_frontmatter(t.lines())));
+    let start = Instant::now();
+    let mut idx = LinkIndex::default();
+    for (rel, t) in &texts {
+        idx.update(rel, t);
+    }
+    println!("  update(): {:.0?}", start.elapsed());
+    let start = Instant::now();
+    let (index, stats) = LinkIndex::build_cached(dir, rels.iter().copied(), None);
+    println!("indexed {} notes in {:.0?} ({} read)", index.len(), start.elapsed(), stats.parsed);
+    let start = Instant::now();
+    let cache = index.to_cache();
+    println!("cache: {} KB, written in {:.0?}", cache.len() / 1024, start.elapsed());
+    let start = Instant::now();
+    let (again, stats) = LinkIndex::build_cached(dir, rels.iter().copied(), Some(&cache));
+    println!(
+        "from the cache: {} notes in {:.0?} ({} read, {} cached)",
+        again.len(),
+        start.elapsed(),
+        stats.parsed,
+        stats.cached
+    );
     let start = Instant::now();
     let mut total = 0;
     for rel in rels.iter().take(1000) {

@@ -4,6 +4,7 @@
 mod backlinks;
 #[cfg(debug_assertions)]
 mod dev;
+mod find;
 mod func_editor;
 mod graph;
 mod source_scroll;
@@ -80,6 +81,9 @@ enum Message {
     /// Show or hide the crew hand in the graph.
     ToggleHand,
     Settings(SettingsMessage),
+    Find(find::Message),
+    /// The vault search index is ready (for the vault at this root).
+    SearchBuilt(PathBuf, Built),
     /// From the "assign to which task" box: (node card, task row), or close.
     AssignTo(Option<(usize, usize)>),
     /// Pick a note to add to the open graph.
@@ -135,6 +139,7 @@ enum Shortcut {
     Undo,
     Redo,
     Rename,
+    FindInVault,
     Up,
     Down,
     Escape,
@@ -154,6 +159,11 @@ struct Workspace {
     backlinks: Vec<Backlink>,
     /// Functions: what runs when, and the run log.
     runs: runs::Runs,
+    /// The link index changed since its cache was written.
+    links_dirty: bool,
+    /// Vault search, once it's been used.
+    search: Option<obsession_core::search::SearchIndex>,
+    search_building: bool,
     /// The crew folder (`crew:` in `_settings.md`, else `_crew`).
     crew_folder: String,
     /// The crew, by name: cards in the crew folder, and people's folders.
@@ -221,6 +231,8 @@ pub struct RunResult {
     summary: String,
     /// What each blocked job is (for messages).
     names: HashMap<usize, String>,
+    /// (graph, line) of each job that ran, for the glow.
+    ran: Vec<(String, usize)>,
 }
 
 /// The note texts a run reads: every note the index touches.
@@ -300,11 +312,24 @@ struct App {
     assigning: Option<Assigning>,
     /// The Settings page, while open.
     settings: Option<SettingsForm>,
+    /// Vault search, while open.
+    find: Option<find::Find>,
+}
+
+/// A search index built in the background, handed over once.
+#[derive(Clone)]
+pub struct Built(Arc<std::sync::Mutex<Option<obsession_core::search::SearchIndex>>>);
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Built")
+    }
 }
 
 /// The Settings page: vault-wide settings, saved in `_settings.md`.
 struct SettingsForm {
     crew: String,
+    compact: bool,
     /// Why the picked folder can't be used.
     error: Option<String>,
 }
@@ -317,6 +342,7 @@ pub enum SettingsMessage {
     Browse,
     /// The folder picker closed.
     Picked(Option<PathBuf>),
+    Compact(bool),
     Save,
     Close,
 }
@@ -357,6 +383,7 @@ fn end_kind(end: &End) -> func::PortKind {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        theme::set_compact(settings::prefs().compact);
         let app = Self {
             workspace: None,
             mode: Mode::default(),
@@ -381,6 +408,7 @@ impl App {
             show_hand: true,
             assigning: None,
             settings: None,
+            find: None,
         };
         let start = std::env::args_os()
             .nth(1)
@@ -458,9 +486,24 @@ impl App {
                 // Read every note's links on a background thread.
                 let root = vault.root.clone();
                 let rels: Vec<Box<str>> = vault.notes().map(|e| e.rel.clone()).collect();
+                // Notes unchanged since the last time come from the cache in
+                // `.obsessed/cache/`; only changed ones are read.
                 let index = Task::perform(
                     async move {
-                        let index = LinkIndex::build(&root, rels.iter().map(|r| &**r));
+                        let started = std::time::Instant::now();
+                        let cache = std::fs::read_to_string(root.join(links::CACHE)).ok();
+                        let (index, stats) = LinkIndex::build_cached(&root, rels.iter().map(|r| &**r), cache.as_deref());
+                        if stats.parsed > 0 {
+                            let _ = links::save_cache(&root, &index);
+                        }
+                        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+                            eprintln!(
+                                "TIMING index: {} ms, {} read, {} from cache",
+                                started.elapsed().as_millis(),
+                                stats.parsed,
+                                stats.cached
+                            );
+                        }
                         (root, Arc::new(index))
                     },
                     |(root, index)| Message::Indexed(root, index),
@@ -475,6 +518,9 @@ impl App {
                     indexed: false,
                     backlinks: Vec::new(),
                     runs,
+                    links_dirty: false,
+                    search: None,
+                    search_building: false,
                     crew_folder: crew::FOLDER.to_owned(),
                     crew: Vec::new(),
                     mentions: HashMap::new(),
@@ -524,6 +570,25 @@ impl App {
                 Task::none()
             }
             Message::Settings(message) => self.settings_message(message),
+            Message::Find(message) => self.find_message(message),
+            Message::SearchBuilt(root, built) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                if ws.vault.root != root {
+                    return Task::none();
+                }
+                ws.search_building = false;
+                ws.search = built.0.lock().ok().and_then(|mut b| b.take());
+                // The open note may hold newer text than the disk.
+                if let (Some(search), Some(note)) = (&mut ws.search, &ws.note) {
+                    search.update(&note.rel, &note.text());
+                }
+                if let Some(find) = &mut self.find {
+                    find.refresh(ws.search.as_ref());
+                }
+                Task::none()
+            }
             Message::ToggleHand => {
                 self.show_hand = !self.show_hand;
                 if let Some(graph) = &mut self.graph {
@@ -583,6 +648,7 @@ impl App {
                         // A new note: empty, so nothing to read for its links.
                         if ws.links.outline(&rel).is_none() {
                             ws.links.update(&rel, "");
+                            if let Some(search) = &mut ws.search { search.update(&rel, ""); }
                         }
                         let open = self.open(rel);
                         // Links to it from the note we came from are fine now.
@@ -795,6 +861,13 @@ impl App {
             Message::Saved(result) => {
                 if let Some(ws) = &mut self.workspace {
                     ws.store.finish_save(&result);
+                    // The index holds what was just written: the cache can
+                    // trust it next time.
+                    if result.error().is_none() {
+                        let root = ws.vault.root.clone();
+                        ws.links.stamp(&root, result.rel());
+                        ws.links_dirty = true;
+                    }
                 }
                 if let Some(error) = result.error() {
                     self.status = Some(format!("Couldn't save {}: {error}", result.rel()));
@@ -918,6 +991,15 @@ impl App {
             }
             return Task::none();
         }
+        if let Some(find) = &mut self.find {
+            match shortcut {
+                Shortcut::Up => find.move_selection(false),
+                Shortcut::Down => find.move_selection(true),
+                Shortcut::Escape | Shortcut::FindInVault => self.find = None,
+                _ => {}
+            }
+            return Task::none();
+        }
         if let Some(switcher) = &mut self.switcher {
             match shortcut {
                 Shortcut::Up => switcher.move_selection(false),
@@ -928,6 +1010,7 @@ impl App {
             return Task::none();
         }
         match shortcut {
+            Shortcut::FindInVault => self.open_find(),
             Shortcut::QuickSwitch => {
                 let Some(ws) = &self.workspace else {
                     return Task::none();
@@ -967,6 +1050,63 @@ impl App {
             Shortcut::OpenFolder => self.update(Message::PickFolder),
             Shortcut::Up | Shortcut::Down | Shortcut::Escape => Task::none(),
         }
+    }
+
+    /// Opens vault search, building its index the first time.
+    fn open_find(&mut self) -> Task<Message> {
+        if self.workspace.is_none() {
+            return Task::none();
+        }
+        let save = self.save_now();
+        let Some(ws) = &mut self.workspace else {
+            return save;
+        };
+        let mut find = find::Find::default();
+        find.refresh(ws.search.as_ref());
+        self.find = Some(find);
+        let focus = operation::focus(find::input_id());
+        if ws.search.is_some() || ws.search_building {
+            return Task::batch([save, focus]);
+        }
+        ws.search_building = true;
+        let root = ws.vault.root.clone();
+        let rels: Vec<Box<str>> = ws.vault.notes().map(|e| e.rel.clone()).collect();
+        let build = Task::perform(
+            async move {
+                let started = std::time::Instant::now();
+                let index = obsession_core::search::SearchIndex::build(&root, rels.iter().map(|r| &**r));
+                if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+                    eprintln!("TIMING search: {} notes in {} ms, {} KB", index.len(), started.elapsed().as_millis(), index.bytes() / 1024);
+                }
+                (root, Built(Arc::new(std::sync::Mutex::new(Some(index)))))
+            },
+            |(root, built)| Message::SearchBuilt(root, built),
+        );
+        Task::batch([save, focus, build])
+    }
+
+    fn find_message(&mut self, message: find::Message) -> Task<Message> {
+        let Some(find) = &mut self.find else {
+            return Task::none();
+        };
+        let pick = match message {
+            find::Message::Query(query) => {
+                let index = self.workspace.as_ref().and_then(|ws| ws.search.as_ref());
+                find.set_query(index, query);
+                return Task::none();
+            }
+            find::Message::Close => {
+                self.find = None;
+                return Task::none();
+            }
+            find::Message::Submit => find.selected().cloned(),
+            find::Message::Pick(i) => find.hit(i).cloned(),
+        };
+        let Some(hit) = pick else {
+            return Task::none();
+        };
+        self.find = None;
+        self.open_at(hit.rel, Some(Jump::Line(hit.line)))
     }
 
     fn switcher_message(&mut self, message: switcher::Message) -> Task<Message> {
@@ -1136,6 +1276,13 @@ impl App {
         }
         graph.set_crew(&ws.crew);
         graph.show_hand = self.show_hand;
+        graph.pulses = ws
+            .runs
+            .glow
+            .iter()
+            .filter(|((g, _), _)| **g == *rel)
+            .map(|((_, line), at)| (*line, *at))
+            .collect();
         self.functions = library;
         self.graph = Some(graph);
         self.refresh_editor();
@@ -1923,6 +2070,7 @@ impl App {
                 }
             }
             ws.links.update(now, &new_text);
+            if let Some(search) = &mut ws.search { search.update(now, &new_text); }
             if let Some(note) = &mut ws.note
                 && &*note.rel == now
             {
@@ -1935,6 +2083,7 @@ impl App {
             && let Ok(text) = ws.store.get(&new_rel).map(str::to_owned)
         {
             ws.links.update(&new_rel, &text);
+            if let Some(search) = &mut ws.search { search.update(&new_rel, &text); }
         }
 
         match Vault::scan(&ws.vault.root) {
@@ -1975,6 +2124,7 @@ impl App {
             let text = note.text();
             note.analyze(&text);
             ws.links.update(&note.rel, &text);
+            if let Some(search) = &mut ws.search { search.update(&note.rel, &text); }
             if ws.store.get(&note.rel).ok() != Some(text.as_str()) {
                 changed = Some(note.rel.to_string());
             }
@@ -2111,7 +2261,8 @@ impl App {
                 let outcome = runner::run(&index, &files, &start, team.as_ref());
                 let summary = outcome.summary(&index);
                 let names = outcome.blocked.keys().map(|&j| (j, index.jobs[j].name().to_owned())).collect();
-                Arc::new(RunResult { outcome, summary, names })
+                let ran = outcome.ran.iter().map(|&j| (index.jobs[j].graph.clone(), index.jobs[j].line)).collect();
+                Arc::new(RunResult { outcome, summary, names, ran })
             },
             Message::RunDone,
         )
@@ -2134,6 +2285,7 @@ impl App {
             timers = start_timers(id, t);
         }
         ws.links.update(rel, text);
+        if let Some(search) = &mut ws.search { search.update(rel, text); }
         ws.store.set(rel, text.to_owned());
         let save = match ws.store.take_save(rel) {
             Some(job) => Task::perform(async move { job.run() }, Message::Saved),
@@ -2158,7 +2310,12 @@ impl App {
             return Task::none();
         };
         ws.runs.running = false;
-        ws.runs.last = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        ws.runs.last = Some(now);
+        // Only runs that changed something glow.
+        if !result.outcome.changes.is_empty() {
+            ws.runs.glow = result.ran.iter().map(|k| (k.clone(), now)).collect();
+        }
         let outcome = &result.outcome;
         let mut rels: Vec<String> = Vec::new();
         for c in &outcome.changes {
@@ -2275,6 +2432,7 @@ impl App {
                 Outside::Changed => {
                     let text = ws.store.get(&rel).map(str::to_owned).unwrap_or_default();
                     ws.links.update(&rel, &text);
+                    if let Some(search) = &mut ws.search { search.update(&rel, &text); }
                     if let Some(note) = &mut ws.note
                         && *note.rel == *rel
                     {
@@ -2296,11 +2454,15 @@ impl App {
                 )),
                 Outside::Deleted => {
                     ws.links.remove(&rel);
+                    if let Some(search) = &mut ws.search {
+                        search.remove(&rel);
+                    }
                     structural = true;
                 }
                 Outside::NotLoaded => {
                     if let Ok(text) = std::fs::read_to_string(&event.path) {
                         ws.links.update(&rel, &text);
+                        if let Some(search) = &mut ws.search { search.update(&rel, &text); }
                         outside.push(rel);
                     }
                 }
@@ -2333,14 +2495,19 @@ impl App {
     /// Used when closing: write on this thread so nothing is lost.
     fn save_blocking(&mut self) {
         let Some(ws) = &mut self.workspace else { return };
-        let Some(note) = &mut ws.note else { return };
-        if note.unsynced {
-            ws.store.set(&note.rel, note.text());
-            note.unsynced = false;
+        if let Some(note) = &mut ws.note {
+            if note.unsynced {
+                ws.store.set(&note.rel, note.text());
+                note.unsynced = false;
+            }
+            if let Some(job) = ws.store.take_save(&note.rel) {
+                let result = job.run();
+                ws.store.finish_save(&result);
+            }
         }
-        if let Some(job) = ws.store.take_save(&note.rel) {
-            let result = job.run();
-            ws.store.finish_save(&result);
+        // The index cache, if notes changed since it was written.
+        if ws.indexed && ws.links_dirty {
+            let _ = links::save_cache(&ws.vault.root, &ws.links);
         }
     }
 
@@ -2393,12 +2560,14 @@ impl App {
                 };
                 self.settings = Some(SettingsForm {
                     crew: ws.crew_folder.clone(),
+                    compact: theme::compact(),
                     error: None,
                 });
                 Task::none()
             }
             SettingsMessage::Close => {
                 self.settings = None;
+                theme::set_compact(settings::prefs().compact);
                 Task::none()
             }
             SettingsMessage::Crew(value) => {
@@ -2426,6 +2595,14 @@ impl App {
                     },
                     |picked| Message::Settings(SettingsMessage::Picked(picked)),
                 )
+            }
+            SettingsMessage::Compact(on) => {
+                // Applies at once, so you can see it; Cancel puts it back.
+                if let Some(form) = &mut self.settings {
+                    form.compact = on;
+                }
+                theme::set_compact(on);
+                Task::none()
             }
             SettingsMessage::Picked(None) => Task::none(),
             SettingsMessage::Picked(Some(path)) => {
@@ -2457,6 +2634,12 @@ impl App {
                 };
                 let folder = form.crew.replace('\\', "/").trim().trim_matches('/').to_owned();
                 let folder = if folder.is_empty() { crew::FOLDER.to_owned() } else { folder };
+                // This computer's preferences.
+                let prefs = settings::Prefs { compact: form.compact };
+                if prefs != settings::prefs() {
+                    settings::save_prefs(prefs);
+                }
+                theme::set_compact(form.compact);
                 let Some(ws) = &mut self.workspace else {
                     return Task::none();
                 };
@@ -2565,6 +2748,13 @@ impl App {
                 None => text(preview).size(theme::SMALL).color(theme::MENTION),
             },
             picks,
+            rule::horizontal(1),
+            text("This computer").size(theme::TEXT_SIZE).color(theme::HEADING),
+            iced::widget::checkbox(form.compact)
+                .label("Compact layout: tighter toolbar, file tree and panels")
+                .on_toggle(|on| Message::Settings(SettingsMessage::Compact(on)))
+                .text_size(theme::SMALL)
+                .size(16),
             row![
                 Space::new().width(Fill),
                 button(text("Cancel").size(theme::SMALL))
@@ -2947,6 +3137,9 @@ impl App {
         if let (Some(form), Some(ws)) = (&self.settings, &self.workspace) {
             return stack![main, self.view_settings(form, ws)].into();
         }
+        if let (Some(find), Some(ws)) = (&self.find, &self.workspace) {
+            return stack![main, find.view(ws.search.is_some()).map(Message::Find)].into();
+        }
         if let Some(a) = &self.assigning {
             let mut list = column![
                 text(format!("Give @{} which task in {}?", a.member, a.title)).size(theme::TEXT_SIZE).color(theme::HEADING)
@@ -2983,7 +3176,7 @@ impl App {
         let mode_button = |label: &'static str, mode: Mode| {
             button(text(label).size(theme::SMALL))
                 .on_press(Message::SetMode(mode))
-                .padding([4, 12])
+                .padding(theme::tool_pad())
                 .style(theme::tool(self.mode == mode))
         };
         let path = ws
@@ -2995,15 +3188,19 @@ impl App {
             row![
                 button(text("Open folder").size(theme::SMALL))
                     .on_press(Message::PickFolder)
-                    .padding([4, 12])
+                    .padding(theme::tool_pad())
                     .style(theme::tool(false)),
                 button(text("Settings").size(theme::SMALL))
                     .on_press(Message::Settings(SettingsMessage::Open))
-                    .padding([4, 12])
+                    .padding(theme::tool_pad())
                     .style(theme::tool(self.settings.is_some())),
+                button(text("Search").size(theme::SMALL))
+                    .on_press(Message::Shortcut(Shortcut::FindInVault))
+                    .padding(theme::tool_pad())
+                    .style(theme::tool(self.find.is_some())),
                 button(text("+ New note").size(theme::SMALL))
                     .on_press(Message::StartNewNote)
-                    .padding([4, 12])
+                    .padding(theme::tool_pad())
                     .style(theme::tool(false)),
                 text(path).size(theme::SMALL).color(theme::MUTED),
                 Space::new().width(Fill),
@@ -3011,34 +3208,34 @@ impl App {
                     .push(self.graph.is_some().then(|| {
                         button(text("Graph").size(theme::SMALL))
                             .on_press(Message::ToggleGraph)
-                            .padding([4, 12])
+                            .padding(theme::tool_pad())
                             .style(theme::tool(self.show_graph))
                     }))
                     .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("+ Node").size(theme::SMALL))
                             .on_press(Message::AddNode)
-                            .padding([4, 12])
+                            .padding(theme::tool_pad())
                             .style(theme::tool(false))
                     }))
                     .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("+ Function").size(theme::SMALL))
                             .on_press(Message::AddFunctionNode)
-                            .padding([4, 12])
+                            .padding(theme::tool_pad())
                             .style(theme::tool(false))
                     }))
                     .push((self.graph.is_some() && self.show_graph && self.editor.is_none() && !ws.crew.is_empty()).then(|| {
                         button(text("Crew").size(theme::SMALL))
                             .on_press(Message::ToggleHand)
-                            .padding([4, 12])
+                            .padding(theme::tool_pad())
                             .style(theme::tool(self.show_hand))
                     }))
                     .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
                         button(text("Link wires").size(theme::SMALL))
                             .on_press(Message::ToggleLinkWires)
-                            .padding([4, 12])
+                            .padding(theme::tool_pad())
                             .style(theme::tool(self.show_link_wires))
                     }))
-                    .spacing(10),
+                    .spacing(theme::tool_gap()),
                 row![]
                     .push({
                         let stale = ws
@@ -3049,18 +3246,18 @@ impl App {
                         (stale > 0).then(|| {
                             button(text(format!("⚠ Run {stale} out of date")).size(theme::SMALL).color(theme::WARNING))
                                 .on_press(Message::RunGraph)
-                                .padding([4, 12])
+                                .padding(theme::tool_pad())
                                 .style(theme::tool(false))
                         })
                     })
-                    .spacing(10),
+                    .spacing(theme::tool_gap()),
                 button(text(if ws.runs.running { "Runs ●" } else { "Runs" }).size(theme::SMALL))
                     .on_press(Message::ToggleRuns)
-                    .padding([4, 12])
+                    .padding(theme::tool_pad())
                     .style(theme::tool(ws.runs.show)),
                 button(text("Backlinks").size(theme::SMALL))
                     .on_press(Message::ToggleBacklinks)
-                    .padding([4, 12])
+                    .padding(theme::tool_pad())
                     .style(theme::tool(self.show_backlinks && !ws.runs.show)),
                 Space::new().width(8),
                 mode_button("Live", Mode::Live),
@@ -3068,10 +3265,10 @@ impl App {
                 mode_button("Split", Mode::Split),
                 mode_button("Reading", Mode::Reading),
             ]
-            .spacing(10)
+            .spacing(theme::tool_gap())
             .align_y(iced::Center),
         )
-        .padding([8, 12])
+        .padding(theme::bar_pad())
         .style(theme::status_bar)
         .into()
     }
@@ -3104,7 +3301,7 @@ impl App {
             stats.writes,
             stats.skipped_writes,
         );
-        let message = self.status.as_deref().unwrap_or("Ctrl+N new · Ctrl+P find · Ctrl+E view · Ctrl+O open");
+        let message = self.status.as_deref().unwrap_or("Ctrl+N new · Ctrl+P find · Ctrl+Shift+F search · Ctrl+E view · Ctrl+O open");
         // On a crew card: their open mentions across the vault.
         let person = ws.note.as_ref().filter(|n| crew::is_card(&n.rel, &ws.crew_folder)).and_then(|n| {
             let i = ws.crew.iter().position(|m| *m.rel == *n.rel)?;
@@ -3125,7 +3322,7 @@ impl App {
             ]
             .spacing(16),
         )
-        .padding([4, 12])
+        .padding(theme::tool_pad())
         .style(theme::status_bar)
         .into()
     }
@@ -3233,6 +3430,7 @@ fn shortcut_from_event(
             Key::Character("o") => Some(Shortcut::OpenFolder),
             Key::Character("n") => Some(Shortcut::NewNote),
             Key::Character("p") => Some(Shortcut::QuickSwitch),
+            Key::Character("f" | "F") if modifiers.shift() => Some(Shortcut::FindInVault),
             Key::Character("e") => Some(Shortcut::CycleMode),
             Key::Character("s") => Some(Shortcut::Save),
             Key::Character("z") if modifiers.shift() => Some(Shortcut::Redo),

@@ -592,7 +592,8 @@ At the vault root, for this machine only:
 
 - `log/` – the undo log (the last 500 runs)
 - window, graph and editor state
-- caches (link index, search index)
+- `cache/links.txt` – the link index, so opening a vault only reads notes
+  changed since last time
 
 The app puts a `.gitignore` containing `*` inside it, so it never reaches git.
 Deleting the folder is safe: you only lose undo history and window positions.

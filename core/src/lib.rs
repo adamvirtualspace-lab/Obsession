@@ -16,6 +16,7 @@
 //!   loop guard, undo.
 //! - [`log`]: the run log in `.obsessed/log/`.
 //! - [`crew`]: `@mentions`, crew cards in `_crew/`, badges.
+//! - [`search`]: vault search (built on first use).
 
 pub mod crew;
 pub mod doc;
@@ -28,6 +29,7 @@ pub mod live;
 pub mod nodes;
 pub mod preview;
 pub mod runner;
+pub mod search;
 pub mod status;
 pub mod store;
 pub mod syntax;

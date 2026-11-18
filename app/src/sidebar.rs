@@ -87,10 +87,10 @@ impl Tree {
 
     pub fn view<'a>(&'a self, vault: &'a Vault, open: Option<&str>) -> Element<'a, Message> {
         let total = self.visible.len();
-        let first = ((self.offset / theme::ROW_HEIGHT).floor() as usize).min(total);
+        let first = ((self.offset / theme::row_height()).floor() as usize).min(total);
         // One extra row above and below so scrolling never shows a gap.
         let first = first.saturating_sub(1);
-        let count = (self.height / theme::ROW_HEIGHT).ceil() as usize + 3;
+        let count = (self.height / theme::row_height()).ceil() as usize + 3;
         let last = (first + count).min(total);
 
         let rows = self.visible[first..last].iter().map(|&index| {
@@ -117,7 +117,7 @@ impl Tree {
             let row = button(label)
                 .on_press(message)
                 .padding([0, 4])
-                .height(theme::ROW_HEIGHT)
+                .height(theme::row_height())
                 .width(Fill)
                 .style(theme::row(selected));
             match entry.kind {
@@ -129,8 +129,8 @@ impl Tree {
             }
         });
 
-        let above = first as f32 * theme::ROW_HEIGHT;
-        let below = (total - last) as f32 * theme::ROW_HEIGHT;
+        let above = first as f32 * theme::row_height();
+        let below = (total - last) as f32 * theme::row_height();
         let list = column![Space::new().height(above)]
             .extend(rows)
             .push(Space::new().height(below))

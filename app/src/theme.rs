@@ -29,6 +29,38 @@ pub const TAG: Color = color!(0x7ee787);
 pub const CODE: Color = color!(0xffa657);
 
 pub const ROW_HEIGHT: f32 = 26.0;
+
+/// Compact mode: tighter toolbars, rows and panels (a preference of this
+/// computer, see `settings.rs`).
+static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compact(on: bool) {
+    COMPACT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compact() -> bool {
+    COMPACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A file tree row.
+pub fn row_height() -> f32 {
+    if compact() { 21.0 } else { ROW_HEIGHT }
+}
+
+/// Around a toolbar button's label.
+pub fn tool_pad() -> iced::Padding {
+    if compact() { [2, 8].into() } else { [4, 12].into() }
+}
+
+/// Between toolbar buttons.
+pub fn tool_gap() -> f32 {
+    if compact() { 6.0 } else { 10.0 }
+}
+
+/// Around the toolbar.
+pub fn bar_pad() -> iced::Padding {
+    if compact() { [4, 8].into() } else { [8, 12].into() }
+}
 pub const TEXT_SIZE: f32 = 14.0;
 pub const SMALL: f32 = 12.0;
 

@@ -5,6 +5,10 @@
 //! snippet of the line) and its headings and block ids, so it costs a small
 //! fraction of the vault's size. It's built once when a vault opens, on a
 //! background thread, and kept current as notes are saved.
+//!
+//! The index is cached in `.obsessed/cache/links.txt` with each note's
+//! modified time and size, so the next start only reads notes that changed
+//! ([`LinkIndex::build_cached`], [`LinkIndex::to_cache`]).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -12,6 +16,19 @@ use std::path::Path;
 
 use crate::syntax::{Kind, LineState, scan_line};
 use crate::vault::{Resolved, Vault};
+
+/// Where the index cache lives, from the vault root.
+pub const CACHE: &str = ".obsessed/cache/links.txt";
+
+/// Writes the index cache (creating `.obsessed/` with its `.gitignore`).
+pub fn save_cache(root: &Path, index: &LinkIndex) -> std::io::Result<()> {
+    crate::log::ensure(root)?;
+    let path = root.join(CACHE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::write::atomic_write(&path, index.to_cache().as_bytes())
+}
 
 /// One link in a note.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +344,164 @@ struct Indexed {
     mentions: Vec<(String, char)>,
     /// The note's own `statuses:`, if it has them.
     format: Option<crate::status::Format>,
+    /// The file's modified time (ns since 1970) and size when it was read,
+    /// for the cache. `None` when indexed from text being edited.
+    stamp: Option<(u64, u64)>,
+}
+
+/// How a cached build went.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuildStats {
+    /// Notes read and parsed.
+    pub parsed: usize,
+    /// Notes taken from the cache.
+    pub cached: usize,
+}
+
+fn stamp_of(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((modified.as_nanos() as u64, meta.len()))
+}
+
+/// Escapes a cache field (no tabs or line breaks inside).
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn unesc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Reads one note's text into what the index keeps.
+fn index_text(text: &str) -> Indexed {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut found = Vec::new();
+    for link in links(text) {
+        if link.target.is_empty() {
+            continue;
+        }
+        let line = lines.get(link.line).copied().unwrap_or("").trim();
+        let snippet = match line.char_indices().nth(SNIPPET) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => line.to_owned(),
+        };
+        found.push(IndexedLink {
+            target: link.target.into(),
+            line: link.line as u32,
+            snippet: snippet.into(),
+        });
+    }
+    Indexed {
+        links: found,
+        outline: outline(text),
+        mentions: crate::crew::task_mentions(text),
+        format: crate::status::from_frontmatter(text.lines()).and_then(|l| l.format),
+        stamp: None,
+    }
+}
+
+/// Reads cache text back into notes.
+fn parse_cache(text: &str) -> HashMap<String, Indexed> {
+    let mut out: HashMap<String, Indexed> = HashMap::new();
+    let mut lines = text.lines();
+    if lines.next() != Some("obsession-links 1") {
+        return out;
+    }
+    let mut current: Option<(String, Indexed)> = None;
+    let mut statuses: Vec<crate::status::Status> = Vec::new();
+    fn finish(
+        current: &mut Option<(String, Indexed)>,
+        statuses: &mut Vec<crate::status::Status>,
+        out: &mut HashMap<String, Indexed>,
+    ) {
+        if let Some((rel, mut note)) = current.take() {
+            if !statuses.is_empty() {
+                note.format = crate::status::Format::from_statuses(std::mem::take(statuses));
+            }
+            out.insert(rel, note);
+        }
+    }
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if let ["N", rel, modified, len] = fields.as_slice() {
+            finish(&mut current, &mut statuses, &mut out);
+            if let (Ok(m), Ok(l)) = (modified.parse(), len.parse()) {
+                current = Some((
+                    unesc(rel),
+                    Indexed {
+                        stamp: Some((m, l)),
+                        ..Indexed::default()
+                    },
+                ));
+            }
+            continue;
+        }
+        let Some((_, note)) = &mut current else { continue };
+        match fields.as_slice() {
+            ["L", line, target, snippet] => {
+                if let Ok(line) = line.parse() {
+                    note.links.push(IndexedLink {
+                        target: unesc(target).into(),
+                        line,
+                        snippet: unesc(snippet).into(),
+                    });
+                }
+            }
+            ["H", line, h] => {
+                if let Ok(line) = line.parse() {
+                    note.outline.headings.push((unesc(h), line));
+                }
+            }
+            ["B", line, b] => {
+                if let Ok(line) = line.parse() {
+                    note.outline.blocks.push((unesc(b), line));
+                }
+            }
+            ["M", ch, name] => {
+                if let Some(c) = unesc(ch).chars().next() {
+                    note.mentions.push((unesc(name), c));
+                }
+            }
+            ["F", ch, symbol, label] => {
+                if let Some(c) = unesc(ch).chars().next() {
+                    statuses.push(crate::status::Status {
+                        ch: c,
+                        symbol: unesc(symbol).into(),
+                        label: unesc(label).into(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    finish(&mut current, &mut statuses, &mut out);
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -361,13 +536,89 @@ fn name_key(target: &str) -> String {
 impl LinkIndex {
     /// Reads every note once and indexes it. Unreadable notes are skipped.
     pub fn build<'a>(root: &Path, notes: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::build_cached(root, notes, None).0
+    }
+
+    /// Like [`LinkIndex::build`], but a note whose modified time and size
+    /// match `cache` (from [`LinkIndex::to_cache`]) is taken from it, not
+    /// read. Only changed and new notes are read from disk.
+    pub fn build_cached<'a>(
+        root: &Path,
+        notes: impl IntoIterator<Item = &'a str>,
+        cache: Option<&str>,
+    ) -> (Self, BuildStats) {
+        let mut cached = cache.map(parse_cache).unwrap_or_default();
         let mut index = Self::default();
+        let mut stats = BuildStats::default();
         for rel in notes {
-            if let Ok(text) = std::fs::read_to_string(root.join(rel)) {
-                index.update(rel, &text);
+            let path = root.join(rel);
+            let stamp = stamp_of(&path);
+            if let Some(old) = cached.remove(rel)
+                && old.stamp.is_some()
+                && old.stamp == stamp
+            {
+                index.insert(rel, old);
+                stats.cached += 1;
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let mut indexed = index_text(&text);
+                indexed.stamp = stamp;
+                index.insert(rel, indexed);
+                stats.parsed += 1;
             }
         }
-        index
+        (index, stats)
+    }
+
+    /// Records that `rel` was just written to disk with what the index
+    /// holds, so the cache can trust it next time.
+    pub fn stamp(&mut self, root: &Path, rel: &str) {
+        if let Some(note) = self.notes.get_mut(rel) {
+            note.stamp = stamp_of(&root.join(rel));
+        }
+    }
+
+    /// The index as cache text. Notes indexed from unsaved text (no stamp)
+    /// are left out, so they're read again next time.
+    pub fn to_cache(&self) -> String {
+        let mut out = String::from("obsession-links 1\n");
+        let mut rels: Vec<&Box<str>> = self.notes.keys().collect();
+        rels.sort();
+        for rel in rels {
+            let note = &self.notes[rel];
+            let Some((modified, len)) = note.stamp else { continue };
+            out.push_str(&format!("N\t{}\t{modified}\t{len}\n", esc(rel)));
+            for l in &note.links {
+                out.push_str(&format!("L\t{}\t{}\t{}\n", l.line, esc(&l.target), esc(&l.snippet)));
+            }
+            for (h, line) in &note.outline.headings {
+                out.push_str(&format!("H\t{line}\t{}\n", esc(h)));
+            }
+            for (b, line) in &note.outline.blocks {
+                out.push_str(&format!("B\t{line}\t{}\n", esc(b)));
+            }
+            for (name, ch) in &note.mentions {
+                out.push_str(&format!("M\t{}\t{}\n", esc(&ch.to_string()), esc(name)));
+            }
+            if let Some(format) = &note.format {
+                for s in format.statuses() {
+                    out.push_str(&format!("F\t{}\t{}\t{}\n", esc(&s.ch.to_string()), esc(&s.symbol), esc(&s.label)));
+                }
+            }
+        }
+        out
+    }
+
+    fn insert(&mut self, rel: &str, indexed: Indexed) {
+        self.remove(rel);
+        for link in &indexed.links {
+            let sources = self.by_name.entry(name_key(&link.target)).or_default();
+            if sources.last().is_none_or(|last| **last != *rel) {
+                sources.push(rel.into());
+            }
+        }
+        self.notes.insert(rel.into(), indexed);
     }
 
     pub fn len(&self) -> usize {
@@ -380,38 +631,7 @@ impl LinkIndex {
 
     /// Re-indexes one note from its text.
     pub fn update(&mut self, rel: &str, text: &str) {
-        self.remove(rel);
-        let lines: Vec<&str> = text.split('\n').collect();
-        let mut found = Vec::new();
-        for link in links(text) {
-            if link.target.is_empty() {
-                continue;
-            }
-            let line = lines.get(link.line).copied().unwrap_or("").trim();
-            let snippet = match line.char_indices().nth(SNIPPET) {
-                Some((cut, _)) => format!("{}…", &line[..cut]),
-                None => line.to_owned(),
-            };
-            let key = name_key(&link.target);
-            let sources = self.by_name.entry(key).or_default();
-            if sources.last().is_none_or(|last| **last != *rel) {
-                sources.push(rel.into());
-            }
-            found.push(IndexedLink {
-                target: link.target.into(),
-                line: link.line as u32,
-                snippet: snippet.into(),
-            });
-        }
-        self.notes.insert(
-            rel.into(),
-            Indexed {
-                links: found,
-                outline: outline(text),
-                mentions: crate::crew::task_mentions(text),
-                format: crate::status::from_frontmatter(text.lines()).and_then(|l| l.format),
-            },
-        );
+        self.insert(rel, index_text(text));
     }
 
     pub fn remove(&mut self, rel: &str) {
@@ -568,6 +788,44 @@ pub fn rewrite_links(
         }
     }
     Some((lines.join("\n"), count))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_round_trip_reads_only_changed_notes() {
+        let root = std::env::temp_dir().join(format!("obsession-links-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let a = "---\nstatuses:\n  - \"[ ] 🔳 to do\"\n  - \"[x] ✅ done\"\n---\n# Head\\Tab\nSee [[b]] and [[c|C]].\n- [ ] Task @ika ^t1\n";
+        std::fs::write(root.join("a.md"), a).unwrap();
+        std::fs::write(root.join("b.md"), "[[a#Head]]\n").unwrap();
+        let (index, stats) = LinkIndex::build_cached(&root, ["a.md", "b.md"], None);
+        assert_eq!(stats, BuildStats { parsed: 2, cached: 0 });
+        let cache = index.to_cache();
+
+        // Nothing changed: everything comes from the cache, and it's the same.
+        let (again, stats) = LinkIndex::build_cached(&root, ["a.md", "b.md"], Some(&cache));
+        assert_eq!(stats, BuildStats { parsed: 0, cached: 2 });
+        assert_eq!(again.to_cache(), cache);
+        assert_eq!(again.targets("a.md").collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!(again.outline("a.md"), index.outline("a.md"));
+        assert_eq!(again.mention_counts(None, None).get("ika"), Some(&1));
+        assert_eq!(again.notes["a.md"].format, index.notes["a.md"].format);
+        assert!(again.notes["a.md"].format.is_some());
+
+        // One note changed (a different size): only it is read.
+        std::fs::write(root.join("b.md"), "[[a]] and more\n").unwrap();
+        let (_, stats) = LinkIndex::build_cached(&root, ["a.md", "b.md"], Some(&cache));
+        assert_eq!(stats, BuildStats { parsed: 1, cached: 1 });
+        // A garbled cache is ignored.
+        let (_, stats) = LinkIndex::build_cached(&root, ["a.md", "b.md"], Some("junk"));
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(unesc(&esc("a\tb\\c\nd")), "a\tb\\c\nd");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -485,6 +485,52 @@ Known limits, for later:
 - The Settings page has one setting so far (the crew folder). Status formats
   are still edited in `_settings.md` itself.
 
+### Polish (milestone 8)
+
+10,000-note vault (3.5 MB of notes), `--profile measure`:
+
+| What | Before | After |
+|---|---|---|
+| Startup indexing, files already in Windows' file cache | 1.9 s, every note read | **0.6 s**, no note read (cache) |
+| Startup indexing right after a reboot | 50 s (cold reads) | file times only, no note read |
+| Startup CPU | 3.0 s | **1.6 s** |
+| Vault search: first use (reads every note) | – | **1.0 s**, 7 MB |
+| Vault search: a query | – | instant (well under a frame) |
+| Memory: a note open / search built | 110 MB | 115 MB / 138 MB |
+| Idle CPU: note, graph, search open | 0 ms | **0 ms** |
+| Core tests | 83 | 86 |
+
+What changed:
+
+- **Link index cache** (`core/src/links.rs`): each note's links, headings,
+  block ids, task `@mentions` and own `statuses:` are saved in
+  `.obsessed/cache/links.txt` with its modified time and size. At startup a
+  note whose time and size match is taken from the cache without reading it.
+  The cache is written after a build that read anything, and on close if notes
+  were saved meanwhile. A saved note is re-stamped after its write; a note
+  changed by another app is read again next time.
+- **Vault search** (`core/src/search.rs`, `app/src/find.rs`): built on first
+  use on a background thread. Each note keeps its text and an ASCII-lowercased
+  copy (same byte offsets), so a query is a plain `contains` per line, and the
+  match positions point straight into the real line. Up to 300 hits are shown,
+  all are counted. It's kept current wherever the link index is.
+- **Compact layout:** a preference of this computer (`%APPDATA%\Obsession\
+  prefs.txt`), toggled in Settings. Toolbar padding and gaps, the file tree's
+  row height and the toolbar's margins shrink; the editor and the graph don't
+  change.
+- **Animation pass:** wires and function nodes whose function just ran glow
+  green and fade over 1.2 s (only runs that changed something). A crew card
+  eases up when hovered (140 ms). Both are time-based and draw frames only
+  while they move.
+
+Known limits, for later:
+
+- Search ignores case for ASCII letters only (`É` doesn't match `é`).
+- Memory with search built grows by more than the 7 MB of text (138 MB vs
+  115 MB with the results list open); not looked into yet.
+- Compact layout doesn't change the editor's line spacing or the graph cards.
+- Crew portraits are still initials.
+
 ### Drawing: only when something changes
 
 - **Reactive rendering.** iced redraws only after an event. When nothing moves,
@@ -692,7 +738,7 @@ performance budgets checked.
 | 5 | **Function editor** ✅ | Hover a wire, "ƒ" button, inner canvas, the full node library, type checking, dashed-to-solid animation, live values on hover, `_funct.md` saved functions |
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
-| 8 | **Polish** | Animation pass, compact mode, vault search, performance on large vaults |
+| 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
 
 ## Risks
 
