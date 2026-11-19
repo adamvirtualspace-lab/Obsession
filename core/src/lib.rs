@@ -17,6 +17,8 @@
 //! - [`log`]: the run log in `.obsessed/log/`.
 //! - [`crew`]: `@mentions`, crew cards in `_crew/`, badges.
 //! - [`search`]: vault search (built on first use).
+//! - [`views`]: where you last looked in each graph and function
+//!   (`.obsessed/views.txt`).
 
 pub mod crew;
 pub mod doc;
@@ -33,6 +35,7 @@ pub mod search;
 pub mod status;
 pub mod store;
 pub mod syntax;
+pub mod views;
 pub mod vault;
 pub mod write;
 

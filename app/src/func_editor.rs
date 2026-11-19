@@ -22,6 +22,7 @@ use obsession_core::func::eval::{self, Bind, Run};
 use obsession_core::func::library::{self, Category, Default as Def, Spec};
 use obsession_core::func::types::{Type, Want};
 use obsession_core::func::{Arg, Block, Literal, Origin, PortKind, Value};
+use obsession_core::views::View as SavedView;
 
 use crate::graph::{View, curve, draw_grid, fit, pin_color};
 use crate::theme;
@@ -65,6 +66,9 @@ pub enum Message {
     Select(Option<Sel>),
     Delete(usize),
     OpenPalette(Option<Point>),
+    /// The view was panned or zoomed: where it is now, to remember (the app
+    /// keeps it; the editor ignores it).
+    Viewed(SavedView),
     // From the panel.
     Back,
     Draft(usize, String),
@@ -118,6 +122,8 @@ pub struct Editor {
     palette: Option<Palette>,
     /// Bumped when a different function opens, so the view fits it.
     pub fit: u64,
+    /// Where this function was last looked at: used instead of fitting it.
+    pub saved_view: Option<SavedView>,
     cache: Cache,
     drawn: Cell<Option<DrawKey>>,
     version: u64,
@@ -158,6 +164,7 @@ impl Editor {
             header_draft: String::new(),
             palette: None,
             fit: 0,
+            saved_view: None,
             cache: Cache::new(),
             drawn: Cell::new(None),
             version: 0,
@@ -519,6 +526,7 @@ impl Editor {
                 Outcome::None
             }
             Message::Back => Outcome::Back,
+            Message::Viewed(_) => Outcome::None,
             Message::Draft(k, value) => {
                 if let Some(d) = self.drafts.get_mut(k) {
                     *d = value;
@@ -872,6 +880,8 @@ pub struct State {
     cursor: Point,
     fitted: Option<u64>,
     last_click: Option<Instant>,
+    /// The canvas size, for remembering the view's middle.
+    size: Size,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -902,7 +912,14 @@ impl canvas::Program<Message> for Editor {
 
     fn update(&self, state: &mut State, event: &Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<canvas::Action<Message>> {
         if state.fitted != Some(self.fit) {
-            self.fit_view(state, bounds.size());
+            match self.saved_view {
+                Some(v) => {
+                    let zoom = v.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                    state.zoom = zoom;
+                    state.pan = Vector::new(bounds.width / 2.0 - v.x * zoom, bounds.height / 2.0 - v.y * zoom);
+                }
+                None => self.fit_view(state, bounds.size()),
+            }
             state.fitted = Some(self.fit);
             state.interaction = Interaction::Idle;
             state.hover = None;
@@ -912,6 +929,7 @@ impl canvas::Program<Message> for Editor {
             pan: state.pan,
             zoom: state.zoom,
         };
+        state.size = bounds.size();
         let point = cursor.position_in(bounds);
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
@@ -1032,6 +1050,9 @@ impl canvas::Program<Message> for Editor {
                         })
                     }
                     Interaction::Idle => None,
+                    Interaction::Panning { pan, .. } if pan != state.pan => {
+                        Some(canvas::Action::publish(Message::Viewed(saved_view(state))))
+                    }
                     _ => Some(canvas::Action::request_redraw()),
                 }
             }
@@ -1045,7 +1066,7 @@ impl canvas::Program<Message> for Editor {
                 let g = view.graph(p);
                 state.zoom = zoom;
                 state.pan = Vector::new(p.x - g.x * zoom, p.y - g.y * zoom);
-                Some(canvas::Action::request_redraw().and_capture())
+                Some(canvas::Action::publish(Message::Viewed(saved_view(state))).and_capture())
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
                 use keyboard::key::Named;
@@ -1209,6 +1230,13 @@ impl canvas::Program<Message> for Editor {
 }
 
 /// A wire's colour by the type it carries.
+/// The view as it's remembered: the point in the middle of the canvas, and
+/// the zoom.
+fn saved_view(state: &State) -> SavedView {
+    let middle = View { pan: state.pan, zoom: state.zoom }.graph(Point::new(state.size.width / 2.0, state.size.height / 2.0));
+    SavedView { x: middle.x, y: middle.y, zoom: state.zoom }
+}
+
 pub fn type_color(t: Type) -> Color {
     match t {
         Type::File => pin_color(PortKind::File),

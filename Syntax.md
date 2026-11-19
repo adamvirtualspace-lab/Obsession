@@ -591,7 +591,8 @@ Set Status(dst, s, find: target)
 At the vault root, for this machine only:
 
 - `log/` – the undo log (the last 500 runs)
-- window, graph and editor state
+- `views.txt` – where you last looked in each graph and each function (the
+  point in the middle and the zoom), so they open where you left them
 - `cache/links.txt` – the link index, so opening a vault only reads notes
   changed since last time
 

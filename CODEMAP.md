@@ -51,6 +51,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `runner.rs` | 560 | `Index::build(vault, graphs, saved)` → `jobs: Vec<Job>` (`Job { graph, line, function, checked, params, ports }`), `affected(changed)`, `files()`, `reads(rel)`, `find(graph, line)`. `run(index, files, start, team)` → `Outcome { texts, changes, ran, blocked, warnings }` (chains, loop guard), `pending` (out of date), `apply` / `revert` (`Change { rel, line, old, new, by }`), `params_from`, `end_kind`. |
 | `crew.rs` | 510 | `Member { key, rel, name, role, portrait, color, skills, bot, exists }`, `card(rel, text)`, `is_card(rel, folder)`, `seats(folder, entries)` (notes and people's folders), `new_card_rel`, `key_of`, `folder_setting` / `frontmatter_value` / `set_frontmatter` (`crew:` in `_settings.md`), `template`, `mentions(line)`, `task_mentions(text)`, `add_mention(line, name)`, `badges(counts)` → `Badge::{Overloaded, Powerhouse}`, `initials`. |
 | `log.rs` | 250 | `.obsessed/log/`: `Record { id, time, kind: Kind::{Run, Outside}, summary, changes, undone }`, `append` (keeps 500), `load`, `mark_undone`, `ensure` (folder + `.gitignore`). |
+| `views.rs` | 250 | `.obsessed/views.txt`: `Views` (`parse`, `to_text`, `get`, `set` (marks dirty only on a real change), `prune`, `rename`, `load`, `save` (only if dirty)), `View { x, y, zoom }` (the graph point in the middle of the canvas), `graph_key(rel)`, `function_key(file, name)`. |
 | `func/edit.rs` | 330 | Editor changes as one-line edits: `set_pos`, `set_arg`, `args_for`, `add_step`, `remove_step`, `add_header`, `remove_line`, `fresh_id`, `wire_call`. |
 
 ## app/src
@@ -152,6 +153,14 @@ builds `SearchIndex` off-thread the first time → `Message::SearchBuilt`) →
 `find::Find`. Typing → `find_message` → `SearchIndex::query`. Enter or a click
 → `open_at(rel, Jump::Line)`. Every `ws.links.update` is followed by
 `ws.search.update`, so search stays current.
+
+**Views.** Panning or zooming a graph or the function editor publishes
+`graph::Message::Viewed` / `func_editor::Message::Viewed` → `ws.views.set`
+(in memory) and the canvas's `saved_view`. A canvas starting fresh (a graph
+opened, coming back from the editor, a function opened) uses `saved_view`
+instead of fitting. `save_views` writes `.obsessed/views.txt` on leaving a
+graph (`open`, `ToggleGraph`, `SetMode`), switching vaults and closing
+(`save_blocking`); never while idle. Renames move the keys.
 
 **Startup cache.** `Message::Scanned` → background `LinkIndex::build_cached`
 with `.obsessed/cache/links.txt` → `save_cache` if anything was read.

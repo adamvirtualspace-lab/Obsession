@@ -356,7 +356,8 @@ Known limits, for later:
 
 - A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the row.
   → Milestone 9.
-- The view isn't saved: a graph opens fitted to the window. → Milestone 9.
+- ~~The view isn't saved: a graph opens fitted to the window.~~ Done in
+  milestone 9, item 2.
 - Link wires can't be removed from the graph yet (Syntax.md wants it to ask
   whether to remove the link from the note); Delete says where the link is.
   → Milestone 9.
@@ -400,8 +401,8 @@ Known limits, for later:
   in Ctrl+Z (only the open note has undo history). → Milestone 9.
 - Renaming a function (its `fn` line) doesn't update the wires that use it.
   → Milestone 9.
-- The editor's view and the inputs node's place aren't saved. → Milestone 9
-  (the view; the inputs node's place stays for later).
+- The editor's view and the inputs node's place aren't saved. The view is
+  done in milestone 9, item 2; the inputs node's place stays for later.
 - An `id` can't be renamed from the editor (edit the text).
 - `Find Task` and `Set Status`'s `find` ignore case (Syntax.md says so now).
 
@@ -783,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (1 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (2 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -823,6 +824,22 @@ In this order:
    app, never while idle. A graph seen for the first time still opens fitted.
    (`settings.rs` or a small `views` module in core with a parse/write test,
    `graph.rs`, `func_editor.rs`)
+
+   ✅ **Done (November 2026).** `core/src/views.rs` keeps each view as the
+   graph point in the middle of the canvas plus the zoom, so it comes back
+   centred whatever the window's size; functions are keyed by the file that
+   holds them (`_funct.md#Wait For Done`, `shots/_nodes.md#Check Lighting`).
+   The canvases publish `Viewed` after a pan or a zoom; the app keeps it in
+   memory and writes the file only on leaving a graph, switching vaults and
+   closing, dropping views of files that are gone. Renaming a graph carries
+   its views. Coming back from the function editor no longer re-fits the
+   graph either (the editor replaces the graph's canvas, which lost its
+   view). Checked by hand: a zoomed and panned graph comes back the same
+   after the editor, after opening another note and after a restart; a
+   function opens at its own view after a restart; a graph never seen opens
+   fitted; nothing is written while panning or zooming, only on leaving or
+   closing. Idle: 0 ms CPU, 0 bytes written over 10 s with the graph and with
+   the editor. Core tests: 92 (5 new).
 3. **Wires reach their rows.** A wire to a task or a heading
    (`[[a#^t2]]`, `[[a#Notes]]`) ends at that row of the card, or at the card's
    edge when the row isn't shown. (`graph.rs`; the row lookup in core with a

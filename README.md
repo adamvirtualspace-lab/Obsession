@@ -53,7 +53,8 @@ several per folder are fine) opens as a graph (the **Graph** button
 switches between the graph and its text). Each node is a card with the note's
 name, folder, tasks and progress; amber when several notes share the name,
 dashed when the note doesn't exist yet. Drag the background (or hold the middle
-button) to pan, scroll to zoom, drag a card to move it, double-click a card to
+button) to pan, scroll to zoom (each graph, and each function in the editor,
+opens where you left it), drag a card to move it, double-click a card to
 open its note. Drag from the dot on a card's right edge to another card to add
 a wire; select a card or wire and press Delete to remove it from the graph
 (the note itself stays). The graph's own buttons sit in a small bar in its

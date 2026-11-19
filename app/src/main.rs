@@ -40,6 +40,7 @@ use obsession_core::func::{self, Library, Origin};
 use obsession_core::func::eval::Bind;
 use obsession_core::nodes::{self, End, Section};
 use obsession_core::runner::{self, Change, Index, Outcome};
+use obsession_core::views::{self, Views};
 use obsession_core::store::Outside;
 
 use crate::highlight::LinkStates;
@@ -168,6 +169,9 @@ struct Workspace {
     search_building: bool,
     /// The crew folder (`crew:` in `_settings.md`, else `_crew`).
     crew_folder: String,
+    /// Where each graph and function was last looked at
+    /// (`.obsessed/views.txt`), written on leaving a graph and on close.
+    views: Views,
     /// The crew, by name: cards in the crew folder, and people's folders.
     crew: Vec<Member>,
     /// Open `@mentions` per person across the vault.
@@ -480,10 +484,13 @@ impl App {
             Message::FolderPicked(None) => Task::none(),
             Message::Scanned(Ok(vault)) => {
                 self.scanning = false;
+                // Leaving the old vault, if any.
+                self.save_views();
                 settings::remember_vault(&vault.root);
                 let store = Store::new(&vault.root);
                 let tree = Tree::new(&vault);
                 let runs = runs::Runs::new(&vault.root);
+                let root_for_views = vault.root.clone();
                 self.status = Some(format!("{} notes", vault.notes().count()));
                 // Read every note's links on a background thread.
                 let root = vault.root.clone();
@@ -524,6 +531,7 @@ impl App {
                     search: None,
                     search_building: false,
                     crew_folder: crew::FOLDER.to_owned(),
+                    views: Views::load(&root_for_views),
                     crew: Vec::new(),
                     mentions: HashMap::new(),
                 };
@@ -566,6 +574,9 @@ impl App {
             Message::Graph(message) => self.graph_message(message),
             Message::ToggleGraph => {
                 self.show_graph = !self.show_graph;
+                if !self.show_graph {
+                    self.save_views();
+                }
                 if self.show_graph {
                     self.rebuild_graph();
                 }
@@ -877,6 +888,9 @@ impl App {
                 Task::none()
             }
             Message::SetMode(mode) => {
+                if self.show_graph {
+                    self.save_views();
+                }
                 self.show_graph = false;
                 self.set_mode(mode)
             }
@@ -1289,6 +1303,7 @@ impl App {
             self.show_link_wires,
         );
         graph.fit = self.graph_fit;
+        graph.saved_view = ws.views.get(&views::graph_key(&rel));
         for w in &mut graph.wires {
             w.stale = w.line.and_then(|l| ws.runs.out_of_date.get(&(rel.to_string(), l)).cloned());
         }
@@ -1318,6 +1333,7 @@ impl App {
         let mut editor = Editor::new(block.function.name.clone(), origin, context);
         self.editor_fit += 1;
         editor.fit = self.editor_fit;
+        editor.saved_view = self.function_view_key(&editor).and_then(|key| self.workspace.as_ref()?.views.get(&key));
         if shadowed {
             self.status = Some(format!("⚠ {name} in this graph hides the saved one in _funct.md"));
         }
@@ -1440,8 +1456,27 @@ impl App {
         }
     }
 
+    /// Where a function's view is remembered: by the file that holds it.
+    fn function_view_key(&self, editor: &Editor) -> Option<String> {
+        let file = match editor.origin {
+            Origin::Saved => func::SAVED.to_owned(),
+            Origin::Local => self.workspace.as_ref()?.note.as_ref()?.rel.to_string(),
+        };
+        Some(views::function_key(&file, &editor.name))
+    }
+
     fn editor_message(&mut self, message: func_editor::Message) -> Task<Message> {
         use func_editor::Outcome;
+        if let func_editor::Message::Viewed(view) = message {
+            let key = self.editor.as_ref().and_then(|e| self.function_view_key(e));
+            if let (Some(key), Some(ws)) = (key, &mut self.workspace) {
+                ws.views.set(&key, view);
+            }
+            if let Some(editor) = &mut self.editor {
+                editor.saved_view = Some(view);
+            }
+            return Task::none();
+        }
         let Some(editor) = &mut self.editor else {
             return Task::none();
         };
@@ -1736,6 +1771,18 @@ impl App {
             return Task::none();
         };
         match message {
+            graph::Message::Viewed(view) => {
+                // Kept for coming back from the function editor, and written
+                // to `.obsessed/views.txt` when you leave the graph.
+                graph.saved_view = Some(view);
+                if let Some(ws) = &mut self.workspace
+                    && let Some(note) = &ws.note
+                {
+                    let key = views::graph_key(&note.rel);
+                    ws.views.set(&key, view);
+                }
+                Task::none()
+            }
             graph::Message::Moved(card, at) => {
                 if let Some(c) = graph.cards.get_mut(card) {
                     c.pos = at;
@@ -1948,6 +1995,8 @@ impl App {
             return Task::none();
         }
         let save = self.save_now();
+        // Leaving a graph: remember where it was looked at.
+        self.save_views();
         let mode = self.mode;
         self.next_note_id += 1;
         self.editor = None;
@@ -2070,6 +2119,7 @@ impl App {
             let _ = ws.store.pin(&new_rel);
         }
         ws.links.remove(old);
+        ws.views.rename(old, &new_rel);
 
         let mut notes = 0;
         let mut count = 0;
@@ -2533,6 +2583,19 @@ impl App {
         if ws.indexed && ws.links_dirty {
             let _ = links::save_cache(&ws.vault.root, &ws.links);
         }
+        self.save_views();
+    }
+
+    /// Writes `.obsessed/views.txt` if a view changed (forgetting graphs and
+    /// function files that are gone). Never runs while idle: only on leaving
+    /// a graph, switching vaults and closing.
+    fn save_views(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        if !ws.views.is_dirty() {
+            return;
+        }
+        ws.views.prune(|file| ws.vault.note(file).is_some());
+        let _ = ws.views.save(&ws.vault.root);
     }
 
     /// A message from Live Preview.

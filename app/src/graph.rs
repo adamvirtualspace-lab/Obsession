@@ -20,6 +20,7 @@ use obsession_core::crew::{self, Badge, Member};
 use obsession_core::func::{self, Library, PortKind};
 use obsession_core::links::LinkIndex;
 use obsession_core::nodes::{self, End, NodeKind};
+use obsession_core::views::View as SavedView;
 use obsession_core::status::{self, Format};
 use obsession_core::store::Store;
 use obsession_core::vault::{Resolved, Vault};
@@ -81,6 +82,8 @@ pub enum Message {
     },
     /// Double-click on a crew card: open it.
     OpenCrew(usize),
+    /// The view was panned or zoomed: where it is now, to remember.
+    Viewed(SavedView),
 }
 
 /// One crew card in the hand.
@@ -225,6 +228,8 @@ pub struct Graph {
     pub pulses: Vec<(usize, Instant)>,
     /// Changed when a different graph is opened, so the view fits it.
     pub fit: u64,
+    /// Where this graph was last looked at: used instead of fitting it.
+    pub saved_view: Option<SavedView>,
     cache: Cache,
     /// What the cache was drawn for.
     drawn: Cell<Option<DrawKey>>,
@@ -481,6 +486,7 @@ impl Graph {
             hand: Vec::new(),
             show_hand: true,
             pulses: Vec::new(),
+            saved_view: None,
             fit: 0,
             cache: Cache::new(),
             drawn: Cell::new(None),
@@ -752,7 +758,10 @@ impl canvas::Program<Message> for Graph {
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
         if state.fitted != Some(self.fit) {
-            self.fit(state, bounds.size());
+            match self.saved_view {
+                Some(v) => restore(state, v, bounds.size()),
+                None => self.fit(state, bounds.size()),
+            }
             state.fitted = Some(self.fit);
             state.started.get_or_insert_with(Instant::now);
             state.selected = None;
@@ -919,6 +928,9 @@ impl canvas::Program<Message> for Graph {
                         })
                     }
                     Interaction::Idle => None,
+                    Interaction::Panning { pan, .. } if pan != state.pan => {
+                        Some(canvas::Action::publish(Message::Viewed(saved_view(state))))
+                    }
                     _ => Some(canvas::Action::request_redraw()),
                 }
             }
@@ -933,7 +945,7 @@ impl canvas::Program<Message> for Graph {
                 let g = view.graph(p);
                 state.zoom = zoom;
                 state.pan = Vector::new(p.x - g.x * zoom, p.y - g.y * zoom);
-                Some(canvas::Action::request_redraw().and_capture())
+                Some(canvas::Action::publish(Message::Viewed(saved_view(state))).and_capture())
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
                 use keyboard::key::Named;
@@ -1297,6 +1309,20 @@ impl Graph {
         text(frame, format!("{} open task{} here", c.open, if c.open == 1 { "" } else { "s" }), 12.0, 96.0, 11.5, theme::MUTED, theme::UI_FONT);
         text(frame, "Drag onto a task".to_owned(), 12.0, 112.0, 10.5, theme::FAINT, theme::UI_FONT);
     }
+}
+
+/// The view as it's remembered: the graph point in the middle of the
+/// canvas, and the zoom.
+fn saved_view(state: &State) -> SavedView {
+    let middle = View { pan: state.pan, zoom: state.zoom }.graph(Point::new(state.size.width / 2.0, state.size.height / 2.0));
+    SavedView { x: middle.x, y: middle.y, zoom: state.zoom }
+}
+
+/// Puts a remembered view back, centred in a canvas of this size.
+fn restore(state: &mut State, v: SavedView, size: Size) {
+    let zoom = v.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+    state.zoom = zoom;
+    state.pan = Vector::new(size.width / 2.0 - v.x * zoom, size.height / 2.0 - v.y * zoom);
 }
 
 /// Out of the right side of a card (mid-header), where its handle is.
