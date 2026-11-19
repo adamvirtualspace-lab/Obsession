@@ -275,7 +275,8 @@ Known limits, for later:
 - Up/Down through a blank line forgets the column.
 - The scrollbar can shift slightly while scrolling a long note for the first
   time, as estimated heights are replaced by measured ones.
-- Images and embeds show as a placeholder (📎, 🖼), not the picture.
+- Images and embeds show as a placeholder (📎, 🖼), not the picture. →
+  Milestone 10 (images; note embeds stay out of version 1).
 
 How to measure: `cargo build -p obsession --profile measure` builds a release
 binary that keeps the debug-only hooks in `app/src/dev.rs`, then read the
@@ -314,10 +315,11 @@ Known limits, for later:
 - Folders can't be renamed yet, only notes (moving a note into another folder
   works).
 - Relative markdown links *inside* a moved note aren't adjusted.
-- Attachments open from the vault root only (they aren't scanned yet).
+- Attachments open from the vault root only (they aren't scanned yet). →
+  Milestone 10.
 - Backlink snippets show the raw line, and unlinked mentions aren't listed.
-- Edits made by other apps reach the index when the file watcher arrives
-  (milestone 6).
+- ~~Edits made by other apps reach the index when the file watcher arrives
+  (milestone 6).~~ Done in milestone 6.
 
 ### Graph (milestone 4)
 
@@ -353,9 +355,11 @@ How it works:
 Known limits, for later:
 
 - A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the row.
-- The view isn't saved: a graph opens fitted to the window.
+  → Milestone 9.
+- The view isn't saved: a graph opens fitted to the window. → Milestone 9.
 - Link wires can't be removed from the graph yet (Syntax.md wants it to ask
   whether to remove the link from the note); Delete says where the link is.
+  → Milestone 9.
 - The card look is a first pass, to be matched to the Possess mockup.
 
 ### Function editor (milestone 5)
@@ -393,9 +397,11 @@ How it works:
 Known limits, for later:
 
 - Edits to a saved function in `_funct.md` are saved straight away but aren't
-  in Ctrl+Z (only the open note has undo history).
+  in Ctrl+Z (only the open note has undo history). → Milestone 9.
 - Renaming a function (its `fn` line) doesn't update the wires that use it.
-- The editor's view and the inputs node's place aren't saved.
+  → Milestone 9.
+- The editor's view and the inputs node's place aren't saved. → Milestone 9
+  (the view; the inputs node's place stays for later).
 - An `id` can't be renamed from the editor (edit the text).
 - `Find Task` and `Set Status`'s `find` ignore case (Syntax.md says so now).
 
@@ -442,8 +448,8 @@ Known limits, for later:
 - Only the newest run can be undone, from the Runs panel (not Ctrl+Z).
 - A note changed in another app while it has unsaved edits here keeps the
   edits here (with a warning), and they are saved over the other change.
-- The link index is still built in full at startup (no cache in
-  `.obsessed/cache/` yet).
+- ~~The link index is still built in full at startup (no cache in
+  `.obsessed/cache/` yet).~~ Done in milestone 8.
 
 ### Crew (milestone 7)
 
@@ -477,10 +483,12 @@ How it works:
 Known limits, for later:
 
 - Portraits aren't drawn yet: every card shows initials in its colour (bots a
-  square face). `portrait:` is read and kept for when images arrive.
+  square face). `portrait:` is read and kept for when images arrive. →
+  Milestone 10.
 - Highlighting and drop targets cover the first 8 task rows a card shows.
-- Hover highlighting was checked by reading the code, not by an automated
-  screenshot (the dev hooks can't hover the canvas).
+- ~~Hover highlighting was checked by reading the code, not by an automated
+  screenshot (the dev hooks can't hover the canvas).~~ Checked by hand in
+  November 2026 (see "Checked by hand").
 - `@` suggestions only list people in the crew folder.
 - The Settings page has one setting so far (the crew folder). Status formats
   are still edited in `_settings.md` itself.
@@ -529,7 +537,7 @@ Known limits, for later:
 - Memory with search built grows by more than the 7 MB of text (138 MB vs
   115 MB with the results list open); not looked into yet.
 - Compact layout doesn't change the editor's line spacing or the graph cards.
-- Crew portraits are still initials.
+- Crew portraits are still initials. → Milestone 10.
 
 ### Checked by hand (November 2026)
 
@@ -558,9 +566,9 @@ when the mouse leaves. Core tests: 87.
 Still not right, for later:
 
 - With the graph open, the toolbar is wider than a 1138-pixel-wide window
-  (2560 × 1600 at 225 %): the last view buttons are cut off.
+  (2560 × 1600 at 225 %): the last view buttons are cut off. → Milestone 9.
 - With six crew cards and the backlinks panel open, the hand overlaps enough
-  that badges run into each other.
+  that badges run into each other. → Milestone 9.
 - An unknown `@name` is amber only when its line is drawn, not on the line
   being edited.
 - The run glow (1.2 s, starting about a second after a change) is easy to miss;
@@ -774,6 +782,77 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
+| 9 | **Graph and functions, finished** | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
+
+## Next
+
+Milestones 1–8 cover version 1's scope. These two finish what's half done
+(each milestone's "Known limits, for later") before anything from
+[Not in version 1](#not-in-version-1). Each item says where the work goes;
+anything that changes file text goes in core with tests.
+
+### Milestone 9: Graph and functions, finished
+
+In this order:
+
+1. **The toolbar fits.** With a graph open, the toolbar is wider than a
+   1138-pixel window. The graph's own tools (**+ Node**, **+ Function**,
+   **Crew**, **Link wires**, **⚠ Run N out of date**) move onto the graph as a
+   small bar in its top-left corner, so the top toolbar is the same for notes
+   and graphs. *Done when* every button is reachable at 1000 pixels wide, in
+   both layouts. (`main.rs` `view_toolbar`, `graph.rs`)
+2. **Views are remembered.** Each graph's pan and zoom, and each function's
+   view in the editor, are kept in `.obsessed/views.txt` (this machine only,
+   as Syntax.md section 11 says). Written when you leave a graph or close the
+   app, never while idle. A graph seen for the first time still opens fitted.
+   (`settings.rs` or a small `views` module in core with a parse/write test,
+   `graph.rs`, `func_editor.rs`)
+3. **Wires reach their rows.** A wire to a task or a heading
+   (`[[a#^t2]]`, `[[a#Notes]]`) ends at that row of the card, or at the card's
+   edge when the row isn't shown. (`graph.rs`; the row lookup in core with a
+   test)
+4. **Link wires can be deleted.** Delete on a link wire asks "Remove the link
+   to [[b]] from a?" (Remove / Cancel), as Syntax.md section 7 says. Removing
+   keeps the link's words: `[[b|the shot]]` becomes `the shot`, `[[b]]`
+   becomes `b`. Undoable like any edit. (`links::remove_link(text, line,
+   target)` in core with tests, then `main.rs`)
+5. **Renaming a function reaches its wires.** The function editor's title
+   becomes editable. Renaming rewrites the `fn` line and every wire, `fn Name`
+   node, `Name.pin` end and layout line that uses it: in its own graph for a
+   local function, in every graph for a saved one. A name already taken is
+   refused with a sentence saying so. (`nodes::rename_function(text, old,
+   new)` in core with tests, then `main.rs`)
+6. **Function edits undo.** Ctrl+Z in the function editor undoes its last edit
+   wherever the function lives, `_funct.md` included (today only the open
+   note has history). (`main.rs`, `history.rs`)
+7. **The crew hand stays readable.** With many people or a narrow graph, cards
+   overlap but each name and badge stays visible; the raised card shows in
+   full. *Done when* eight people fit a 700-pixel-wide graph. (`graph.rs`
+   `draw_crew`)
+
+*Milestone done when* each item is checked by hand in the real window (as in
+"Checked by hand" above), core tests cover the new text edits, and idle CPU is
+0 ms with 0 bytes written over 10 s with a graph and the function editor open.
+
+Left for later: the inputs node's place in the editor (needs a syntax line),
+renaming an `id` from the editor, matching the cards to the Possess mockup.
+
+### Milestone 10: Images
+
+1. **Attachments are scanned**, so `![[shot.png]]` and `[[ref.pdf]]` resolve
+   from any folder, the way Obsidian finds them. (`vault.rs`, with tests)
+2. **Pictures in notes.** `![[shot.png]]` and `![](shot.png)` draw the picture
+   in Live, Split and Reading, fitted to the text column. Decoded off the UI
+   thread at the size drawn, not full size; pictures far off screen are
+   dropped from memory. (`app/src/live.rs`, iced's `image` feature)
+3. **Crew portraits.** `portrait:` on a card is drawn on the crew hand, the
+   graph and the card's note; bots without one keep their bot face.
+   (`graph.rs`)
+
+*Budgets*, to be confirmed by measuring first: decoded pictures held in at
+most 64 MB, a note with 20 pictures opening in under 100 ms after the first
+time, idle CPU 0 ms. Note embeds (`![[other note]]`) stay out of version 1.
 
 ## Risks
 

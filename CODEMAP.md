@@ -7,6 +7,7 @@ Read this first; open only the files a change needs.
 - **What the app does and how files look:** [README.md](README.md),
   [Syntax.md](Syntax.md).
 - **Why it's built this way, measurements, milestones:** [PLAN.md](PLAN.md).
+  What comes next (milestones 9 and 10) is in its "Next" section.
 - **Keep this file current:** when a file, a main type or a flow changes,
   update its line here in the same commit.
 
