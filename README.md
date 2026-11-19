@@ -56,7 +56,9 @@ dashed when the note doesn't exist yet. Drag the background (or hold the middle
 button) to pan, scroll to zoom, drag a card to move it, double-click a card to
 open its note. Drag from the dot on a card's right edge to another card to add
 a wire; select a card or wire and press Delete to remove it from the graph
-(the note itself stays). **+ Node** adds a note. `[[links]]` between cards show
+(the note itself stays). The graph's own buttons sit in a small bar in its
+top-left corner: **+ Node** adds a note, **+ Function** a function node,
+**Crew** shows or hides the crew, and `[[links]]` between cards show
 as fainter wires (**Link wires** hides them). Everything is written back into
 `_nodes.md` as Syntax.md section 7 describes, and Ctrl+Z undoes it.
 
@@ -104,7 +106,7 @@ here or in Obsidian, VS Code or a `git pull`. If its changes change a note
 another function reads, that one runs too (each line changes at most once per
 run). Runs happen at most once a second, and every changed note is saved once.
 Opening a vault never changes anything: functions that would change something
-show **⚠ out of date** on their wire, and **Run N out of date** in the toolbar
+show **⚠ out of date** on their wire, and **Run N out of date** in the graph's bar
 runs them. **Runs** opens the log: every run with the lines it changed, notes
 changed in other apps, and **Undo** for the newest run (it puts back only lines
 that still hold what the run wrote). The log lives in `.obsessed/log/` at the

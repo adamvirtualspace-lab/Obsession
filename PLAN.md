@@ -566,7 +566,8 @@ when the mouse leaves. Core tests: 87.
 Still not right, for later:
 
 - With the graph open, the toolbar is wider than a 1138-pixel-wide window
-  (2560 × 1600 at 225 %): the last view buttons are cut off. → Milestone 9.
+  (2560 × 1600 at 225 %): the last view buttons are cut off. → Done in
+  milestone 9, item 1.
 - With six crew cards and the backlinks panel open, the hand overlaps enough
   that badges run into each other. → Milestone 9.
 - An unknown `@name` is amber only when its line is drawn, not on the line
@@ -782,7 +783,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (1 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -802,6 +803,20 @@ In this order:
    small bar in its top-left corner, so the top toolbar is the same for notes
    and graphs. *Done when* every button is reachable at 1000 pixels wide, in
    both layouts. (`main.rs` `view_toolbar`, `graph.rs`)
+
+   ✅ **Done (November 2026).** `App::view_graph_bar` draws the bar on a
+   `stack!` over the canvas (always two layers, so pan and zoom survive the
+   bar changing). The bar is `opaque`, so a click or drag on it never reaches
+   the cards; its buttons wrap onto a second line in a narrow graph. In the
+   function editor it only holds the run button, when something is out of
+   date. The note's path in the top toolbar takes the space left and is cut
+   off, so a deep path can't push the buttons out either. Checked by hand at
+   1002 × 632 (laptop screen, 225 %), normal and compact: every top button
+   visible, each bar button works, a drag on the bar doesn't pan, the graph
+   keeps its view. Idle: 0 ms CPU, 0 bytes written over 10 s with the graph,
+   and with the function editor. Found on the way: after **+ Node** and Esc,
+   the next Ctrl+P added the chosen note to the graph instead of opening it
+   (Esc didn't clear the add-node flag); fixed.
 2. **Views are remembered.** Each graph's pan and zoom, and each function's
    view in the editor, are kept in `.obsessed/views.txt` (this machine only,
    as Syntax.md section 11 says). Written when you leave a graph or close the

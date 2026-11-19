@@ -1016,7 +1016,11 @@ impl App {
             match shortcut {
                 Shortcut::Up => switcher.move_selection(false),
                 Shortcut::Down => switcher.move_selection(true),
-                Shortcut::Escape | Shortcut::QuickSwitch => self.switcher = None,
+                Shortcut::Escape | Shortcut::QuickSwitch => {
+                    self.switcher = None;
+                    // It may have been opened by + Node.
+                    self.adding_node = false;
+                }
                 _ => {}
             }
             return Task::none();
@@ -1027,6 +1031,8 @@ impl App {
                 let Some(ws) = &self.workspace else {
                     return Task::none();
                 };
+                // Ctrl+P opens a note; only + Node adds one.
+                self.adding_node = false;
                 self.switcher = Some(Switcher::new(&ws.vault));
                 operation::focus(switcher::input_id())
             }
@@ -3066,10 +3072,13 @@ impl App {
                             })
                         };
                         let graph = self.graph.as_ref().filter(|_| self.show_graph).map(|g| {
-                            match &self.editor {
+                            let canvas = match &self.editor {
                                 Some(editor) => editor.view().map(Message::Editor),
                                 None => g.view().map(Message::Graph),
-                            }
+                            };
+                            // Always two layers, so the canvas keeps its pan
+                            // and zoom whether or not the bar has buttons.
+                            stack![canvas, self.view_graph_bar(ws, note)].into()
                         });
                         let body = match self.mode {
                             _ if graph.is_some() => graph,
@@ -3198,6 +3207,46 @@ impl App {
         }
     }
 
+    /// The graph's own tools, in a small bar in the graph's top-left corner
+    /// (the top toolbar is the same for notes and graphs). In the function
+    /// editor only the run button shows.
+    fn view_graph_bar<'a>(&'a self, ws: &'a Workspace, note: &'a Note) -> Element<'a, Message> {
+        let nowrap = iced::widget::text::Wrapping::None;
+        let tool = |label: &'static str, message: Message, active: bool| {
+            button(text(label).size(theme::SMALL).wrapping(nowrap))
+                .on_press(message)
+                .padding(theme::tool_pad())
+                .style(theme::tool(active))
+        };
+        let mut bar = row![].spacing(theme::tool_gap()).align_y(iced::Center);
+        if self.editor.is_none() {
+            bar = bar
+                .push(tool("+ Node", Message::AddNode, false))
+                .push(tool("+ Function", Message::AddFunctionNode, false))
+                .push((!ws.crew.is_empty()).then(|| tool("Crew", Message::ToggleHand, self.show_hand)))
+                .push(tool("Link wires", Message::ToggleLinkWires, self.show_link_wires));
+        }
+        let stale = ws.runs.stale_in(&note.rel);
+        if stale > 0 {
+            bar = bar.push(
+                button(text(format!("⚠ Run {stale} out of date")).size(theme::SMALL).color(theme::WARNING).wrapping(nowrap))
+                    .on_press(Message::RunGraph)
+                    .padding(theme::tool_pad())
+                    .style(theme::tool(false)),
+            );
+        }
+        let empty = self.editor.is_some() && stale == 0;
+        // Opaque: a click between the buttons doesn't reach the cards under
+        // it. Only the bar itself; the rest of the canvas stays live.
+        let bar: Element<'_, Message> = if empty {
+            Space::new().into()
+        } else {
+            // A narrow graph wraps the buttons onto a second line.
+            iced::widget::opaque(container(bar.wrap().vertical_spacing(theme::tool_gap())).padding(4).style(theme::popup))
+        };
+        container(bar).padding(8).into()
+    }
+
     fn view_toolbar<'a>(&'a self, ws: &'a Workspace) -> Element<'a, Message> {
         let mode_button = |label: &'static str, mode: Mode| {
             button(text(label).size(theme::SMALL))
@@ -3228,8 +3277,10 @@ impl App {
                     .on_press(Message::StartNewNote)
                     .padding(theme::tool_pad())
                     .style(theme::tool(false)),
-                text(path).size(theme::SMALL).color(theme::MUTED),
-                Space::new().width(Fill),
+                // The path takes what's left and is cut off, never the buttons.
+                container(text(path).size(theme::SMALL).color(theme::MUTED).wrapping(iced::widget::text::Wrapping::None))
+                    .width(Fill)
+                    .clip(true),
                 row![]
                     .push(self.graph.is_some().then(|| {
                         button(text("Graph").size(theme::SMALL))
@@ -3237,45 +3288,6 @@ impl App {
                             .padding(theme::tool_pad())
                             .style(theme::tool(self.show_graph))
                     }))
-                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
-                        button(text("+ Node").size(theme::SMALL))
-                            .on_press(Message::AddNode)
-                            .padding(theme::tool_pad())
-                            .style(theme::tool(false))
-                    }))
-                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
-                        button(text("+ Function").size(theme::SMALL))
-                            .on_press(Message::AddFunctionNode)
-                            .padding(theme::tool_pad())
-                            .style(theme::tool(false))
-                    }))
-                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none() && !ws.crew.is_empty()).then(|| {
-                        button(text("Crew").size(theme::SMALL))
-                            .on_press(Message::ToggleHand)
-                            .padding(theme::tool_pad())
-                            .style(theme::tool(self.show_hand))
-                    }))
-                    .push((self.graph.is_some() && self.show_graph && self.editor.is_none()).then(|| {
-                        button(text("Link wires").size(theme::SMALL))
-                            .on_press(Message::ToggleLinkWires)
-                            .padding(theme::tool_pad())
-                            .style(theme::tool(self.show_link_wires))
-                    }))
-                    .spacing(theme::tool_gap()),
-                row![]
-                    .push({
-                        let stale = ws
-                            .note
-                            .as_ref()
-                            .filter(|_| self.graph.is_some() && self.show_graph)
-                            .map_or(0, |n| ws.runs.stale_in(&n.rel));
-                        (stale > 0).then(|| {
-                            button(text(format!("⚠ Run {stale} out of date")).size(theme::SMALL).color(theme::WARNING))
-                                .on_press(Message::RunGraph)
-                                .padding(theme::tool_pad())
-                                .style(theme::tool(false))
-                        })
-                    })
                     .spacing(theme::tool_gap()),
                 button(text(if ws.runs.running { "Runs ●" } else { "Runs" }).size(theme::SMALL))
                     .on_press(Message::ToggleRuns)
