@@ -60,7 +60,9 @@ a wire; select a card or wire and press Delete to remove it from the graph
 (the note itself stays). The graph's own buttons sit in a small bar in its
 top-left corner: **+ Node** adds a note, **+ Function** a function node,
 **Crew** shows or hides the crew, and `[[links]]` between cards show
-as fainter wires (**Link wires** hides them). Everything is written back into
+as fainter wires (**Link wires** hides them). A wire to a task or a heading
+(`[[a#^t2]]`, `[[a#Notes]]`) ends at that task's row on the card, or at the
+first task under the heading. Everything is written back into
 `_nodes.md` as Syntax.md section 7 describes, and Ctrl+Z undoes it.
 
 **Functions:** hover a wire and click its **ƒ** to put a function on it: pick

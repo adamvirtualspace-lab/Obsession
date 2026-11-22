@@ -354,8 +354,8 @@ How it works:
 
 Known limits, for later:
 
-- A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the row.
-  → Milestone 9.
+- ~~A wire to a task or heading (`[[a#^t2]]`) attaches to the card, not the
+  row.~~ Done in milestone 9, item 3.
 - ~~The view isn't saved: a graph opens fitted to the window.~~ Done in
   milestone 9, item 2.
 - Link wires can't be removed from the graph yet (Syntax.md wants it to ask
@@ -784,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (2 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (3 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -844,6 +844,20 @@ In this order:
    (`[[a#^t2]]`, `[[a#Notes]]`) ends at that row of the card, or at the card's
    edge when the row isn't shown. (`graph.rs`; the row lookup in core with a
    test)
+   ✅ **Done (November 2026).** `links::task_at(text, sub, task_lines)` finds
+   the task a `#^block` points at (the task on its line), or the first task
+   in a heading's section (up to the next heading of the same or a higher
+   level, subsections included). Each `WireView` keeps `from_row` / `to_row`
+   and `wire_ends` uses the row's middle; a wire that leaves a row starts
+   with a small dot. A link wire uses the row only when every link from that
+   note to the card points at the same row. Ends stay at the card for a
+   heading with no task under it, a block on a line that isn't a task, a row
+   past the eighth (the card shows "+N more") and a missing card. Checked by
+   hand: `[[anim/sh040#^lip]] → [[lighting/sh040#^t2]]` runs from the Lip
+   sync row to the Rim light tweak row; a `[[comp/sh040#Grade]]` link in the
+   FX note leaves comp's card at Final grade, the first task under
+   `## Grade`; hover still lights the moved wires. Idle: 0 ms CPU, 0 bytes
+   written over 10 s. Core tests: 93 (1 new).
 4. **Link wires can be deleted.** Delete on a link wire asks "Remove the link
    to [[b]] from a?" (Remove / Cancel), as Syntax.md section 7 says. Removing
    keeps the link's words: `[[b|the shot]]` becomes `the shot`, `[[b]]`

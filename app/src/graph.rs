@@ -18,7 +18,7 @@ use iced::{Color, Element, Fill, Font, Pixels, Point, Rectangle, Renderer, Size,
 
 use obsession_core::crew::{self, Badge, Member};
 use obsession_core::func::{self, Library, PortKind};
-use obsession_core::links::LinkIndex;
+use obsession_core::links::{self, LinkIndex};
 use obsession_core::nodes::{self, End, NodeKind};
 use obsession_core::views::View as SavedView;
 use obsession_core::status::{self, Format};
@@ -199,6 +199,10 @@ pub struct WireView {
     /// The function card's output pin it starts at / input pin it ends at.
     pub from_pin: Option<usize>,
     pub to_pin: Option<usize>,
+    /// The task row it leaves from / ends at, for a `[[a#^t2]]` or
+    /// `[[a#Notes]]` end (only rows the card shows).
+    pub from_row: Option<usize>,
+    pub to_row: Option<usize>,
     pub state: WireState,
     /// When it turned solid (for the dashed-to-solid animation).
     pub solid_since: Option<Instant>,
@@ -365,6 +369,12 @@ impl Graph {
             End::Pin { pin, .. } => pins.iter().position(|(n, _)| n.eq_ignore_ascii_case(pin)),
             End::Note { .. } => None,
         };
+        // The task row a `#^block` / `#heading` end points at, if the card
+        // shows it.
+        let mut row_of = |end: &End, card: &Card| -> Option<usize> {
+            let End::Note { sub: Some(sub), .. } = end else { return None };
+            row_in(store, card, sub)
+        };
         let mut wires: Vec<WireView> = Vec::new();
         for w in &graph.wires {
             let (Some(from), Some(to)) = (find(&w.from, &cards), find(&w.to, &cards)) else {
@@ -373,6 +383,8 @@ impl Graph {
             let from_pin = pin_of(&w.from, &cards[from].pins_out);
             let to_pin = pin_of(&w.to, &cards[to].pins_in);
             let state = wire_state(w, &cards[from], &cards[to], from_pin, to_pin, library);
+            let from_row = row_of(&w.from, &cards[from]);
+            let to_row = row_of(&w.to, &cards[to]);
             wires.push(WireView {
                 from,
                 to,
@@ -381,6 +393,8 @@ impl Graph {
                 line: Some(w.line),
                 from_pin,
                 to_pin,
+                from_row,
+                to_row,
                 state,
                 solid_since: None,
                 stale: None,
@@ -424,6 +438,9 @@ impl Graph {
         // with the link.
         for (i, c) in cards.iter().enumerate() {
             let Some(source) = &c.rel else { continue };
+            // The links as written, for which row of the linked card each
+            // one points at.
+            let written = store.get(source).map(links::links).unwrap_or_default();
             for target in links.targets(source) {
                 let Some(to) = vault.resolve_from(target, Some(source)).entry() else {
                     continue;
@@ -433,6 +450,14 @@ impl Graph {
                 };
                 let known = wires.iter().any(|w| w.from == j && w.to == i);
                 if j != i && !known {
+                    // Every link to that note must point at the same row,
+                    // or the wire leaves from the card.
+                    let mut rows = written
+                        .iter()
+                        .filter(|l| vault.resolve_from(&l.target, Some(source)).entry().is_some_and(|e| e.rel == to.rel))
+                        .map(|l| l.sub.as_deref().and_then(|sub| row_in(store, &cards[j], sub)));
+                    let first = rows.next().flatten();
+                    let from_row = first.filter(|_| rows.all(|r| r == first));
                     wires.push(WireView {
                         from: j,
                         to: i,
@@ -441,6 +466,8 @@ impl Graph {
                         line: None,
                         from_pin: None,
                         to_pin: None,
+                        from_row,
+                        to_row: None,
                         state: WireState::Plain,
                         solid_since: None,
                         stale: None,
@@ -639,13 +666,15 @@ impl Graph {
     fn wire_ends(&self, wire: &WireView, state: &State) -> (Point, Point) {
         let a = self.card_rect(wire.from, state);
         let b = self.card_rect(wire.to, state);
-        let start = match wire.from_pin {
-            Some(k) => self.cards[wire.from].pin_at(a.position(), true, k),
-            None => handle(a),
+        let start = match (wire.from_pin, wire.from_row) {
+            (Some(k), _) => self.cards[wire.from].pin_at(a.position(), true, k),
+            (None, Some(r)) => Point::new(a.x + a.width, row_y(a, r)),
+            (None, None) => handle(a),
         };
-        let end = match wire.to_pin {
-            Some(k) => self.cards[wire.to].pin_at(b.position(), false, k),
-            None => Point::new(b.x, b.y + b.height.min(HEADER + 40.0) / 2.0),
+        let end = match (wire.to_pin, wire.to_row) {
+            (Some(k), _) => self.cards[wire.to].pin_at(b.position(), false, k),
+            (None, Some(r)) => Point::new(b.x, row_y(b, r)),
+            (None, None) => Point::new(b.x, b.y + b.height.min(HEADER + 40.0) / 2.0),
         };
         (start, end)
     }
@@ -1325,6 +1354,22 @@ fn restore(state: &mut State, v: SavedView, size: Size) {
     state.pan = Vector::new(size.width / 2.0 - v.x * zoom, size.height / 2.0 - v.y * zoom);
 }
 
+/// The middle of task row `r` on a card at `card` (graph coordinates).
+fn row_y(card: Rectangle, r: usize) -> f32 {
+    card.y + HEADER + r as f32 * ROW + 8.5
+}
+
+/// The row of `card` that a `#^block` or `#heading` link points at, if the
+/// card shows it.
+fn row_in(store: &mut Store, card: &Card, sub: &str) -> Option<usize> {
+    if card.kind == CardKind::Function || card.kind == CardKind::Missing {
+        return None;
+    }
+    let text = store.get(card.rel.as_deref()?).ok()?;
+    let lines: Vec<usize> = card.tasks.iter().map(|t| t.line).collect();
+    links::task_at(text, sub, &lines).filter(|&r| r < MAX_ROWS)
+}
+
 /// Out of the right side of a card (mid-header), where its handle is.
 fn handle(r: Rectangle) -> Point {
     Point::new(r.x + r.width, r.y + r.height.min(HEADER + 40.0) / 2.0)
@@ -1712,6 +1757,10 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
             })
         },
     );
+    // A dot where it leaves a task row, so the row reads as its start.
+    if wire.from_row.is_some() {
+        frame.fill(&Path::circle(sa, 3.0 * z), color);
+    }
     // Arrowhead.
     let s = 7.0 * z;
     frame.fill(

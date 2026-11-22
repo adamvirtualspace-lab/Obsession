@@ -278,6 +278,39 @@ pub fn outline(text: &str) -> Outline {
     out
 }
 
+/// Which task a `#^block` or `#heading` link into `text` points at, for
+/// ending a graph wire at that task's row. `tasks` holds the note's task
+/// lines in order; the answer is an index into it.
+///
+/// A block id points at the task on its own line. A heading points at the
+/// first task in its section, which runs until the next heading of the
+/// same or a higher level. `None` when the note has no such block or
+/// heading, or no task there (the wire then ends at the card).
+pub fn task_at(text: &str, sub: &str, tasks: &[usize]) -> Option<usize> {
+    let sub = sub.trim();
+    if !sub.starts_with('^') && normalize_heading(sub.rsplit('#').next().unwrap_or(sub)).is_empty() {
+        return None;
+    }
+    let outline = outline(text);
+    let line = outline.find(sub)?;
+    if sub.starts_with('^') {
+        return tasks.iter().position(|&t| t == line);
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let level = |l: usize| {
+        let t = lines.get(l).copied().unwrap_or("").trim_start();
+        t.bytes().take_while(|&b| b == b'#').count()
+    };
+    let own = level(line);
+    let end = outline
+        .headings
+        .iter()
+        .map(|&(_, l)| l)
+        .find(|&l| l > line && level(l) <= own)
+        .unwrap_or(usize::MAX);
+    tasks.iter().position(|&t| t > line && t < end)
+}
+
 /// The state of every link in `text` (a note at `rel`), keyed by
 /// [`dest_key`]. Links to the note's own headings use `own`.
 pub fn link_states(
@@ -858,6 +891,26 @@ mod tests {
         assert_eq!(o.find("^INTRO"), Some(1));
         assert_eq!(o.find("Indented"), Some(6));
         assert_eq!(o.find("not a heading"), None);
+    }
+
+    #[test]
+    fn a_link_into_a_note_finds_its_task() {
+        let text = "# Shot\n- [ ] block out ^t1\n## Notes\nSome text\n### Lighting\n- [ ] key light ^t2\n- [x] rim\n## Done\n- [x] wrap\n```\n# not a heading\n```\n## Empty\ntext ^p1";
+        let tasks = [1, 5, 6, 8];
+        assert_eq!(task_at(text, "^t2", &tasks), Some(1));
+        assert_eq!(task_at(text, "^T1", &tasks), Some(0));
+        // A heading: the first task in its section, subsections included.
+        assert_eq!(task_at(text, "Notes", &tasks), Some(1));
+        assert_eq!(task_at(text, "Shot#Lighting", &tasks), Some(1));
+        assert_eq!(task_at(text, "Done", &tasks), Some(3));
+        // The top heading's section holds everything.
+        assert_eq!(task_at(text, "Shot", &tasks), Some(0));
+        // No task there, no such place, or the whole note: the card.
+        assert_eq!(task_at(text, "Empty", &tasks), None);
+        assert_eq!(task_at(text, "^p1", &tasks), None);
+        assert_eq!(task_at(text, "Nope", &tasks), None);
+        assert_eq!(task_at(text, "^nope", &tasks), None);
+        assert_eq!(task_at(text, "", &tasks), None);
     }
 
     #[test]
