@@ -79,7 +79,11 @@ remove it. **+ Node** (or double-click the canvas) adds a node from the
 library. Click a node to set its values in the panel; hover a pin to see its
 live value, read from the real notes the wire connects. The panel also holds
 the wire's own values (`task`, `target`…). **+ Function** adds a function with
-several ins or outs as a node; wire notes to its pins.
+several ins or outs as a node; wire notes to its pins. To rename a function,
+click its name at the top of the panel, type the new one and press Enter: every
+wire, `fn` card and pin that uses it follows (in every graph, for a saved
+function), and one Ctrl+Z puts it all back. A name that's already taken is
+refused.
 
 **Search:** Ctrl+Shift+F (or **Search** in the toolbar) finds every line that
 has all the words you type, in every note, ignoring case. Matches are

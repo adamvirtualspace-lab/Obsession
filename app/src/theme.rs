@@ -205,6 +205,23 @@ pub fn search(_: &Theme, _: text_input::Status) -> text_input::Style {
     }
 }
 
+/// A title that reads as text until it's hovered or typed in.
+pub fn title_input(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let boxed = !matches!(status, text_input::Status::Active);
+    text_input::Style {
+        background: Background::Color(if boxed { PANEL } else { Color::TRANSPARENT }),
+        border: Border {
+            color: if boxed { LINE } else { Color::TRANSPARENT },
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        icon: MUTED,
+        placeholder: FAINT,
+        value: MENTION,
+        selection: Color { a: 0.35, ..ACCENT },
+    }
+}
+
 /// The line being edited in Live Preview: no box, so it sits in the page
 /// like the drawn lines around it.
 pub fn live_editor(_: &Theme, _: text_editor::Status) -> text_editor::Style {

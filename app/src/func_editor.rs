@@ -77,6 +77,9 @@ pub enum Message {
     ParamSubmit,
     HeaderDraft(String),
     HeaderSubmit,
+    /// The title being typed in, and Enter on it: rename the function.
+    NameDraft(String),
+    NameSubmit,
     RemoveLine(usize),
     PaletteQuery(String),
     AddNode(&'static str),
@@ -100,6 +103,8 @@ pub enum Outcome {
     TakeOff,
     /// Copy this saved function into the graph's `## Functions`.
     Duplicate,
+    /// Rename the function (and everything that uses it) to this.
+    Rename(String),
     Status(String),
 }
 
@@ -119,6 +124,8 @@ pub struct Editor {
     drafts: Vec<String>,
     param_drafts: Vec<String>,
     header_draft: String,
+    /// The editable title.
+    name_draft: String,
     palette: Option<Palette>,
     /// Bumped when a different function opens, so the view fits it.
     pub fit: u64,
@@ -149,6 +156,7 @@ struct DrawKey {
 impl Editor {
     pub fn new(name: String, origin: Origin, context: Context) -> Self {
         Self {
+            name_draft: name.clone(),
             name,
             origin,
             context,
@@ -191,6 +199,10 @@ impl Editor {
             return;
         };
         let f = &f;
+        if f.name != self.name {
+            // Renamed (here, or by an undo): the title follows.
+            self.name_draft = f.name.clone();
+        }
         self.name = f.name.clone();
         self.checked = obsession_core::func::check::check(f);
         // The wire's values, by param.
@@ -443,6 +455,10 @@ impl Editor {
 
     /// Handles a message; returns what the app should do.
     pub fn update(&mut self, message: Message) -> Outcome {
+        if let Message::NameDraft(value) = message {
+            self.name_draft = value;
+            return Outcome::None;
+        }
         let Some(block) = self.block.clone() else {
             return match message {
                 Message::Back => Outcome::Back,
@@ -600,6 +616,21 @@ impl Editor {
                 self.header_draft.clear();
                 Outcome::Edit(Box::new(move |text| obsession_core::func::edit::add_header(text, &block, &line)))
             }
+            Message::NameDraft(_) => Outcome::None,
+            Message::NameSubmit => {
+                let new = self.name_draft.trim().to_owned();
+                if new.is_empty() {
+                    self.name_draft = self.name.clone();
+                    return Outcome::Status("⚠ A function needs a name".into());
+                }
+                if new.contains(['(', ')', '.', ':', '[', ']']) {
+                    return Outcome::Status("⚠ A function's name can't contain ( ) . : [ or ]".into());
+                }
+                if new == f.name {
+                    return Outcome::None;
+                }
+                Outcome::Rename(new)
+            }
             Message::RemoveLine(line) => Outcome::Edit(Box::new(move |text| obsession_core::func::edit::remove_line(text, line))),
             Message::PaletteQuery(q) => {
                 if let Some(p) = &mut self.palette {
@@ -648,22 +679,30 @@ impl Editor {
                 .padding([4, 10])
                 .style(theme::tool(false))
         };
+        let title_font = Font {
+            weight: iced::font::Weight::Semibold,
+            ..theme::UI_FONT
+        };
         let mut col = column![
             row![
                 tool("← Graph", Message::Back),
-                text(format!("ƒ {}", self.name))
+                text("ƒ").size(16).font(title_font).color(theme::MENTION),
+                text_input("Function name", &self.name_draft)
+                    .on_input(Message::NameDraft)
+                    .on_submit(Message::NameSubmit)
                     .size(16)
-                    .font(Font {
-                        weight: iced::font::Weight::Semibold,
-                        ..theme::UI_FONT
-                    })
-                    .color(theme::MENTION),
+                    .font(title_font)
+                    .padding([2, 4])
+                    .style(theme::title_input),
             ]
-            .spacing(10)
+            .spacing(6)
             .align_y(iced::Center),
         ]
         .spacing(10)
         .padding(14);
+        if self.name_draft.trim() != self.name {
+            col = col.push(small("Enter renames it, and every wire and node that uses it".into()));
+        }
 
         col = col.push(small(match self.origin {
             Origin::Local => "In this graph's ## Functions".to_owned(),

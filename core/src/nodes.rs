@@ -482,6 +482,97 @@ pub fn set_wire_function(text: &str, line: usize, function: Option<&str>) -> Str
     lines.join()
 }
 
+/// The function name in a wire end like `Check Lighting.anim`: its range
+/// in `s` (trimmed). `None` for a `[[note]]` end.
+fn pin_function(s: &str) -> Option<Range<usize>> {
+    let lead = s.len() - s.trim_start().len();
+    if s[lead..].starts_with("[[") {
+        return None;
+    }
+    let dot = s.rfind('.')?;
+    let end = s[..dot].trim_end().len();
+    (end > lead).then_some(lead..end)
+}
+
+/// Renames the function `old` everywhere a graph uses it: `- fn Old` in
+/// `## Nodes`, `: Old(...)` on a wire, `Old.pin` wire ends and the
+/// `fn Old` layout line. Names match ignoring case; nothing else changes
+/// (the function's own `fn` line is `func::edit::rename`'s).
+pub fn rename_function(text: &str, old: &str, new: &str) -> String {
+    let mut lines = Lines::new(text);
+    let sections = lines.sections();
+    let layout = lines.layout();
+    let old = old.trim();
+    let same = |s: &str| s.trim().eq_ignore_ascii_case(old);
+    for (i, section) in sections.iter().enumerate() {
+        let raw = lines.lines[i].clone();
+        let lead = raw.len() - raw.trim_start().len();
+        if let Some((open, close)) = layout
+            && (open..=close).contains(&i)
+        {
+            // `fn Old 300,200`
+            if i > open + 1
+                && i < close
+                && let Some((key, xy)) = raw.trim().rsplit_once(' ')
+                && let Some(name) = key.trim().strip_prefix("fn ")
+                && same(name)
+            {
+                lines.lines[i] = format!("{}fn {new} {xy}", &raw[..lead]);
+            }
+            continue;
+        }
+        let Some(item) = list_item(&raw) else {
+            continue;
+        };
+        let item_at = item.as_ptr() as usize - raw.as_ptr() as usize;
+        match section {
+            Some(Section::Nodes) => {
+                if let Some(name) = item.strip_prefix("fn ")
+                    && same(name)
+                {
+                    lines.lines[i] = format!("{}fn {new}", &raw[..item_at]);
+                }
+            }
+            Some(Section::Wires) => {
+                let (Some((at, len)), Some(head)) = (arrow(item), wire_head(item)) else {
+                    continue;
+                };
+                // Ranges in `item` to replace with the new name.
+                let mut spots: Vec<Range<usize>> = Vec::new();
+                if let Some(r) = pin_function(&item[..at]) {
+                    spots.push(r);
+                }
+                let to_at = at + len;
+                if let Some(r) = pin_function(&item[to_at..head]) {
+                    spots.push(r.start + to_at..r.end + to_at);
+                }
+                let after = &item[head..];
+                if let Some(colon) = after.find(':') {
+                    let call_at = head + colon + 1;
+                    let call = &item[call_at..];
+                    let start = call_at + (call.len() - call.trim_start().len());
+                    let name_end = call.find('(').map_or(item.len(), |p| call_at + p);
+                    let end = start + item[start..name_end].trim_end().len();
+                    if end > start {
+                        spots.push(start..end);
+                    }
+                }
+                let mut new_item = item.to_owned();
+                for r in spots.into_iter().rev() {
+                    if same(&item[r.clone()]) {
+                        new_item.replace_range(r, new);
+                    }
+                }
+                if new_item != item {
+                    lines.lines[i] = format!("{}{new_item}", &raw[..item_at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    lines.join()
+}
+
 /// The lines of a section (after its heading).
 pub fn section_lines(text: &str, section: Section) -> Range<usize> {
     let lines = Lines::new(text);
@@ -589,6 +680,36 @@ mod tests {
         assert_eq!(fresh, "# G\n\n## Nodes\n- [[a]]\n\n## Functions\n```obsession\nfn New\n```\n");
         let names: Vec<String> = crate::func::local_blocks(&added).into_iter().map(|b| b.function.name).collect();
         assert_eq!(names, ["Check Lighting", "New"]);
+    }
+
+    #[test]
+    fn renaming_a_function_reaches_its_uses() {
+        let text = SAMPLE.replace(
+            "- Check Lighting.light → [[lighting/sh040]]\n",
+            "- Check Lighting.light → [[lighting/sh040]]\n-   check lighting .x -> Check Lighting.y\n- [[a]] → [[b]] :  check Lighting (task: \"Check Lighting.a\")\n- [[a]] → [[b]] : Check\n",
+        );
+        let renamed = rename_function(&text, "Check Lighting", "Light Check");
+        let want = text
+            .replace("- fn Check Lighting\n", "- fn Light Check\n")
+            .replace("→ Check Lighting.anim", "→ Light Check.anim")
+            .replace("- Check Lighting.light →", "- Light Check.light →")
+            .replace("-   check lighting .x -> Check Lighting.y", "-   Light Check .x -> Light Check.y")
+            .replace(":  check Lighting (task:", ":  Light Check (task:")
+            .replace("\nfn Check Lighting 300,200\n", "\nfn Light Check 300,200\n");
+        assert_eq!(renamed, want);
+        // The block's own `fn` line, a string argument and another function
+        // (`Check`) stay.
+        assert!(renamed.contains("```obsession\nfn Check Lighting\n"));
+        assert!(renamed.contains("[[a]] → [[b]] : Check\n"));
+        let g = parse(&renamed);
+        assert_eq!(g.position("fn Light Check"), Some((300.0, 200.0)));
+        assert_eq!(g.wires[2].to, End::Pin { function: "Light Check".into(), pin: "anim".into() });
+
+        // A wire's function, with Windows line endings.
+        let crlf = "## Wires\r\n- [[a]] -> [[b]] : Wait For Done\r\n";
+        assert_eq!(rename_function(crlf, "wait for done", "Hold"), "## Wires\r\n- [[a]] -> [[b]] : Hold\r\n");
+        // Nothing to do: the same text.
+        assert_eq!(rename_function(SAMPLE, "Nope", "X"), SAMPLE);
     }
 
     #[test]

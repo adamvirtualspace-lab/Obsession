@@ -34,7 +34,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `store.rs` | 520 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
-| `history.rs` | 252 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step` + `fingerprint`: undo for changes made from the open note's view to other notes, taken only while the open note's text matches its fingerprint from then. |
+| `history.rs` | 283 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step { files: Vec<Change>, open, what, joined }` + `fingerprint`: undo for changes made from the open note's view to other notes (one step can hold several files), taken only while the open note's text matches its fingerprint from then. A `joined` step goes with the open note's own edit in one press (`undo_joined` after its undo; redone just before its redo). |
 | `syntax.rs` | 380 | Line tokenizer for highlighting: `scan_line(LineState, line)`, `LineState::{Start, Normal, Frontmatter, Fence, Comment}`, `can_hold_task`. Used by everything that must skip code and frontmatter. |
 | `status.rs` | 440 | Tasks and status formats: `task_box(line)`, `tasks(text)` → `(line, byte of [, char)`, `Format` (`builtin`, `index_of`, `get`, `next`, `is_finished`), `from_frontmatter`, `resolve(note, team)`. |
 | `live.rs` | 910 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s with raw-byte mapping, `table_cells`, `trailing_block_id`. |
@@ -42,7 +42,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `preview.rs` | 430 | Obsidian → plain markdown (unused by the app now; kept for export). |
 | `fuzzy.rs` | 70 | `score(query, candidate)` for the quick switcher. |
 | `search.rs` | 230 | Vault search: `SearchIndex::build(root, notes)`, `update`, `remove`, `query(words, limit)` → `Results { hits: Vec<Hit { rel, line, text, ranges }>, total, notes }`. |
-| `nodes.rs` | 600 | Graph files (any `…_nodes.md`, `is_graph(rel)`): `parse(text)` → `Graph { nodes, wires, layout }`, `Node`/`NodeKind::{File, Function}`, `Wire { from, to, function, line }`, `End::{Note{target, sub}, Pin{function, pin}}`. Edits: `set_layout`, `add_item`, `remove_lines`, `add_block`, `set_wire_function`, `section_lines`. |
+| `nodes.rs` | 727 | Graph files (any `…_nodes.md`, `is_graph(rel)`): `parse(text)` → `Graph { nodes, wires, layout }`, `Node`/`NodeKind::{File, Function}`, `Wire { from, to, function, line }`, `End::{Note{target, sub}, Pin{function, pin}}`. Edits: `set_layout`, `add_item`, `remove_lines`, `add_block`, `set_wire_function`, `section_lines`, `rename_function(text, old, new)` (`- fn Old`, wire calls, `Old.pin` ends, the layout line; `pin_function`). |
 | `func/mod.rs` | 640 | Function text format: `parse`, `blocks(text)` / `local_blocks(graph)` → `Block { open, close, function }`, `Function { name, inputs, outputs, params, steps, errors }`, `Step { id, op, args, pos, line }`, `Value::{Ref, Lit}`, `Literal`, `parse_call`, `parse_value`, `write_step`. `Library { local, saved }` (`find`, `all`), `SAVED` = `_funct.md`, `SAVED_DEFAULT`. |
 | `func/types.rs` | 140 | `Type` (File, Section, Task, Text, Number, Bool, TextList, TaskList) and `Want` (what an argument accepts; `accepts`, `describe`). |
 | `func/library.rs` | 210 | `NODES`: every node (`Spec { name, category, inputs, output, help }`), `find(name)`. Add a node here *and* in `eval.rs`'s `apply`. |
@@ -51,14 +51,14 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `runner.rs` | 560 | `Index::build(vault, graphs, saved)` → `jobs: Vec<Job>` (`Job { graph, line, function, checked, params, ports }`), `affected(changed)`, `files()`, `reads(rel)`, `find(graph, line)`. `run(index, files, start, team)` → `Outcome { texts, changes, ran, blocked, warnings }` (chains, loop guard), `pending` (out of date), `apply` / `revert` (`Change { rel, line, old, new, by }`), `params_from`, `end_kind`. |
 | `crew.rs` | 510 | `Member { key, rel, name, role, portrait, color, skills, bot, exists }`, `card(rel, text)`, `is_card(rel, folder)`, `seats(folder, entries)` (notes and people's folders), `new_card_rel`, `key_of`, `folder_setting` / `frontmatter_value` / `set_frontmatter` (`crew:` in `_settings.md`), `template`, `mentions(line)`, `task_mentions(text)`, `add_mention(line, name)`, `badges(counts)` → `Badge::{Overloaded, Powerhouse}`, `initials`. |
 | `log.rs` | 250 | `.obsessed/log/`: `Record { id, time, kind: Kind::{Run, Outside}, summary, changes, undone }`, `append` (keeps 500), `load`, `mark_undone`, `ensure` (folder + `.gitignore`). |
-| `views.rs` | 250 | `.obsessed/views.txt`: `Views` (`parse`, `to_text`, `get`, `set` (marks dirty only on a real change), `prune`, `rename`, `load`, `save` (only if dirty)), `View { x, y, zoom }` (the graph point in the middle of the canvas), `graph_key(rel)`, `function_key(file, name)`. |
-| `func/edit.rs` | 330 | Editor changes as one-line edits: `set_pos`, `set_arg`, `args_for`, `add_step`, `remove_step`, `add_header`, `remove_line`, `fresh_id`, `wire_call`. |
+| `views.rs` | 263 | `.obsessed/views.txt`: `Views` (`parse`, `to_text`, `get`, `set` (marks dirty only on a real change), `prune`, `rename`, `move_view` (a renamed function's view), `load`, `save` (only if dirty)), `View { x, y, zoom }` (the graph point in the middle of the canvas), `graph_key(rel)`, `function_key(file, name)`. |
+| `func/edit.rs` | 337 | Editor changes as one-line edits: `set_pos`, `set_arg`, `args_for`, `add_step`, `remove_step`, `add_header`, `remove_line`, `fresh_id`, `wire_call`, `rename(text, block, new, heading)` (the `fn` line, and the `## Name` heading in `_funct.md`). |
 
 ## app/src
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3717 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 3899 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
@@ -72,7 +72,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `new_note.rs` | 105 | New-note box (Ctrl+N), also the rename box (F2). |
 | `backlinks.rs` | 70 | Backlinks panel. |
 | `graph.rs` | 2054 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`, drawn by `draw_crew` in the overlay. `takes_function(wire)`: no ƒ on wires to or from a function node's pin. `WireView::from_row` / `to_row` (via `row_in` → `links::task_at`): a `#^block` / `#heading` end meets that task row (`row_y`); `wire_ends` uses it. Hover is worked out again when a drag ends. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
-| `func_editor.rs` | 1480 | Function editor (`Editor`: canvas + panel), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
+| `func_editor.rs` | 1550 | Function editor (`Editor`: canvas + panel; the title is a `text_input` on `name_draft`, `NameDraft`/`NameSubmit`), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`, `Rename(new)`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
 | `runs.rs` | 280 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `watch(root)` subscription → `Vec<FsEvent>`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
 | `theme.rs` | 260 | Colours, fonts, widget styles. Compact layout: `set_compact`, `compact`, `row_height`, `tool_pad`, `tool_gap`, `bar_pad`. |
 | `timer.rs` | 20 | One-shot delay future. |
@@ -115,7 +115,16 @@ wire's function, maybe add a block) → `open_editor`. Editor events →
 through `edit_graph`, or `_funct.md` through the store and a save; then
 `rebuild_graph` → `refresh_editor`, which finds the block again, gathers the
 wire's values and the wired notes (`Bind`s), and calls `Editor::refresh`
-(check + eval → live values).
+(check + eval → live values). If the function's name isn't found, it takes
+the block at the same lines (a rename or its undo) and moves the view key
+(`Views::move_view`).
+
+**Renaming a function.** Editor title + Enter → `Outcome::Rename` →
+`rename_function`: `name_taken` refuses a name in use. Local: one `edit_graph`
+(`func::edit::rename` + `nodes::rename_function`). Saved: `_funct.md` and every
+other graph without its own function of that name (`graph_rels`) go to
+`edit_files(files, what, joined)` as one `Elsewhere` step; the open graph's own
+change is then an `edit_graph`, and `joined` ties the two into one Ctrl+Z.
 
 **Runs.** `rebuild_index` (on scan, and when a graph, `_funct.md` or
 `_settings.md` changes) → `Index::build`, pins job files, `check_out_of_date`
@@ -140,11 +149,12 @@ refreshes `ws.mentions` (vault-wide open counts). `rebuild_graph` →
 the `Assigning` box → `AssignTo` → `assign` → `edit_elsewhere`. Delete on a
 link wire → `Unlinking` box ("Remove the link to [[b]] from a?") →
 `Message::Unlink` → `unlink` (`links::remove_links`, `leads_to`) →
-`edit_elsewhere`. `edit_elsewhere` pushes a `history::Step` on
-`ws.elsewhere`, then `put_elsewhere` (`put_text` + `note_changed` +
-`refresh_links` + `rebuild_graph`). `undo` asks `ws.elsewhere` first (by the
-open note's fingerprint) → `undo_elsewhere`, which refuses if that note
-changed since. `App::open` clears `ws.elsewhere`.
+`edit_elsewhere` → `edit_files`, which pushes a `history::Step` on
+`ws.elsewhere`, then `put_files` (`put_text` + `note_changed` for each, then
+`refresh_links` + `rebuild_graph` once). `undo` asks `ws.elsewhere` first (by
+`open_fingerprint`) → `undo_elsewhere`, which refuses if a file changed since;
+otherwise `undo_open` (the open note's history), then `undo_joined` for a step
+joined to it. `App::open` clears `ws.elsewhere`.
 `@name` click → `follow_link("@name")` → `open_crew` (opens or creates
 `_crew/name.md`). Typing → `update_completion` → `Completion`; Tab
 (`live::Intent::Complete` / `SourceEvent::Complete`, or `Shortcut::Tab` if the

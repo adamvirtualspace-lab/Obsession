@@ -409,6 +409,13 @@ Set Status(dst, st, find: target, from: "- ")  @680,60
 - **Local:** in `## Functions` of a `_nodes.md`. Only that graph can use them.
 - **Saved:** in `_funct.md` (section 9). Every graph can use them.
 - If both have the same name, the local one wins, with a warning.
+- **Renaming:** edit the name at the top of the function editor and press
+  Enter. The app rewrites the `fn` line and every use: `- fn Name` in
+  `## Nodes`, `: Name(...)` on wires, `Name.pin` wire ends and the layout
+  line. A local function is renamed in its own graph only; a saved one in
+  `_funct.md` (its `## Name` heading too) and in every graph that uses it,
+  except a graph with a local function of the same name. A name another
+  function already has is refused. One Ctrl+Z undoes the whole rename.
 
 ### Types
 
@@ -556,6 +563,8 @@ Set Status(dst, s, find: target)
 ````
 
 - Names must be unique across `_funct.md`.
+- Renaming one from the function editor (section 8) renames its `## Name`
+  heading too, and every graph's wires that use it.
 - **Editing a saved function updates every wire that uses it.** To make a
   variant, use **Duplicate** in the function library and edit the copy.
 - The app creates `_funct.md` with these two functions the first time you open

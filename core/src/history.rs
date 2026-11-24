@@ -113,13 +113,24 @@ pub struct Elsewhere {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
-    pub rel: String,
-    pub before: String,
-    pub after: String,
-    /// [`fingerprint`] of the open note's text when it happened.
+    /// The notes it changed (one, or several for a function renamed in
+    /// `_funct.md` and the graphs that use it).
+    pub files: Vec<Change>,
+    /// [`fingerprint`] of the open note's text when it happened (before
+    /// the open note's own edit, for a joined step).
     pub open: u64,
     /// What it did, for the status line ("Removed the link to [[b]]").
     pub what: String,
+    /// Made together with an edit of the open note, right after this step:
+    /// undone right after that edit is undone, and redone right before it.
+    pub joined: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub rel: String,
+    pub before: String,
+    pub after: String,
 }
 
 /// A cheap fingerprint of a note's text.
@@ -149,6 +160,15 @@ impl Elsewhere {
         let step = self.undo.pop()?;
         self.redo.push(step.clone());
         Some(step)
+    }
+
+    /// The joined step to undo now that the open note's own edit was undone
+    /// (the open note is back at `open`).
+    pub fn undo_joined(&mut self, open: u64) -> Option<Step> {
+        if !self.undo.last()?.joined {
+            return None;
+        }
+        self.undo(open)
     }
 
     /// The step to redo now, under the same rule as [`Elsewhere::undo`].
@@ -222,11 +242,14 @@ mod tests {
 
     fn step(rel: &str, open: &str) -> Step {
         Step {
-            rel: rel.into(),
-            before: "x".into(),
-            after: "y".into(),
+            files: vec![Change {
+                rel: rel.into(),
+                before: "x".into(),
+                after: "y".into(),
+            }],
             open: fingerprint(open),
             what: String::new(),
+            joined: false,
         }
     }
 
@@ -237,7 +260,7 @@ mod tests {
         // The open note changed since: its own undo goes first.
         assert_eq!(e.undo(fingerprint("graph 2")), None);
         // Back at the text it had then: this step is next.
-        assert_eq!(e.undo(fingerprint("graph 1")).map(|s| s.rel), Some("a.md".into()));
+        assert_eq!(e.undo(fingerprint("graph 1")).map(|s| s.files[0].rel.clone()), Some("a.md".into()));
         assert_eq!(e.undo(fingerprint("graph 1")), None);
         // Redo follows the same rule.
         assert_eq!(e.redo(fingerprint("graph 0")), None);
@@ -248,5 +271,13 @@ mod tests {
         assert_eq!(e.redo(fingerprint("graph 1")), None);
         e.clear();
         assert_eq!(e.undo(fingerprint("graph 1")), None);
+
+        // A joined step waits for the open note's own edit to be undone,
+        // and a plain one isn't taken as joined.
+        e.push(step("c.md", "graph 1"));
+        assert_eq!(e.undo_joined(fingerprint("graph 1")), None);
+        e.push(Step { joined: true, ..step("d.md", "graph 1") });
+        assert_eq!(e.undo_joined(fingerprint("graph 2")), None);
+        assert!(e.undo_joined(fingerprint("graph 1")).is_some_and(|s| s.joined));
     }
 }

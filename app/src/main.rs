@@ -976,17 +976,39 @@ impl App {
     }
 
     fn undo(&mut self, redo: bool) -> Task<Message> {
-        // A change made from here to another note goes first when it's the
+        // A change made from here to other notes goes first when it's the
         // newest (the open note is as it was then).
-        if let Some(ws) = &mut self.workspace
-            && let Some(note) = &ws.note
+        if let Some(open) = self.open_fingerprint()
+            && let Some(ws) = &mut self.workspace
         {
-            let open = history::fingerprint(&note.text());
             let step = if redo { ws.elsewhere.redo(open) } else { ws.elsewhere.undo(open) };
             if let Some(step) = step {
-                return self.undo_elsewhere(&step, redo);
+                let (task, done) = self.undo_elsewhere(&step, redo);
+                if redo && done && step.joined {
+                    // Made with the open note's own edit: that comes next.
+                    return Task::batch([task, self.undo_open(true)]);
+                }
+                return task;
             }
         }
+        let task = self.undo_open(redo);
+        if !redo
+            && let Some(open) = self.open_fingerprint()
+            && let Some(step) = self.workspace.as_mut().and_then(|ws| ws.elsewhere.undo_joined(open))
+        {
+            let (more, _) = self.undo_elsewhere(&step, false);
+            return Task::batch([task, more]);
+        }
+        task
+    }
+
+    /// The open note's text, fingerprinted for `ws.elsewhere`.
+    fn open_fingerprint(&self) -> Option<u64> {
+        Some(history::fingerprint(&self.workspace.as_ref()?.note.as_ref()?.text()))
+    }
+
+    /// Undoes (or redoes) the open note's own last edit.
+    fn undo_open(&mut self, redo: bool) -> Task<Message> {
         let mode = self.mode;
         let Some(note) = self.note_mut() else {
             return Task::none();
@@ -1012,17 +1034,24 @@ impl App {
         }
     }
 
-    /// Undoes (or redoes) a change made to another note, if that note still
-    /// holds what the change left.
-    fn undo_elsewhere(&mut self, step: &history::Step, redo: bool) -> Task<Message> {
-        let (expect, put) = if redo { (&step.before, &step.after) } else { (&step.after, &step.before) };
-        let name = step.rel.trim_end_matches(".md");
-        if self.current_text(&step.rel).as_ref() != Some(expect) {
-            self.status = Some(format!("{name} changed since, so that can't be undone from here"));
-            return Task::none();
+    /// Undoes (or redoes) a change made to other notes, if they all still
+    /// hold what the change left. Says whether it did.
+    fn undo_elsewhere(&mut self, step: &history::Step, redo: bool) -> (Task<Message>, bool) {
+        for f in &step.files {
+            let expect = if redo { &f.before } else { &f.after };
+            if self.current_text(&f.rel).as_ref() != Some(expect) {
+                let name = f.rel.trim_end_matches(".md");
+                self.status = Some(format!("{name} changed since, so that can't be undone from here"));
+                return (Task::none(), false);
+            }
         }
         self.status = Some(format!("{}: {}", if redo { "Redone" } else { "Undone" }, step.what));
-        self.put_elsewhere(&step.rel, put)
+        let puts: Vec<(String, String)> = step
+            .files
+            .iter()
+            .map(|f| (f.rel.clone(), if redo { f.after.clone() } else { f.before.clone() }))
+            .collect();
+        (self.put_files(&puts), true)
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
@@ -1396,6 +1425,7 @@ impl App {
     fn refresh_editor(&mut self) {
         let Some(editor) = &self.editor else { return };
         let (name, origin, context) = (editor.name.clone(), editor.origin, editor.context.clone());
+        let was = editor.block.as_ref().map(|b| (b.open, b.close));
         let Some(ws) = &mut self.workspace else { return };
         let Some(note) = ws.note.as_ref().filter(|n| nodes::is_graph(&n.rel)) else {
             self.editor = None;
@@ -1407,7 +1437,21 @@ impl App {
             Origin::Local => &self.functions.local,
             Origin::Saved => &self.functions.saved,
         };
-        let block = pool.iter().find(|b| b.function.name.eq_ignore_ascii_case(&name)).cloned();
+        let block = pool.iter().find(|b| b.function.name.eq_ignore_ascii_case(&name)).cloned().or_else(|| {
+            // Renamed, or a rename undone: the block in the same place.
+            let (open, close) = was?;
+            pool.iter().find(|b| b.open == open && b.close == close).cloned()
+        });
+        if let Some(b) = &block
+            && b.function.name != name
+        {
+            // Its view follows the new name.
+            let file = match origin {
+                Origin::Saved => func::SAVED.to_owned(),
+                Origin::Local => graph_rel.to_string(),
+            };
+            ws.views.move_view(&views::function_key(&file, &name), &views::function_key(&file, &b.function.name));
+        }
         let parsed = nodes::parse(&graph_text);
         let (ins, outs) = block
             .as_ref()
@@ -1570,6 +1614,128 @@ impl App {
                 Context::Node => Task::none(),
             },
             Outcome::Duplicate => self.duplicate_function(&name, context),
+            Outcome::Rename(new) => self.rename_function(&new),
+        }
+    }
+
+    /// Why `new` can't be the name of the function `old` (from `origin`):
+    /// another function already has it where this one is used.
+    fn name_taken(&mut self, old: &str, new: &str, origin: Origin) -> Option<String> {
+        if new.eq_ignore_ascii_case(old) {
+            return None;
+        }
+        let has = |blocks: &[func::Block]| blocks.iter().any(|b| b.function.name.eq_ignore_ascii_case(new));
+        match origin {
+            Origin::Local => {
+                if has(&self.functions.local) {
+                    return Some(format!("This graph already has a function called {new}"));
+                }
+                if has(&self.functions.saved) {
+                    return Some(format!("_funct.md already has a function called {new}"));
+                }
+                None
+            }
+            Origin::Saved => {
+                if has(&self.functions.saved) {
+                    return Some(format!("_funct.md already has a function called {new}"));
+                }
+                // A graph's own function by that name would take its wires.
+                for rel in self.graph_rels() {
+                    if let Some(text) = self.current_text(&rel)
+                        && has(&func::local_blocks(&text))
+                    {
+                        return Some(format!("{} has its own function called {new}", rel.trim_end_matches(".md")));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Every graph file in the vault.
+    fn graph_rels(&self) -> Vec<String> {
+        self.workspace.as_ref().map_or_else(Vec::new, |ws| {
+            ws.vault
+                .entries
+                .iter()
+                .filter(|e| e.kind == Kind::Note && nodes::is_graph(&e.rel))
+                .map(|e| e.rel.to_string())
+                .collect()
+        })
+    }
+
+    /// Renames the function open in the editor, and every wire, node and
+    /// layout line that uses it: in this graph for a local function, in
+    /// every graph (except those with their own function by that name) for
+    /// a saved one. Undoable in one step.
+    fn rename_function(&mut self, new: &str) -> Task<Message> {
+        let Some(editor) = &self.editor else {
+            return Task::none();
+        };
+        let Some(block) = editor.block.clone() else {
+            return Task::none();
+        };
+        let origin = editor.origin;
+        let old = block.function.name.clone();
+        if let Some(why) = self.name_taken(&old, new, origin) {
+            self.status = Some(format!("⚠ {why}"));
+            return Task::none();
+        }
+        let Some(open) = self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).map(|n| (n.rel.to_string(), n.text())) else {
+            return Task::none();
+        };
+        let (open_rel, open_text) = open;
+        match origin {
+            Origin::Local => {
+                let task = self.edit_graph(
+                    |text| nodes::rename_function(&func::edit::rename(text, &block, new, false), &old, new),
+                    true,
+                );
+                self.status = Some(format!("Renamed {old} to {new} in this graph"));
+                task
+            }
+            Origin::Saved => {
+                let Some(saved) = self.current_text(func::SAVED) else {
+                    self.status = Some("⚠ Couldn't read _funct.md".into());
+                    return Task::none();
+                };
+                let mut files = vec![history::Change {
+                    rel: func::SAVED.to_owned(),
+                    after: func::edit::rename(&saved, &block, new, true),
+                    before: saved,
+                }];
+                let own = |text: &str| func::local_blocks(text).iter().any(|b| b.function.name.eq_ignore_ascii_case(&old));
+                for rel in self.graph_rels() {
+                    if rel == open_rel {
+                        continue;
+                    }
+                    let Some(text) = self.current_text(&rel) else { continue };
+                    if own(&text) {
+                        continue;
+                    }
+                    let after = nodes::rename_function(&text, &old, new);
+                    if after != text {
+                        files.push(history::Change { rel, before: text, after });
+                    }
+                }
+                let open_after = if own(&open_text) { open_text.clone() } else { nodes::rename_function(&open_text, &old, new) };
+                let joined = open_after != open_text;
+                let graphs = files.len() - 1 + usize::from(joined);
+                let what = format!(
+                    "Renamed {old} to {new} in _funct.md{}",
+                    match graphs {
+                        0 => String::new(),
+                        1 => " and 1 graph".to_owned(),
+                        n => format!(" and {n} graphs"),
+                    }
+                );
+                let task = self.edit_files(files, what, joined);
+                if !joined {
+                    return task;
+                }
+                let graph = self.edit_graph(|_| open_after, true);
+                Task::batch([task, graph])
+            }
         }
     }
 
@@ -2960,30 +3126,46 @@ impl App {
     /// Changes a note other than the open one from the open note's view
     /// (the graph): saved at once, and undoable from here with Ctrl+Z.
     fn edit_elsewhere(&mut self, rel: &str, before: &str, after: &str, what: String) -> Task<Message> {
-        if let Some(ws) = &mut self.workspace
-            && let Some(note) = &ws.note
-            && &*note.rel != rel
-        {
-            let open = history::fingerprint(&note.text());
+        let change = history::Change {
+            rel: rel.to_owned(),
+            before: before.to_owned(),
+            after: after.to_owned(),
+        };
+        self.edit_files(vec![change], what, false)
+    }
+
+    /// Changes notes other than the open one as one undo step. `joined`:
+    /// an edit of the open note follows, and undoes with it.
+    fn edit_files(&mut self, files: Vec<history::Change>, what: String, joined: bool) -> Task<Message> {
+        let open = self.open_fingerprint();
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let open_rel = ws.note.as_ref().map(|n| n.rel.to_string());
+        let files: Vec<history::Change> = files.into_iter().filter(|f| Some(&f.rel) != open_rel.as_ref()).collect();
+        let puts: Vec<(String, String)> = files.iter().map(|f| (f.rel.clone(), f.after.clone())).collect();
+        if let Some(open) = open {
             ws.elsewhere.push(history::Step {
-                rel: rel.to_owned(),
-                before: before.to_owned(),
-                after: after.to_owned(),
+                files,
                 open,
                 what: what.clone(),
+                joined,
             });
         }
         self.status = Some(what);
-        self.put_elsewhere(rel, after)
+        self.put_files(&puts)
     }
 
-    /// Puts text in another note and brings what depends on it up to date.
-    fn put_elsewhere(&mut self, rel: &str, text: &str) -> Task<Message> {
-        let save = self.put_text(rel, text);
-        let runs = self.note_changed(rel);
+    /// Puts text in other notes and brings what depends on them up to date.
+    fn put_files(&mut self, files: &[(String, String)]) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for (rel, text) in files {
+            tasks.push(self.put_text(rel, text));
+            tasks.push(self.note_changed(rel));
+        }
         self.refresh_links();
         self.rebuild_graph();
-        Task::batch([save, runs])
+        Task::batch(tasks)
     }
 
     /// How many links in `source` lead to the note `target`.

@@ -125,6 +125,16 @@ impl Views {
         self.dirty |= self.map.len() != before;
     }
 
+    /// A function was renamed: its view follows it.
+    pub fn move_view(&mut self, from: &str, to: &str) {
+        if from != to
+            && let Some(view) = self.map.remove(from)
+        {
+            self.map.insert(to.to_owned(), view);
+            self.dirty = true;
+        }
+    }
+
     /// A note was renamed: its views follow it.
     pub fn rename(&mut self, old: &str, new: &str) {
         let moved: Vec<String> = self.map.keys().filter(|k| key_file(k) == old).cloned().collect();

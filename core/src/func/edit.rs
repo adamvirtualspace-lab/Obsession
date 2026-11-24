@@ -232,6 +232,37 @@ pub fn new_block(name: &str) -> Vec<String> {
     ]
 }
 
+/// Renames a function where it's defined: its `fn` line, and with
+/// `heading`, the heading just above its block when it carries the old name
+/// (`## Wait For Done` in `_funct.md`). Uses elsewhere are
+/// `nodes::rename_function`'s.
+pub fn rename(text: &str, block: &Block, new: &str, heading: bool) -> String {
+    let mut lines = Lines::new(text);
+    let old = block.function.name.clone();
+    let end = block.close.min(lines.lines.len());
+    if let Some(i) = (block.open + 1..end).find(|&i| lines.lines[i].trim_start().starts_with("fn ")) {
+        let (indent, _, comment) = parts(&lines.lines[i]);
+        lines.lines[i] = format!("{indent}fn {new}{comment}");
+    }
+    if heading {
+        // The nearest heading above, unless a fence comes first.
+        for i in (0..block.open.min(lines.lines.len())).rev() {
+            let t = lines.lines[i].trim_start();
+            if t.starts_with("```") || t.starts_with("~~~") {
+                break;
+            }
+            if let Some((level, title)) = crate::nodes::heading(&lines.lines[i]) {
+                if title.eq_ignore_ascii_case(old.trim()) {
+                    let indent = &lines.lines[i][..lines.lines[i].len() - t.len()];
+                    lines.lines[i] = format!("{indent}{} {new}", "#".repeat(level));
+                }
+                break;
+            }
+        }
+    }
+    lines.join()
+}
+
 /// The text after ` : ` on a wire for this call.
 pub fn wire_call(name: &str, args: &[Arg]) -> String {
     if args.is_empty() { name.to_owned() } else { write_call(name, args) }
@@ -284,5 +315,23 @@ mod tests {
 
         let with_param = add_header(FILE, b, &param_line("done", &Literal::Text("x".into())));
         assert!(with_param.contains("out dst: File\r\nparam done = \"x\"\r\n\r\n"));
+    }
+
+    #[test]
+    fn renames_where_its_defined() {
+        let b = &blocks(FILE)[0];
+        // In a graph: only the `fn` line (the heading is `## Functions`).
+        assert_eq!(rename(FILE, b, "Wait Longer", true), FILE.replace("fn Wait\r\n", "fn Wait Longer\r\n"));
+        // In `_funct.md`: its own heading too, but not another one's.
+        let saved = "# Functions\n\n## Wait\nWaits.\n\n```obsession\n  fn Wait   // the first\nin a: File\n```\n\n## Copy\n```obsession\nfn Copy\n```\n";
+        let blocks = blocks(saved);
+        assert_eq!(
+            rename(saved, &blocks[0], "Hold", true),
+            saved.replace("## Wait\n", "## Hold\n").replace("  fn Wait   // the first", "  fn Hold   // the first")
+        );
+        assert_eq!(rename(saved, &blocks[0], "Hold", false), saved.replace("fn Wait ", "fn Hold "));
+        // A heading with another name stays.
+        let other = saved.replace("## Wait\n", "## Waiting\n");
+        assert_eq!(rename(&other, &blocks[0], "Hold", true), other.replace("fn Wait ", "fn Hold "));
     }
 }

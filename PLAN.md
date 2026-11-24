@@ -399,8 +399,8 @@ Known limits, for later:
 
 - Edits to a saved function in `_funct.md` are saved straight away but aren't
   in Ctrl+Z (only the open note has undo history). → Milestone 9.
-- Renaming a function (its `fn` line) doesn't update the wires that use it.
-  → Milestone 9.
+- ~~Renaming a function (its `fn` line) doesn't update the wires that use
+  it.~~ Done in milestone 9, item 5: rename from the editor's title.
 - The editor's view and the inputs node's place aren't saved. The view is
   done in milestone 9, item 2; the inputs node's place stays for later.
 - An `id` can't be renamed from the editor (edit the text).
@@ -784,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (4 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (5 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -888,6 +888,33 @@ In this order:
    local function, in every graph for a saved one. A name already taken is
    refused with a sentence saying so. (`nodes::rename_function(text, old,
    new)` in core with tests, then `main.rs`)
+   ✅ **Done (November 2026).** The editor's title is a text field that looks
+   like the title until hovered or clicked; while it differs, a line below
+   says "Enter renames it, and every wire and node that uses it". An empty
+   name, or one with `( ) . : [ ]`, is refused in the panel. Core:
+   `func::edit::rename(text, block, new, heading)` rewrites the block's own
+   `fn` line (indent and comment kept) and, in `_funct.md`, the `## Name`
+   heading just above it when it carries the old name;
+   `nodes::rename_function(text, old, new)` rewrites `- fn Old`, the call on
+   a wire (arguments kept), `Old.pin` ends and the `fn Old x,y` layout line,
+   matching names without case and keeping the spacing. A local function is
+   renamed in its graph only: one edit, undone like any other. A saved one
+   is renamed in `_funct.md` and in every graph that uses it, except a graph
+   with its own function of that name (its wires mean that one). Taken names
+   are refused in the status line: "This graph already has a function called
+   X", "_funct.md already has …" or "fx/water_nodes has its own function
+   called X"; a change of case alone is allowed. Undo: an `Elsewhere` step
+   now holds several files, and a `joined` step goes with the open graph's
+   own edit, so one Ctrl+Z (or Ctrl+Y) takes the whole rename. The editor
+   follows its function through a rename and its undo (`refresh_editor`
+   falls back to the block at the same lines), and the function's saved view
+   moves with it (`Views::move_view`). Checked by hand: *Wait For Done*
+   renamed in `_funct.md` (fn line and heading) and two graphs, one Ctrl+Z
+   back byte for byte in all three, Ctrl+Y; the local *Check Lighting*
+   renamed in its node, three pin ends, block and layout line, the card
+   staying in place with its wires, then undone and redone; "Copy Status"
+   refused with nothing written. Idle: 0 ms CPU, 0 bytes written over 10 s.
+   Core tests: 97 (2 new).
 6. **Function edits undo.** Ctrl+Z in the function editor undoes its last edit
    wherever the function lives, `_funct.md` included (today only the open
    note has history). (`main.rs`, `history.rs`)
