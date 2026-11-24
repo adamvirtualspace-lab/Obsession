@@ -336,6 +336,9 @@ both files are nodes in the open graph.
 - Adding a function to it writes a wire line into `## Wires`. The link in the
   note stays where it is.
 - Deleting it in the graph asks whether to also remove the link from the note.
+  Removing keeps the link's words: `[[b|the shot]]` becomes `the shot`,
+  `[[b]]` becomes `b`, `[[b#Notes]]` becomes `b > Notes`. Every link in that
+  note leading to the same note goes, so the wire does too.
 - A toggle in the graph hides link wires.
 
 ### Layout

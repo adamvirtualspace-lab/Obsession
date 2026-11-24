@@ -41,6 +41,7 @@ use obsession_core::func::eval::Bind;
 use obsession_core::nodes::{self, End, Section};
 use obsession_core::runner::{self, Change, Index, Outcome};
 use obsession_core::views::{self, Views};
+use obsession_core::history::{self, Elsewhere};
 use obsession_core::store::Outside;
 
 use crate::highlight::LinkStates;
@@ -87,6 +88,8 @@ enum Message {
     SearchBuilt(PathBuf, Built),
     /// From the "assign to which task" box: (node card, task row), or close.
     AssignTo(Option<(usize, usize)>),
+    /// From "Remove the link?": remove it, or keep it.
+    Unlink(bool),
     /// Pick a note to add to the open graph.
     AddNode,
     /// Pick a function to add to the open graph as a node.
@@ -172,6 +175,9 @@ struct Workspace {
     /// Where each graph and function was last looked at
     /// (`.obsessed/views.txt`), written on leaving a graph and on close.
     views: Views,
+    /// Undo for what the open note's view changed in other notes (a link
+    /// removed from the graph, a crew card dropped on a task).
+    elsewhere: Elsewhere,
     /// The crew, by name: cards in the crew folder, and people's folders.
     crew: Vec<Member>,
     /// Open `@mentions` per person across the vault.
@@ -316,6 +322,8 @@ struct App {
     show_hand: bool,
     /// A crew card dropped on a node: choosing which task.
     assigning: Option<Assigning>,
+    /// "Remove the link to [[b]] from a?", asked before a link wire goes.
+    unlinking: Option<Unlinking>,
     /// The Settings page, while open.
     settings: Option<SettingsForm>,
     /// Vault search, while open.
@@ -351,6 +359,14 @@ pub enum SettingsMessage {
     Compact(bool),
     Save,
     Close,
+}
+
+/// A link wire about to be removed: the links in `source` that lead to
+/// `target`.
+struct Unlinking {
+    source: Box<str>,
+    target: Box<str>,
+    count: usize,
 }
 
 struct Assigning {
@@ -413,6 +429,7 @@ impl App {
             completion: None,
             show_hand: true,
             assigning: None,
+            unlinking: None,
             settings: None,
             find: None,
         };
@@ -532,6 +549,7 @@ impl App {
                     search_building: false,
                     crew_folder: crew::FOLDER.to_owned(),
                     views: Views::load(&root_for_views),
+                    elsewhere: Elsewhere::default(),
                     crew: Vec::new(),
                     mentions: HashMap::new(),
                 };
@@ -610,6 +628,10 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Unlink(remove) => match self.unlinking.take() {
+                Some(u) if remove => self.unlink(&u),
+                _ => Task::none(),
+            },
             Message::AssignTo(None) => {
                 self.assigning = None;
                 Task::none()
@@ -954,6 +976,17 @@ impl App {
     }
 
     fn undo(&mut self, redo: bool) -> Task<Message> {
+        // A change made from here to another note goes first when it's the
+        // newest (the open note is as it was then).
+        if let Some(ws) = &mut self.workspace
+            && let Some(note) = &ws.note
+        {
+            let open = history::fingerprint(&note.text());
+            let step = if redo { ws.elsewhere.redo(open) } else { ws.elsewhere.undo(open) };
+            if let Some(step) = step {
+                return self.undo_elsewhere(&step, redo);
+            }
+        }
         let mode = self.mode;
         let Some(note) = self.note_mut() else {
             return Task::none();
@@ -979,6 +1012,19 @@ impl App {
         }
     }
 
+    /// Undoes (or redoes) a change made to another note, if that note still
+    /// holds what the change left.
+    fn undo_elsewhere(&mut self, step: &history::Step, redo: bool) -> Task<Message> {
+        let (expect, put) = if redo { (&step.before, &step.after) } else { (&step.after, &step.before) };
+        let name = step.rel.trim_end_matches(".md");
+        if self.current_text(&step.rel).as_ref() != Some(expect) {
+            self.status = Some(format!("{name} changed since, so that can't be undone from here"));
+            return Task::none();
+        }
+        self.status = Some(format!("{}: {}", if redo { "Redone" } else { "Undone" }, step.what));
+        self.put_elsewhere(&step.rel, put)
+    }
+
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
         if self.menu.take().is_some() && matches!(shortcut, Shortcut::Escape) {
             return Task::none();
@@ -989,6 +1035,10 @@ impl App {
         }
         if self.settings.is_some() && matches!(shortcut, Shortcut::Escape) {
             self.settings = None;
+            return Task::none();
+        }
+        if self.unlinking.is_some() && matches!(shortcut, Shortcut::Escape) {
+            self.unlinking = None;
             return Task::none();
         }
         if self.assigning.is_some() && matches!(shortcut, Shortcut::Escape) {
@@ -1959,10 +2009,17 @@ impl App {
                 match w.line {
                     Some(line) => self.edit_graph(|text| nodes::remove_lines(text, &[line]), true),
                     None => {
-                        let note = graph.cards[w.to].title.clone();
-                        self.status = Some(format!(
-                            "That wire is a [[link]] in {note}; remove the link there, or hide link wires"
-                        ));
+                        // A link wire: from the linked note to the note
+                        // with the link.
+                        let (Some(source), Some(target)) =
+                            (graph.cards[w.to].rel.clone(), graph.cards[w.from].rel.clone())
+                        else {
+                            return Task::none();
+                        };
+                        let count = self.links_to(&source, &target);
+                        if count > 0 {
+                            self.unlinking = Some(Unlinking { source, target, count });
+                        }
                         Task::none()
                     }
                 }
@@ -2011,6 +2068,8 @@ impl App {
         if let Some(old) = ws.note.take() {
             ws.store.unpin(&old.rel);
         }
+        // Its undo steps belong to the note that was open.
+        ws.elsewhere.clear();
         match ws.store.pin(&rel).and_then(|()| ws.store.get(&rel).map(str::to_owned)) {
             Ok(text) => {
                 ws.tree.reveal(&ws.vault, &rel);
@@ -2894,12 +2953,73 @@ impl App {
         };
         lines[line] = &new;
         let changed = lines.join("\n");
-        let save = self.put_text(&rel, &changed);
-        self.status = Some(format!("Added @{member} to “{title}” in {}", rel.trim_end_matches(".md")));
-        let runs = self.note_changed(&rel);
+        let what = format!("Added @{member} to “{title}” in {}", rel.trim_end_matches(".md"));
+        self.edit_elsewhere(&rel, &text, &changed, what)
+    }
+
+    /// Changes a note other than the open one from the open note's view
+    /// (the graph): saved at once, and undoable from here with Ctrl+Z.
+    fn edit_elsewhere(&mut self, rel: &str, before: &str, after: &str, what: String) -> Task<Message> {
+        if let Some(ws) = &mut self.workspace
+            && let Some(note) = &ws.note
+            && &*note.rel != rel
+        {
+            let open = history::fingerprint(&note.text());
+            ws.elsewhere.push(history::Step {
+                rel: rel.to_owned(),
+                before: before.to_owned(),
+                after: after.to_owned(),
+                open,
+                what: what.clone(),
+            });
+        }
+        self.status = Some(what);
+        self.put_elsewhere(rel, after)
+    }
+
+    /// Puts text in another note and brings what depends on it up to date.
+    fn put_elsewhere(&mut self, rel: &str, text: &str) -> Task<Message> {
+        let save = self.put_text(rel, text);
+        let runs = self.note_changed(rel);
         self.refresh_links();
         self.rebuild_graph();
         Task::batch([save, runs])
+    }
+
+    /// How many links in `source` lead to the note `target`.
+    fn links_to(&mut self, source: &str, target: &str) -> usize {
+        let Some(text) = self.current_text(source) else {
+            return 0;
+        };
+        let Some(ws) = &self.workspace else {
+            return 0;
+        };
+        links::links(&text)
+            .iter()
+            .filter(|l| leads_to(&ws.vault, source, l, target))
+            .count()
+    }
+
+    /// Removes the links in `u.source` that lead to `u.target`, keeping
+    /// their words.
+    fn unlink(&mut self, u: &Unlinking) -> Task<Message> {
+        let Some(text) = self.current_text(&u.source) else {
+            return Task::none();
+        };
+        let Some(ws) = &self.workspace else {
+            return Task::none();
+        };
+        let Some((new, count)) = links::remove_links(&text, |l| leads_to(&ws.vault, &u.source, l, &u.target)) else {
+            self.status = Some("That link is gone already".into());
+            return Task::none();
+        };
+        let what = format!(
+            "Removed {} to [[{}]] from {}",
+            if count == 1 { "the link".to_owned() } else { format!("{count} links") },
+            u.target.trim_end_matches(".md"),
+            u.source.trim_end_matches(".md"),
+        );
+        self.edit_elsewhere(&u.source, &text, &new, what)
     }
 
     /// A click on `@name`: open their crew card, or create it.
@@ -3236,6 +3356,36 @@ impl App {
         if let (Some(find), Some(ws)) = (&self.find, &self.workspace) {
             return stack![main, find.view(ws.search.is_some()).map(Message::Find)].into();
         }
+        if let Some(u) = &self.unlinking {
+            let links = if u.count == 1 { "the link".to_owned() } else { format!("the {} links", u.count) };
+            let question = format!(
+                "Remove {links} to [[{}]] from {}?",
+                u.target.trim_end_matches(".md"),
+                u.source.trim_end_matches(".md")
+            );
+            let buttons = row![
+                Space::new().width(Fill),
+                button(text("Cancel").size(theme::SMALL)).padding([5, 12]).style(theme::tool(false)).on_press(Message::Unlink(false)),
+                button(text("Remove").size(theme::SMALL)).padding([5, 12]).style(theme::tool(true)).on_press(Message::Unlink(true)),
+            ]
+            .spacing(8);
+            let body = column![
+                text(question).size(theme::TEXT_SIZE).color(theme::HEADING),
+                text("The words stay; only the link goes. Ctrl+Z puts it back.").size(theme::SMALL).color(theme::FAINT),
+                buttons,
+            ]
+            .spacing(10);
+            let popup = container(body).padding(16).width(iced::Length::Fixed(460.0)).style(theme::popup);
+            let backdrop = iced::widget::mouse_area(
+                container(iced::widget::opaque(popup))
+                    .padding(iced::Padding::new(0.0).top(120.0))
+                    .center_x(Fill)
+                    .height(Fill)
+                    .style(theme::backdrop),
+            )
+            .on_press(Message::Unlink(false));
+            return stack![main, iced::widget::opaque(backdrop)].into();
+        }
         if let Some(a) = &self.assigning {
             let mut list = column![
                 text(format!("Give @{} which task in {}?", a.member, a.title)).size(theme::TEXT_SIZE).color(theme::HEADING)
@@ -3559,4 +3709,9 @@ fn shortcut_from_event(
         Key::Named(Named::Tab) if !modifiers.shift() && !modifiers.alt() => Some(Shortcut::Tab),
         _ => None,
     }
+}
+
+/// Whether `link`, written in `source`, leads to the note `target`.
+fn leads_to(vault: &Vault, source: &str, link: &links::Link, target: &str) -> bool {
+    !link.target.is_empty() && vault.resolve_from(&link.target, Some(source)).entry().is_some_and(|e| &*e.rel == target)
 }

@@ -97,6 +97,76 @@ impl History {
     }
 }
 
+/// Undo for changes the app makes to notes other than the open one, such
+/// as removing a link from the graph or dropping a crew card on a task.
+///
+/// Each step keeps that note's text before and after, plus a fingerprint
+/// of the open note's text when it happened. A step is undone (or redone)
+/// only while the open note is back at that same text, so Ctrl+Z takes the
+/// open note's own edits and these steps in the order they were made. The
+/// app clears it when another note opens.
+#[derive(Debug, Default)]
+pub struct Elsewhere {
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub rel: String,
+    pub before: String,
+    pub after: String,
+    /// [`fingerprint`] of the open note's text when it happened.
+    pub open: u64,
+    /// What it did, for the status line ("Removed the link to [[b]]").
+    pub what: String,
+}
+
+/// A cheap fingerprint of a note's text.
+pub fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+impl Elsewhere {
+    /// A new change: it can be undone, and nothing undone can be redone.
+    pub fn push(&mut self, step: Step) {
+        self.redo.clear();
+        self.undo.push(step);
+        if self.undo.len() > MAX_STEPS {
+            self.undo.remove(0);
+        }
+    }
+
+    /// The step to undo now, if the open note's text (fingerprinted as
+    /// `open`) is what it was when the newest step was made.
+    pub fn undo(&mut self, open: u64) -> Option<Step> {
+        if self.undo.last()?.open != open {
+            return None;
+        }
+        let step = self.undo.pop()?;
+        self.redo.push(step.clone());
+        Some(step)
+    }
+
+    /// The step to redo now, under the same rule as [`Elsewhere::undo`].
+    pub fn redo(&mut self, open: u64) -> Option<Step> {
+        if self.redo.last()?.open != open {
+            return None;
+        }
+        let step = self.redo.pop()?;
+        self.undo.push(step.clone());
+        Some(step)
+    }
+
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +218,35 @@ mod tests {
         assert!(h.before_edit(EditKind::Other, 0, Instant::now()));
         h.push(snap("a"));
         assert!(h.redo(snap("c")).is_none());
+    }
+
+    fn step(rel: &str, open: &str) -> Step {
+        Step {
+            rel: rel.into(),
+            before: "x".into(),
+            after: "y".into(),
+            open: fingerprint(open),
+            what: String::new(),
+        }
+    }
+
+    #[test]
+    fn elsewhere_waits_for_the_open_note() {
+        let mut e = Elsewhere::default();
+        e.push(step("a.md", "graph 1"));
+        // The open note changed since: its own undo goes first.
+        assert_eq!(e.undo(fingerprint("graph 2")), None);
+        // Back at the text it had then: this step is next.
+        assert_eq!(e.undo(fingerprint("graph 1")).map(|s| s.rel), Some("a.md".into()));
+        assert_eq!(e.undo(fingerprint("graph 1")), None);
+        // Redo follows the same rule.
+        assert_eq!(e.redo(fingerprint("graph 0")), None);
+        assert!(e.redo(fingerprint("graph 1")).is_some());
+        // A new change drops what could be redone.
+        e.undo(fingerprint("graph 1"));
+        e.push(step("b.md", "graph 1"));
+        assert_eq!(e.redo(fingerprint("graph 1")), None);
+        e.clear();
+        assert_eq!(e.undo(fingerprint("graph 1")), None);
     }
 }

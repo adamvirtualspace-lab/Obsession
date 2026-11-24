@@ -57,7 +57,9 @@ button) to pan, scroll to zoom (each graph, and each function in the editor,
 opens where you left it), drag a card to move it, double-click a card to
 open its note. Drag from the dot on a card's right edge to another card to add
 a wire; select a card or wire and press Delete to remove it from the graph
-(the note itself stays). The graph's own buttons sit in a small bar in its
+(the note itself stays). Deleting a link wire asks first, then turns the
+links back into plain words in the note (`[[b|the shot]]` becomes `the shot`).
+Ctrl+Z in the graph also undoes that, and a crew card dropped on a task. The graph's own buttons sit in a small bar in its
 top-left corner: **+ Node** adds a note, **+ Function** a function node,
 **Crew** shows or hides the crew, and `[[links]]` between cards show
 as fainter wires (**Link wires** hides them). A wire to a task or a heading

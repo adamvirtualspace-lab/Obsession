@@ -311,6 +311,53 @@ pub fn task_at(text: &str, sub: &str, tasks: &[usize]) -> Option<usize> {
     tasks.iter().position(|&t| t > line && t < end)
 }
 
+/// What a link reads as once it's plain text: its alias or label, or else
+/// the note, with a heading as `note > Heading` (a `^block` id is dropped).
+pub fn link_words(link: &Link) -> String {
+    if let Some(label) = link.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+        return label.to_owned();
+    }
+    match link.sub.as_deref().map(str::trim) {
+        Some(sub) if !sub.starts_with('^') && !sub.is_empty() => {
+            let sub = sub.replace('#', " > ");
+            if link.target.is_empty() { sub } else { format!("{} > {sub}", link.target) }
+        }
+        _ => link.target.clone(),
+    }
+}
+
+/// Turns the links `pick` chooses back into plain text, keeping their words
+/// (`[[b|the shot]]` becomes `the shot`, `[[b]]` becomes `b`). Returns the
+/// new text and how many links went, or `None` when none did.
+pub fn remove_links(text: &str, mut pick: impl FnMut(&Link) -> bool) -> Option<(String, usize)> {
+    let mut by_line: HashMap<usize, Vec<(Range<usize>, String)>> = HashMap::new();
+    let mut count = 0;
+    for link in links(text) {
+        if pick(&link) {
+            by_line.entry(link.line).or_default().push((link.range.clone(), link_words(&link)));
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let Some(cuts) = by_line.get_mut(&index) else {
+            out.push(line.to_owned());
+            continue;
+        };
+        // Right to left, so earlier ranges stay put.
+        cuts.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+        let mut line = line.to_owned();
+        for (range, words) in cuts.iter() {
+            line.replace_range(range.clone(), words);
+        }
+        out.push(line);
+    }
+    Some((out.join("\n"), count))
+}
+
 /// The state of every link in `text` (a note at `rel`), keyed by
 /// [`dest_key`]. Links to the note's own headings use `own`.
 pub fn link_states(
@@ -891,6 +938,19 @@ mod tests {
         assert_eq!(o.find("^INTRO"), Some(1));
         assert_eq!(o.find("Indented"), Some(6));
         assert_eq!(o.find("not a heading"), None);
+    }
+
+    #[test]
+    fn removing_links_keeps_their_words() {
+        let text = "# A\r\nSee [[b|the shot]] and [[B]] then [[c]].\r\n- [ ] wait on [[b#Notes]] ^t1\r\n![[b]] [x](b.md) [[b#^t2]]\r\n`[[b]]` stays";
+        let (out, n) = remove_links(text, |l| l.target.eq_ignore_ascii_case("b") || l.target == "b.md").unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(
+            out,
+            "# A\r\nSee the shot and B then [[c]].\r\n- [ ] wait on b > Notes ^t1\r\nb x b\r\n`[[b]]` stays"
+        );
+        // Nothing picked: no change.
+        assert_eq!(remove_links(text, |l| l.target == "zzz"), None);
     }
 
     #[test]

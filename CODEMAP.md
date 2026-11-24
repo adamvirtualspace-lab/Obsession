@@ -34,11 +34,11 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `store.rs` | 520 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
-| `history.rs` | 150 | `History`: undo/redo snapshots, grouped, capped at 8 MB. |
+| `history.rs` | 252 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step` + `fingerprint`: undo for changes made from the open note's view to other notes, taken only while the open note's text matches its fingerprint from then. |
 | `syntax.rs` | 380 | Line tokenizer for highlighting: `scan_line(LineState, line)`, `LineState::{Start, Normal, Frontmatter, Fence, Comment}`, `can_hold_task`. Used by everything that must skip code and frontmatter. |
 | `status.rs` | 440 | Tasks and status formats: `task_box(line)`, `tasks(text)` → `(line, byte of [, char)`, `Format` (`builtin`, `index_of`, `get`, `next`, `is_finished`), `from_frontmatter`, `resolve(note, team)`. |
 | `live.rs` | 910 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s with raw-byte mapping, `table_cells`, `trailing_block_id`. |
-| `links.rs` | 961 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `build_cached` + `to_cache` + `save_cache` (`.obsessed/cache/links.txt`), `stamp`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `link_states`, `rewrite_links` for renames, `task_at(text, sub, task_lines)` (which task a `#^block` / `#heading` link points at, for wires that end at a row). |
+| `links.rs` | 1021 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `build_cached` + `to_cache` + `save_cache` (`.obsessed/cache/links.txt`), `stamp`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `link_states`, `rewrite_links` for renames, `remove_links(text, pick)` + `link_words` (unlinking keeps the words), `task_at(text, sub, task_lines)` (which task a `#^block` / `#heading` link points at, for wires that end at a row). |
 | `preview.rs` | 430 | Obsidian → plain markdown (unused by the app now; kept for export). |
 | `fuzzy.rs` | 70 | `score(query, candidate)` for the quick switcher. |
 | `search.rs` | 230 | Vault search: `SearchIndex::build(root, notes)`, `update`, `remove`, `query(words, limit)` → `Results { hits: Vec<Hit { rel, line, text, ranges }>, total, notes }`. |
@@ -58,7 +58,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3500 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 3717 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
@@ -137,7 +137,14 @@ Files created or deleted → `Vault::scan` → `Message::VaultRefreshed`.
 `crew::set_frontmatter` through `put_text`. `refresh_links` marks `@names` without a card in the link states and
 refreshes `ws.mentions` (vault-wide open counts). `rebuild_graph` →
 `Graph::set_crew`. Hand drop → `graph::Message::Assign` → `assign` (a row) or
-the `Assigning` box → `AssignTo` → `assign` → `put_text` + `note_changed`.
+the `Assigning` box → `AssignTo` → `assign` → `edit_elsewhere`. Delete on a
+link wire → `Unlinking` box ("Remove the link to [[b]] from a?") →
+`Message::Unlink` → `unlink` (`links::remove_links`, `leads_to`) →
+`edit_elsewhere`. `edit_elsewhere` pushes a `history::Step` on
+`ws.elsewhere`, then `put_elsewhere` (`put_text` + `note_changed` +
+`refresh_links` + `rebuild_graph`). `undo` asks `ws.elsewhere` first (by the
+open note's fingerprint) → `undo_elsewhere`, which refuses if that note
+changed since. `App::open` clears `ws.elsewhere`.
 `@name` click → `follow_link("@name")` → `open_crew` (opens or creates
 `_crew/name.md`). Typing → `update_completion` → `Completion`; Tab
 (`live::Intent::Complete` / `SourceEvent::Complete`, or `Shortcut::Tab` if the

@@ -358,9 +358,9 @@ Known limits, for later:
   row.~~ Done in milestone 9, item 3.
 - ~~The view isn't saved: a graph opens fitted to the window.~~ Done in
   milestone 9, item 2.
-- Link wires can't be removed from the graph yet (Syntax.md wants it to ask
-  whether to remove the link from the note); Delete says where the link is.
-  → Milestone 9.
+- ~~Link wires can't be removed from the graph yet (Syntax.md wants it to ask
+  whether to remove the link from the note); Delete says where the link is.~~
+  Done in milestone 9, item 4.
 - The card look is a first pass, to be matched to the Possess mockup.
 
 ### Function editor (milestone 5)
@@ -784,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (3 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (4 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -863,6 +863,25 @@ In this order:
    keeps the link's words: `[[b|the shot]]` becomes `the shot`, `[[b]]`
    becomes `b`. Undoable like any edit. (`links::remove_link(text, line,
    target)` in core with tests, then `main.rs`)
+   ✅ **Done (November 2026).** Delete on a link wire opens "Remove the link
+   to [[comp/sh040]] from fx/sh040-water?" (or "the 2 links" when the note
+   links there more than once) with Cancel / Remove; Escape or a click
+   outside keeps it. Remove takes out every link in that note that leads to
+   the card's note, keeping its words: `links::remove_links(text, pick)`
+   with `link_words` (alias or label, else the note, `b > Heading` for a
+   heading, a `^block` dropped). Undo: the other note isn't open, so it has
+   no editor history; `history::Elsewhere` keeps each such change (that
+   note's text before and after) with a fingerprint of the open note's text
+   at the time, and Ctrl+Z takes it only while the open note is back at
+   that text, so it and the graph's own edits undo in the order they were
+   made. Undo refuses, with a message, when the other note changed since.
+   Steps are dropped when another note opens. The crew drop (`assign`) now
+   goes through the same path, so it undoes too. Checked by hand: the
+   dialog's count, Escape, Remove (the FX note read "Waiting on comp/sh040 >
+   Grade. Ask the comp team too."), Ctrl+Z (byte for byte back), Ctrl+Y,
+   a card move after it undoing first, the crew drop's undo, and the refusal
+   after an outside edit. Idle: 0 ms CPU, 0 bytes written over 10 s. Core
+   tests: 95 (2 new).
 5. **Renaming a function reaches its wires.** The function editor's title
    becomes editable. Renaming rewrites the `fn` line and every wire, `fn Name`
    node, `Name.pin` end and layout line that uses it: in its own graph for a
