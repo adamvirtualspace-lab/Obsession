@@ -14,9 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use iced::futures::{SinkExt, StreamExt};
 use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Element, Fill, Subscription};
+use iced::{Element, Fill};
 
 use obsession_core::log::{self, Kind, Record};
 use obsession_core::runner::Index;
@@ -198,61 +197,6 @@ impl Runs {
         .style(theme::panel)
         .into()
     }
-}
-
-/// Watches the vault folder. Events arrive in small batches.
-pub fn watch(root: PathBuf) -> Subscription<Vec<FsEvent>> {
-    Subscription::run_with(root, |root| {
-        let root = root.clone();
-        iced::stream::channel(16, async move |mut output| {
-            use notify::{EventKind, RecursiveMode, Watcher};
-            let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<notify::Event>();
-            let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event {
-                    let _ = tx.unbounded_send(event);
-                }
-            });
-            let Ok(mut watcher) = watcher else { return };
-            if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-                return;
-            }
-            while let Some(first) = rx.next().await {
-                // Gather what's already queued with it.
-                let mut batch = vec![first];
-                while let Ok(more) = rx.try_recv() {
-                    batch.push(more);
-                }
-                let mut events: Vec<FsEvent> = Vec::new();
-                for event in batch {
-                    let structural = matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                    );
-                    if matches!(event.kind, EventKind::Access(_)) {
-                        continue;
-                    }
-                    for path in event.paths {
-                        if !ignored(&root, &path) {
-                            match events.iter_mut().find(|e| e.path == path) {
-                                Some(e) => e.structural |= structural,
-                                None => events.push(FsEvent { path, structural }),
-                            }
-                        }
-                    }
-                }
-                if !events.is_empty() && output.send(events).await.is_err() {
-                    break;
-                }
-            }
-            drop(watcher);
-        })
-    })
-}
-
-/// `.git/`, `.obsidian/`, `.obsessed/` and other dot folders.
-fn ignored(root: &Path, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(root) else { return true };
-    rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 /// A watched path as a vault path (`folder/note.md`), if it's a note.

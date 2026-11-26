@@ -22,6 +22,7 @@ mod status_menu;
 mod switcher;
 mod theme;
 mod timer;
+mod watch;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -124,6 +125,13 @@ enum Message {
     CloseRequested(window::Id),
     /// The watcher saw files change.
     Fs(Vec<runs::FsEvent>),
+    /// Read the next slice of notes changed in other apps.
+    DrainOutside,
+    /// Notes changed in other apps, read off the UI thread: each one's text,
+    /// or `Err(true)` when it's gone.
+    OutsideRead(Vec<(String, Result<String, bool>)>),
+    /// Read the vault folder again (a delayed, coalesced rescan).
+    Rescan,
     /// The vault's list was read again after files came or went.
     VaultRefreshed(Result<Vault, String>),
     /// Time for the pending run.
@@ -189,7 +197,51 @@ struct Workspace {
     crew: Vec<Member>,
     /// Open `@mentions` per person across the vault.
     mentions: HashMap<String, u32>,
+    /// Notes changed in other apps, waiting to be read a slice at a time.
+    outside: OutsideQueue,
+    /// Rescans of the vault folder, throttled (`App::rescan`).
+    rescans: Rescans,
 }
+
+#[derive(Default)]
+struct Rescans {
+    running: bool,
+    /// Asked for while one was running.
+    again: bool,
+    /// One is waiting for the gap to pass.
+    scheduled: bool,
+    last: Option<std::time::Instant>,
+}
+
+/// A burst of outside changes being read (`App::drain_outside`).
+#[derive(Default)]
+struct OutsideQueue {
+    queue: std::collections::VecDeque<PathBuf>,
+    /// What's in `queue`, so a note changed twice is read once.
+    queued: std::collections::HashSet<PathBuf>,
+    /// A slice is scheduled.
+    draining: bool,
+    /// Read so far in this burst, and warnings to show at its end.
+    changed: Vec<String>,
+    warnings: Vec<String>,
+    /// The queue has been empty since then (the burst ends after
+    /// `OUTSIDE_QUIET` of that).
+    quiet_since: Option<std::time::Instant>,
+    /// For the dev timing: when the burst started, slices, notes looked at.
+    started: Option<std::time::Instant>,
+    slices: u32,
+    read: usize,
+}
+
+/// How long one slice of outside changes may take, and the pause after it.
+const OUTSIDE_SLICE: std::time::Duration = std::time::Duration::from_millis(4);
+const OUTSIDE_PAUSE: std::time::Duration = std::time::Duration::from_millis(12);
+/// Notes the store doesn't hold, read off the UI thread per slice.
+const OUTSIDE_BATCH: usize = 64;
+/// A burst ends when no change has come for this long.
+const OUTSIDE_QUIET: std::time::Duration = std::time::Duration::from_millis(150);
+/// Rescans of the vault folder start at most this often.
+const RESCAN_GAP: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Workspace {
     /// Reads the crew folder: each card note in it (through the store),
@@ -660,6 +712,8 @@ impl App {
                     elsewhere: Elsewhere::default(),
                     crew: Vec::new(),
                     mentions: HashMap::new(),
+                    outside: OutsideQueue::default(),
+                    rescans: Rescans::default(),
                 };
                 if let Some(warning) = ws.load_team().into_iter().next() {
                     self.status = Some(format!("_settings.md: {warning}"));
@@ -928,25 +982,47 @@ impl App {
                 }
             }
             Message::Fs(events) => self.files_changed(events),
+            Message::DrainOutside => self.drain_outside(),
+            Message::OutsideRead(texts) => self.outside_read(texts),
+            Message::Rescan => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.rescans.scheduled = false;
+                }
+                self.rescan()
+            }
             Message::VaultRefreshed(Ok(vault)) => {
+                let again = self.rescan_landed();
                 let Some(ws) = &mut self.workspace else {
-                    return Task::none();
+                    return again;
                 };
                 if ws.vault.root != vault.root {
-                    return Task::none();
+                    return again;
                 }
+                let started = std::time::Instant::now();
                 ws.vault = vault;
                 ws.tree.refresh(&ws.vault);
                 ws.load_crew();
+                let crew = started.elapsed();
                 self.pictures.forget_failed();
                 self.rebuild_index();
+                let index = started.elapsed();
                 self.refresh_links();
+                let links = started.elapsed();
                 self.rebuild_graph();
-                Task::none()
+                if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+                    eprintln!(
+                        "TIMING rescan landed: tree+crew {} ms, index {} ms, links {} ms, all {} ms",
+                        crew.as_millis(),
+                        (index - crew).as_millis(),
+                        (links - index).as_millis(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                again
             }
             Message::VaultRefreshed(Err(error)) => {
                 self.status = Some(format!("Couldn't re-read the folder: {error}"));
-                Task::none()
+                self.rescan_landed()
             }
             Message::RunNow => {
                 let Some(ws) = &mut self.workspace else {
@@ -2825,14 +2901,16 @@ impl App {
     }
 
     /// Files changed on disk: tell other apps' edits from our own writes.
+    /// The watcher saw changes. Notes go in a queue that `drain_outside`
+    /// reads a slice at a time, so a burst (a git pull, a sync) doesn't read
+    /// every note at once on the UI thread. The file list and pictures are
+    /// dealt with now.
     fn files_changed(&mut self, events: Vec<runs::FsEvent>) -> Task<Message> {
         let Some(ws) = &mut self.workspace else {
             return Task::none();
         };
         let root = ws.vault.root.clone();
         let mut structural = false;
-        let mut outside: Vec<String> = Vec::new();
-        let mut warnings: Vec<String> = Vec::new();
         for event in events {
             structural |= event.structural;
             if let Ok(rel) = event.path.strip_prefix(&root) {
@@ -2841,7 +2919,55 @@ impl App {
                     self.pictures.forget(&rel);
                 }
             }
-            let Some(rel) = runs::rel_of(&root, &event.path) else { continue };
+            if runs::rel_of(&root, &event.path).is_some() && ws.outside.queued.insert(event.path.clone()) {
+                ws.outside.queue.push_back(event.path);
+                ws.outside.quiet_since = None;
+            }
+        }
+        let drain = !ws.outside.queue.is_empty() && !ws.outside.draining;
+        let mut tasks = Vec::new();
+        if structural {
+            tasks.push(self.rescan());
+        }
+        if drain {
+            if let Some(ws) = &mut self.workspace {
+                ws.outside.draining = true;
+                ws.outside.started = Some(std::time::Instant::now());
+            }
+            tasks.push(self.drain_outside());
+        }
+        Task::batch(tasks)
+    }
+
+    /// Takes the next slice of queued outside changes. Notes the store holds
+    /// (the open one, pinned ones) are checked here, for up to
+    /// `OUTSIDE_SLICE`; up to `OUTSIDE_BATCH` others are read one after
+    /// another off the UI thread (a read can wait on the disk or a virus
+    /// scan) and come back as `Message::OutsideRead`. Then a pause of
+    /// `OUTSIDE_PAUSE` before the next slice, so a big burst stays a
+    /// fraction of one core and the window keeps drawing. When the queue has
+    /// been empty for `OUTSIDE_QUIET`, logs the burst and refreshes what
+    /// depends on the notes once.
+    fn drain_outside(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let root = ws.vault.root.clone();
+        let started = std::time::Instant::now();
+        let mut rescan = false;
+        let mut to_read: Vec<(String, PathBuf)> = Vec::new();
+        ws.outside.slices += 1;
+        while let Some(path) = ws.outside.queue.pop_front() {
+            ws.outside.read += 1;
+            ws.outside.queued.remove(&path);
+            let Some(rel) = runs::rel_of(&root, &path) else { continue };
+            if !ws.store.is_loaded(&rel) {
+                to_read.push((rel, path));
+                if to_read.len() >= OUTSIDE_BATCH {
+                    break;
+                }
+                continue;
+            }
             match ws.store.check_outside(&rel) {
                 Outside::Same => {}
                 Outside::Changed => {
@@ -2852,7 +2978,7 @@ impl App {
                         && *note.rel == *rel
                     {
                         if note.unsynced {
-                            warnings.push(format!(
+                            ws.outside.warnings.push(format!(
                                 "⚠ {} changed in another app; your unsaved edits here will be saved over it",
                                 rel.trim_end_matches(".md")
                             ));
@@ -2861,9 +2987,9 @@ impl App {
                             note.analyze(&text);
                         }
                     }
-                    outside.push(rel);
+                    ws.outside.changed.push(rel);
                 }
-                Outside::Conflict => warnings.push(format!(
+                Outside::Conflict => ws.outside.warnings.push(format!(
                     "⚠ {} changed in another app while it had unsaved changes here; keeping these",
                     rel.trim_end_matches(".md")
                 )),
@@ -2872,24 +2998,77 @@ impl App {
                     if let Some(search) = &mut ws.search {
                         search.remove(&rel);
                     }
-                    structural = true;
+                    rescan = true;
                 }
                 Outside::NotLoaded => {
-                    if let Ok(text) = std::fs::read_to_string(&event.path) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
                         ws.links.update(&rel, &text);
                         if let Some(search) = &mut ws.search { search.update(&rel, &text); }
-                        outside.push(rel);
+                        ws.outside.changed.push(rel);
                     }
                 }
             }
+            if started.elapsed() >= OUTSIDE_SLICE {
+                break;
+            }
         }
         let mut tasks = Vec::new();
-        if !outside.is_empty() {
-            let names: Vec<&str> = outside.iter().take(3).map(|r| r.trim_end_matches(".md")).collect();
-            let more = if outside.len() > 3 { format!(" and {} more", outside.len() - 3) } else { String::new() };
+        if rescan {
+            tasks.push(Task::done(Message::Rescan));
+        }
+        if !to_read.is_empty() {
+            // One after another, off the UI thread.
+            tasks.push(Task::perform(
+                async move {
+                    to_read
+                        .into_iter()
+                        .map(|(rel, path)| {
+                            let text = std::fs::read_to_string(&path).map_err(|e| e.kind() == std::io::ErrorKind::NotFound);
+                            (rel, text)
+                        })
+                        .collect()
+                },
+                Message::OutsideRead,
+            ));
+            return Task::batch(tasks);
+        }
+        // The burst ends once nothing new has come for `OUTSIDE_QUIET`: the
+        // watcher passes changes on as they happen, so a burst arrives as
+        // many small batches.
+        let quiet = match (ws.outside.queue.is_empty(), ws.outside.quiet_since) {
+            (false, _) => None,
+            (true, None) => {
+                ws.outside.quiet_since = Some(std::time::Instant::now());
+                Some(OUTSIDE_QUIET)
+            }
+            (true, Some(since)) => OUTSIDE_QUIET.checked_sub(since.elapsed()).filter(|d| !d.is_zero()),
+        };
+        let wait = if ws.outside.queue.is_empty() { quiet } else { Some(OUTSIDE_PAUSE) };
+        if let Some(wait) = wait {
+            tasks.push(Task::perform(timer::after(wait), |()| Message::DrainOutside));
+            return Task::batch(tasks);
+        }
+        // The burst is read: once for all of it.
+        ws.outside.quiet_since = None;
+        ws.outside.draining = false;
+        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+            eprintln!(
+                "TIMING outside burst: {} notes in {} slices, {} ms",
+                ws.outside.read,
+                ws.outside.slices,
+                ws.outside.started.map_or(0, |t| t.elapsed().as_millis())
+            );
+        }
+        ws.outside.read = 0;
+        ws.outside.slices = 0;
+        let changed = std::mem::take(&mut ws.outside.changed);
+        let warnings = std::mem::take(&mut ws.outside.warnings);
+        if !changed.is_empty() {
+            let names: Vec<&str> = changed.iter().take(3).map(|r| r.trim_end_matches(".md")).collect();
+            let more = if changed.len() > 3 { format!(" and {} more", changed.len() - 3) } else { String::new() };
             let summary = format!("Changed in another app: {}{more}", names.join(", "));
             let _ = ws.runs.record(&root, obsession_core::log::Kind::Outside, summary, Vec::new());
-            for rel in outside {
+            for rel in changed {
                 tasks.push(self.note_changed(&rel));
             }
             self.refresh_links();
@@ -2898,13 +3077,73 @@ impl App {
         if !warnings.is_empty() {
             self.status = Some(warnings.join(" · "));
         }
-        if structural {
-            tasks.push(Task::perform(
-                async move { Vault::scan(&root).map_err(|e| e.to_string()) },
-                Message::VaultRefreshed,
-            ));
-        }
         Task::batch(tasks)
+    }
+
+    /// Notes read off the UI thread for a burst: index them, then on to the
+    /// next slice after a pause. (`Err(true)`: the note is gone.)
+    fn outside_read(&mut self, texts: Vec<(String, Result<String, bool>)>) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let mut rescan = false;
+        for (rel, text) in texts {
+            match text {
+                Ok(text) => {
+                    ws.links.update(&rel, &text);
+                    if let Some(search) = &mut ws.search {
+                        search.update(&rel, &text);
+                    }
+                    ws.outside.changed.push(rel);
+                }
+                Err(true) => {
+                    ws.links.remove(&rel);
+                    if let Some(search) = &mut ws.search {
+                        search.remove(&rel);
+                    }
+                    rescan = true;
+                }
+                Err(false) => {}
+            }
+        }
+        let next = Task::perform(timer::after(OUTSIDE_PAUSE), |()| Message::DrainOutside);
+        if rescan { Task::batch([next, self.rescan()]) } else { next }
+    }
+
+    /// Reads the vault folder again, off the UI thread, at most once every
+    /// `RESCAN_GAP`: a request within the gap (or while one runs) schedules
+    /// one rescan for when it's over, and further requests join that one.
+    /// So a burst of new or deleted files rescans (and refreshes everything
+    /// after it) a few times a second, not once per batch the watcher sends.
+    fn rescan(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        let r = &mut ws.rescans;
+        if r.running {
+            r.again = true;
+            return Task::none();
+        }
+        if r.scheduled {
+            return Task::none();
+        }
+        if let Some(wait) = r.last.and_then(|last| RESCAN_GAP.checked_sub(last.elapsed())) {
+            r.scheduled = true;
+            return Task::perform(timer::after(wait), |()| Message::Rescan);
+        }
+        r.running = true;
+        r.last = Some(std::time::Instant::now());
+        let root = ws.vault.root.clone();
+        Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
+    }
+
+    /// A rescan landed: one asked for meanwhile follows, after the gap.
+    fn rescan_landed(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        ws.rescans.running = false;
+        if std::mem::take(&mut ws.rescans.again) { self.rescan() } else { Task::none() }
     }
 
     /// Used when closing: write on this thread so nothing is lost.
@@ -3507,7 +3746,7 @@ impl App {
         let watch = self
             .workspace
             .as_ref()
-            .map_or_else(Subscription::none, |ws| runs::watch(ws.vault.root.clone()).map(Message::Fs));
+            .map_or_else(Subscription::none, |ws| watch::watch(ws.vault.root.clone()).map(Message::Fs));
         Subscription::batch([
             watch,
             event::listen_with(shortcut_from_event).map(Message::Shortcut),

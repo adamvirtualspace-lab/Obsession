@@ -19,7 +19,7 @@ Line counts are approximate (November 2026).
 |---|---|---|
 | `obsession-core` | `core/` | Everything that isn't UI. No iced. Fully unit-tested (`cargo test -p obsession-core`). |
 | `obsession` | `app/` | The iced 0.14 app (wgpu, canvas). |
-| `obsession-bench` | `bench/` | Test vault generator and timings (`obsession-bench gen <dir> <count>`). |
+| `obsession-bench` | `bench/` | Test vault generator and timings (`obsession-bench gen <dir> <count>`). `bench/scripts/`: `idle-threads.ps1` (each thread's CPU cycles over a window: idle should show none) and `ui-load.ps1` (the UI thread's load every 100 ms during a burst). |
 
 Build and run: `cargo run --release`. Measure: `cargo build -p obsession
 --profile measure` (release speed, debug hooks kept). Cargo's home and target
@@ -58,7 +58,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 4034 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 4273 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1497 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. Pictures: `picture_column` (a `PictureColumn` under the line, or alone for a line of only pictures), `picture_heights` in `line_height`, `pictures_near` (what `view` builds), `Message::PicturesShown`. |
 | `pictures.rs` | 575 | Pictures in notes: `Pictures` (decoded by `Key { rel, width }`, 64 MB `BUDGET`, `want` / `loaded` / `trim` / `forget`, the open note's targets, `decode_width`, scale factor), `decode` (off-thread, two at a time, EXIF, shrunk to the width drawn), `PictureColumn` widget. |
@@ -74,7 +74,8 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `backlinks.rs` | 70 | Backlinks panel. |
 | `graph.rs` | 2297 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`. `draw_crew` lights the person's nodes in the overlay and leaves `hand_now` (`HandNow`: size, raised card and lift, the dragged token); `HandLayer`, a draw-only canvas stacked over the graph in `Graph::view` (its own layer, so graph text can't show through), draws it with `draw_hand` → `draw_hand_card` (whole) or `draw_hand_strip` (face, name and badge in the visible strip of a covered card; `hand_step`, `hand_visible`, `badge_short`). `takes_function(wire)`: no ƒ on wires to or from a function node's pin. `WireView::from_row` / `to_row` (via `row_in` → `links::task_at`): a `#^block` / `#heading` end meets that task row (`row_y`); `wire_ends` uses it. Hover is worked out again when a drag ends. Shared drawing helpers: `View`, `curve`, `draw_grid`, `fit`, `pin_color`. |
 | `func_editor.rs` | 1550 | Function editor (`Editor`: canvas + panel; the title is a `text_input` on `name_draft`, `NameDraft`/`NameSubmit`), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`, `Rename(new)`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). |
-| `runs.rs` | 280 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `watch(root)` subscription → `Vec<FsEvent>`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
+| `watch.rs` | 264 | The vault watcher: `watch(root)` subscription → `Vec<FsEvent>` (batches gathered for 50 ms, dot folders left out). Windows: our own `ReadDirectoryChangesW` thread that sleeps until a change or the stop (`Watching` sets it on drop); elsewhere `notify`. |
+| `runs.rs` | 207 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `FsEvent`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
 | `theme.rs` | 260 | Colours, fonts, widget styles. Compact layout: `set_compact`, `compact`, `row_height`, `tool_pad`, `tool_gap`, `bar_pad`. |
 | `timer.rs` | 20 | One-shot delay future. |
 | `settings.rs` | 60 | `%APPDATA%\Obsession`: the last vault, and `Prefs { compact }` (`prefs`, `save_prefs`). |
@@ -147,12 +148,20 @@ other graph without its own function of that name (`graph_rels`) go to
 `edit_files(files, what, joined)` as one `Elsewhere` step; the open graph's own
 change is then an `edit_graph`, and `joined` ties the two into one Ctrl+Z.
 
+**Outside changes.** `watch::watch` → `Message::Fs` → `files_changed`:
+pictures forgotten, a structural change → `App::rescan` (at most every
+250 ms; `Rescans`, `Message::Rescan`, `rescan_landed` after
+`VaultRefreshed`), notes queued in `ws.outside` → `drain_outside` slices:
+held notes via `Store::check_outside`, others read off-thread →
+`Message::OutsideRead` → `outside_read`, then `Message::DrainOutside` after
+a pause; 150 ms with nothing new ends the burst: `runs.record`, `note_changed`
+for each, `refresh_links`, `rebuild_graph`.
+
 **Runs.** `rebuild_index` (on scan, and when a graph, `_funct.md` or
 `_settings.md` changes) → `Index::build`, pins job files, `check_out_of_date`
 (`runner::pending` → `runs.out_of_date`, drawn by `rebuild_graph` as
 `WireView::stale` / `Card::stale`). A changed note → `note_changed` (from
-`save_now`, or from `files_changed` on watcher events after
-`Store::check_outside`) → `runs.pending` → `schedule_run` (timer, 1 s gap) →
+`save_now`, or from the end of an outside burst) → `runs.pending` → `schedule_run` (timer, 1 s gap) →
 `Message::RunNow` (saves the open note, `index.affected`) → `start_run`
 (`runner::run` off-thread) → `Message::RunDone` → `run_done` (`runner::apply`
 to current texts, `put_text` + save each note once, `runs.record`, recheck).

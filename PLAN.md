@@ -671,7 +671,14 @@ Still not right, for later:
 ### CPU
 
 - **Nothing runs when idle.** No polling or repeating timers. The file watcher
-  is event-driven, and the function timer only exists while a run is pending.
+  is event-driven (on Windows our own, `app/src/watch.rs`: `notify`'s Windows
+  backend wakes every 100 ms), and the function timer only exists while a run
+  is pending. Checked by counting each thread's CPU cycles
+  (`bench/scripts/idle-threads.ps1`): idle, no thread runs at all.
+- **Bursts are spread out.** Many notes changed at once by another app (a git
+  pull, a sync) are queued and read a slice at a time, off the UI thread,
+  with pauses between; rescans start at most every 250 ms. See "Idle and
+  bursts".
 - **Background work is polite.** Indexing, out-of-date checks and function runs
   use at most 2 threads at below-normal priority, so they never compete with
   the UI or with Maya, Blender or Unreal running next to the app.
@@ -762,7 +769,10 @@ measurably lowers memory or frame times.
   scripted session: open vault, open graph, pan, zoom, drag, run functions.
 - **CPU and disk** come from the process's CPU time and Windows I/O counters
   (bytes read and written) over the same session, plus 5 idle minutes. Those
-  idle minutes must show no CPU use and no bytes written.
+  idle minutes must show no CPU use and no bytes written. Process CPU time is
+  charged in 15.6 ms ticks and misses short wakeups, so idle CPU is checked by
+  counting each thread's cycles (`bench/scripts/idle-threads.ps1`), and the UI
+  thread's load during a burst with `bench/scripts/ui-load.ps1`.
 - **The file store counts its own disk reads and writes** per run, so
   `obsession-bench` can check that a warmed-up run reads nothing from disk and
   writes each changed file exactly once.
@@ -1021,9 +1031,16 @@ renaming an `id` from the editor, matching the cards to the Possess mockup.
    scrolling through all of it and back held 49.7 MB in 25 pictures
    (process 147 MB); reopening it decoded nothing. Idle: 0 bytes written;
    CPU 0 ms in Source view, but with pictures on screen an occasional
-   15.6 ms tick (one in about a minute) from a thread outside the app's
-   code (no messages arrive; probably the driver keeping the textures).
-   Core tests: 100 (1 new).
+   15.6 ms tick (one in about a minute). Dug into after milestone 10: not
+   the pictures. Counting cycles per thread (`QueryThreadCycleTime`, finer
+   than the 15.6 ms ticks process CPU time is charged in) shows the same
+   with no picture ever shown: `notify`'s Windows watcher thread waits with
+   a 100 ms timeout (`WaitForSingleObjectEx(wakeup_sem, 100, …)`, which is
+   how it picks up watch and stop commands), so it wakes about 10 times a
+   second, ~70,000 cycles (~25 µs) each, since milestone 6. Ticks only
+   catch it now and then, so "0 ms idle" readings since then were short of
+   that. Fixed after milestone 10 (see "Idle and bursts" below). Core
+   tests: 100 (1 new).
 3. **Crew portraits.** `portrait:` on a card is drawn on the crew hand, the
    graph and the card's note; bots without one keep their bot face.
    (`graph.rs`)
@@ -1057,6 +1074,44 @@ time, idle CPU 0 ms. Note embeds (`![[other note]]`) stay out of version 1.
 Measured in item 2: 49.7 MB held after scrolling a 20-photo note; opening it
 doesn't wait for pictures, and the second time they're all held already;
 idle CPU see item 2.
+
+### Idle and bursts (after milestone 10)
+
+✅ **Done (November 2026).**
+
+- **The idle wakeup.** Counting CPU cycles per thread showed `notify`'s
+  Windows watcher thread waking ten times a second (a 100 ms timeout on a
+  wait nothing signals; that's how it picks up its own commands), with or
+  without pictures. On Windows the vault is now watched by `app/src/watch.rs`:
+  one thread asks for changes under the vault folder (`ReadDirectoryChangesW`,
+  overlapped) and sleeps on that and a stop event with no timeout; dropping
+  the subscription sets the stop. A buffer overflow is reported as the vault
+  folder (rescan). Other systems keep `notify` (inotify, FSEvents sleep until
+  a change); `Cargo.toml` takes `notify` only off Windows and `windows-sys`
+  (already in the build) only on it. The watcher lets a burst gather for 50
+  ms per batch, as each batch is a message and each message a redraw.
+  Checked: an outside edit to the open note, a new note, a rename, a delete
+  and a changed picture all reach the app; the app's own save isn't logged as
+  an outside change. Idle with photos on screen: no thread runs in 60 s.
+- **Bursts.** `files_changed` used to read every changed note at once on the
+  UI thread. Now notes go in a queue (`OutsideQueue`); `drain_outside` takes
+  a slice: notes the store holds are checked there (up to 4 ms), up to 64
+  others are read one after another off the UI thread (`Message::OutsideRead`;
+  a read can wait ~5 ms on the disk or a virus scan), then a 12 ms pause. The
+  burst ends after 150 ms with nothing new: then it's logged and links, runs
+  and the graph are refreshed once. Rescans start at most every 250 ms
+  (`App::rescan`); a burst of creations or deletions used to start one per
+  watcher batch. UI thread, in Mcycles per 100 ms (about 300 is one core):
+
+  | 2,000 notes changed outside | Before | After |
+  |---|---|---|
+  | Created | peaks 380, ~40 steady, then the closing work per note | peaks 75, 15–45; 7.2 s |
+  | Modified | each read blocked the UI thread (~5 ms each) | 15–55; 12 s |
+  | Deleted | peaks 290, 74 rescans | peaks 126 for ~1.2 s, 12 rescans |
+
+  `OBSESSION_DEV_TIMING` prints each burst (notes, slices, time) and each
+  rescan's refresh. The startup link index already read notes one at a time
+  on one background thread and is unchanged.
 
 ## Risks
 
