@@ -1679,7 +1679,7 @@ fn card(
     let (entry, kind) = match vault.resolve_from(target, Some(rel)) {
         Resolved::One(entry) => (entry, CardKind::Note),
         Resolved::Ambiguous { picked, .. } => (picked, CardKind::Ambiguous),
-        Resolved::NotFound | Resolved::Attachment => {
+        Resolved::NotFound | Resolved::Attachment(_) => {
             let name = target.rsplit('/').next().unwrap_or(target);
             let folder = target.rsplit_once('/').map_or("", |(f, _)| f);
             return blank(CardKind::Missing, name, folder);

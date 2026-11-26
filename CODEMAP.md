@@ -30,7 +30,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | File | Lines | Holds |
 |---|---|---|
 | `lib.rs` | 30 | Module list. |
-| `vault.rs` | 470 | `Vault` (flat sorted `Vec<Entry>`; `scan`, `note(rel)`, `path(rel)`, `notes()`), Obsidian link resolution `resolve` / `resolve_from` → `Resolved::{One, Ambiguous, NotFound, Attachment}` (`.entry()`), `note_rel_from_input`, `create_note`. |
+| `vault.rs` | 558 | `Vault` (flat sorted `Vec<Entry>`; `scan`, `note(rel)`, `path(rel)`, `notes()`; attachments apart in `files` with their own lookups, `with_files`), Obsidian link resolution `resolve` / `resolve_from` (steps shared by notes and attachments in `find`) → `Resolved::{One, Ambiguous, NotFound, Attachment(Option<rel>)}` (`.entry()`), `attachment(target, from)`, `is_attachment`, `note_rel_from_input`, `create_note`. |
 | `store.rs` | 520 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
@@ -58,7 +58,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3899 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 3915 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
 | `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |

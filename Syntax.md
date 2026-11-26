@@ -242,6 +242,12 @@ The app reads the same links Obsidian does:
 - **Renaming or moving a file** in the app updates every link to it, in both
   link styles.
 - Links inside code fences and inline code are ignored.
+- **Pictures and other files** (`![[shot.png]]`, `[[ref.pdf]]`, videos,
+  `.blend`…) resolve the same way, with their extension: by name from any
+  folder, a path to narrow it, `./` and `../` relative. When two share a
+  name, the one in the linking note's folder wins, then the shortest path,
+  as Obsidian picks. A click opens the file in its usual app; a link to a
+  file that isn't in the vault shows as missing and never creates a note.
 
 ## 7. Graphs: `_nodes.md`
 

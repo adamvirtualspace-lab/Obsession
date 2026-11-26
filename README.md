@@ -133,7 +133,10 @@ name; the click opens the one Obsidian would and says so) or its `#heading` or
 `^block` isn't there. The **Backlinks** panel on the right lists every line
 that links to the open note; click one to go there. Renaming a note rewrites
 every `[[link]]` and markdown link to it, keeping headings, aliases and `!`
-embeds, using the shortest form that stays unique.
+embeds, using the shortest form that stays unique. Links to pictures and other
+files (`![[shot.png]]`, `[[ref.pdf]]`) are found the same way, from any folder;
+clicking one opens it in the app Windows uses for that file, and one that isn't
+in the vault shows dim.
 
 ## Workspace
 

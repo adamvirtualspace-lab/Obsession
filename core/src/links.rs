@@ -384,7 +384,8 @@ pub fn link_states(
         } else {
             match vault.resolve_from(&link.target, Some(rel)) {
                 Resolved::NotFound => LinkState::Missing,
-                Resolved::Attachment => LinkState::Ok,
+                Resolved::Attachment(Some(_)) => LinkState::Ok,
+                Resolved::Attachment(None) => LinkState::Missing,
                 Resolved::Ambiguous { .. } => LinkState::Ambiguous,
                 Resolved::One(entry) => {
                     let outline = if *entry.rel == *rel { Some(&own) } else { index.outline(&entry.rel) };
@@ -975,11 +976,15 @@ mod tests {
 
     #[test]
     fn states() {
-        let v = vault(&["a/x.md", "b/x.md", "brief.md"]);
+        let v = vault(&["a/x.md", "b/x.md", "brief.md"]).with_files(vec!["refs/shot.png".into()]);
         let mut index = LinkIndex::default();
         index.update("brief.md", "# Scope\ntext");
-        let text = "# Top\n[[x]] [[brief#Scope]] [[brief#Nope]] [[gone]] [[#Top]] [[#Bottom]] [[Brief | B]]";
+        let text = "# Top\n[[x]] [[brief#Scope]] [[brief#Nope]] [[gone]] [[#Top]] [[#Bottom]] [[Brief | B]] ![[shot.png]] ![[lost.png]]";
         let s = link_states(text, "n.md", &v, &index);
+        // A picture from another folder is found; one that isn't anywhere
+        // shows as missing.
+        assert_eq!(s["shot.png"], LinkState::Ok);
+        assert_eq!(s["lost.png"], LinkState::Missing);
         assert_eq!(s["x"], LinkState::Ambiguous);
         assert_eq!(s["brief#scope"], LinkState::Ok);
         assert_eq!(s["brief#nope"], LinkState::MissingSection);

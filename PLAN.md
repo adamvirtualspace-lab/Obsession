@@ -315,8 +315,8 @@ Known limits, for later:
 - Folders can't be renamed yet, only notes (moving a note into another folder
   works).
 - Relative markdown links *inside* a moved note aren't adjusted.
-- Attachments open from the vault root only (they aren't scanned yet). →
-  Milestone 10.
+- ~~Attachments open from the vault root only (they aren't scanned yet).~~
+  Done in milestone 10, item 1.
 - Backlink snippets show the raw line, and unlinked mentions aren't listed.
 - ~~Edits made by other apps reach the index when the file watcher arrives
   (milestone 6).~~ Done in milestone 6.
@@ -969,6 +969,24 @@ renaming an `id` from the editor, matching the cards to the Possess mockup.
 
 1. **Attachments are scanned**, so `![[shot.png]]` and `[[ref.pdf]]` resolve
    from any folder, the way Obsidian finds them. (`vault.rs`, with tests)
+   ✅ **Done (November 2026).** `Vault::scan` also lists files with an
+   attachment extension (`is_attachment`: pictures, PDFs, video, audio,
+   `.blend`…) in `Vault::files`, sorted, with name and path lookups of their
+   own; they stay out of `entries`, so the tree and note lists don't change.
+   `resolve_from` finds them with the same steps as notes (`find`, shared):
+   `./` and `../`, a path from the root or the note's folder, then by name,
+   the note's folder first, then the shortest path. `Resolved::Attachment`
+   carries the file's path, or `None` when it isn't in the vault: that link
+   shows as missing (it used to look fine), and a click says "Can't find
+   lost.png in the vault" instead of looking only at the vault root.
+   `Vault::attachment(target, from)` is the lookup item 2 will draw from. A
+   rescan (any file created, removed or renamed) picks new files up.
+   Checked by hand: `![[plate.png]]` from `anim/` finds `comp/plate.png`
+   (bright) and `![[lost.png]]` shows missing; clicking `[[lost.png]]` says
+   so and creates no note; copying a `lost.png` into `refs/` while open
+   turns the link bright. Scan: 10,000 notes and 10,000 pictures in 47 ms
+   (`OBSESSION_DEV_TIMING` now times the scan too). Idle: 0 ms CPU, 0 bytes
+   written over 10 s. Core tests: 99 (1 new, 2 extended).
 2. **Pictures in notes.** `![[shot.png]]` and `![](shot.png)` draw the picture
    in Live, Split and Reading, fitted to the text column. Decoded off the UI
    thread at the size drawn, not full size; pictures far off screen are

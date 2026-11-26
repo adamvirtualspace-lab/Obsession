@@ -3,6 +3,10 @@
 //! The vault is kept as one flat, sorted list of entries (folders first, then
 //! notes, case-insensitive). The file tree draws straight from it, which keeps
 //! memory small and makes virtual scrolling trivial.
+//!
+//! Attachments (pictures, PDFs, videos: see `is_attachment`) are kept in a
+//! second sorted list of paths, so `![[shot.png]]` resolves from any folder
+//! the way Obsidian finds it. They aren't in the tree.
 
 use std::collections::HashMap;
 use std::fs;
@@ -54,17 +58,41 @@ pub struct Vault {
     names: HashMap<String, Vec<u32>>,
     /// Lowercased path without `.md` -> entry index.
     paths: HashMap<String, u32>,
+    /// Attachment paths from the vault root (`refs/shot.png`), sorted.
+    pub files: Vec<Box<str>>,
+    /// Lowercased file name (with extension) -> `files` indices.
+    file_names: HashMap<String, Vec<u32>>,
+    /// Lowercased path (with extension) -> `files` index.
+    file_paths: HashMap<String, u32>,
 }
 
 impl Vault {
     /// Scans `root`. Hidden entries (starting with `.`) are skipped, which
     /// covers `.git/`, `.obsidian/` and `.obsessed/`. Only `.md` files are
-    /// listed as notes.
+    /// listed as notes; attachments go in `files`; anything else is left out.
     pub fn scan(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         let mut entries = Vec::new();
-        scan_dir(&root, "", 0, &mut entries)?;
-        Ok(Self::from_entries(root, entries))
+        let mut files = Vec::new();
+        scan_dir(&root, "", 0, &mut entries, &mut files)?;
+        Ok(Self::from_entries(root, entries).with_files(files))
+    }
+
+    /// Adds the attachments (paths from the vault root).
+    pub fn with_files(mut self, mut files: Vec<Box<str>>) -> Self {
+        files.sort_by_cached_key(|f| f.to_lowercase());
+        let mut names: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut paths = HashMap::new();
+        for (i, rel) in files.iter().enumerate() {
+            let key = rel.to_lowercase();
+            let name = key.rsplit('/').next().unwrap_or(&key).to_owned();
+            names.entry(name).or_default().push(i as u32);
+            paths.insert(key, i as u32);
+        }
+        self.files = files;
+        self.file_names = names;
+        self.file_paths = paths;
+        self
     }
 
     pub fn from_entries(root: PathBuf, entries: Vec<Entry>) -> Self {
@@ -84,6 +112,9 @@ impl Vault {
             entries,
             names,
             paths,
+            files: Vec::new(),
+            file_names: HashMap::new(),
+            file_paths: HashMap::new(),
         }
     }
 
@@ -131,67 +162,87 @@ impl Vault {
     ///    how many there were.
     ///
     /// `.md` is optional, case doesn't matter, and anything after `#` or `|`
-    /// is ignored. Links to images and other files aren't notes.
+    /// is ignored. A picture or other attachment (by its extension) is
+    /// found the same way among the attachments, its extension kept.
     pub fn resolve_from(&self, target: &str, from: Option<&str>) -> Resolved<'_> {
         let target = target.split(['#', '|']).next().unwrap_or("").trim().replace('\\', "/");
         let target = target.trim_start_matches('/');
         if target.is_empty() {
             return Resolved::NotFound;
         }
-        if is_attachment(target) {
-            return Resolved::Attachment;
-        }
-        let target = stem(target).to_lowercase();
         let folder = from
             .and_then(|f| f.rsplit_once('/').map(|(dir, _)| dir))
             .unwrap_or("")
             .to_lowercase();
+        if is_attachment(target) {
+            let file = |i: u32| &*self.files[i as usize];
+            let found = find(&target.to_lowercase(), &folder, &self.file_names, &self.file_paths, |i| file(i).to_lowercase(), file);
+            return Resolved::Attachment(found.map(|(i, _)| file(i)));
+        }
         let entry = |i: u32| &self.entries[i as usize];
-
-        if target.starts_with("./") || target.starts_with("../") {
-            return match normalize(&format!("{folder}/{target}")).and_then(|p| self.paths.get(&p)) {
-                Some(&i) => Resolved::One(entry(i)),
-                None => Resolved::NotFound,
-            };
-        }
-        if let Some(&i) = self.paths.get(&target) {
-            return Resolved::One(entry(i));
-        }
-        if !folder.is_empty()
-            && target.contains('/')
-            && let Some(&i) = self.paths.get(&format!("{folder}/{target}"))
-        {
-            return Resolved::One(entry(i));
-        }
-
-        let name = target.rsplit('/').next().unwrap_or(&target);
-        let Some(candidates) = self.names.get(name) else {
-            return Resolved::NotFound;
-        };
-        let suffix = format!("/{target}");
-        let mut matches: Vec<&Entry> = candidates
-            .iter()
-            .map(|&i| entry(i))
-            .filter(|e| {
-                let path = stem(&e.rel).to_lowercase();
-                path == target || path.ends_with(&suffix)
-            })
-            .collect();
-        match matches.len() {
-            0 => Resolved::NotFound,
-            1 => Resolved::One(matches[0]),
-            count => {
-                matches.sort_by_key(|e| {
-                    let parent = e.parent().to_lowercase();
-                    (parent != folder, e.rel.matches('/').count(), e.rel.to_lowercase())
-                });
-                Resolved::Ambiguous {
-                    picked: matches[0],
-                    count,
-                }
-            }
+        let found = find(&stem(target).to_lowercase(), &folder, &self.names, &self.paths, |i| stem(&entry(i).rel).to_lowercase(), |i| &*entry(i).rel);
+        match found {
+            None => Resolved::NotFound,
+            Some((i, 1)) => Resolved::One(entry(i)),
+            Some((i, count)) => Resolved::Ambiguous { picked: entry(i), count },
         }
     }
+
+    /// The attachment a link or embed leads to (`refs/shot.png`), if it's
+    /// in the vault.
+    pub fn attachment(&self, target: &str, from: Option<&str>) -> Option<&str> {
+        match self.resolve_from(target, from) {
+            Resolved::Attachment(rel) => rel,
+            _ => None,
+        }
+    }
+}
+
+/// The steps of `Vault::resolve_from`, for notes or attachments: `target`
+/// and `folder` lowercased, `names` and `paths` the lookups, `key` an item's
+/// lowercased path as `paths` has it, `rel` its path for the tie-break.
+/// Returns the item Obsidian would pick and how many matched.
+fn find<'a>(
+    target: &str,
+    folder: &str,
+    names: &HashMap<String, Vec<u32>>,
+    paths: &HashMap<String, u32>,
+    key: impl Fn(u32) -> String,
+    rel: impl Fn(u32) -> &'a str,
+) -> Option<(u32, usize)> {
+    if target.starts_with("./") || target.starts_with("../") {
+        let path = normalize(&format!("{folder}/{target}"))?;
+        return paths.get(&path).map(|&i| (i, 1));
+    }
+    if let Some(&i) = paths.get(target) {
+        return Some((i, 1));
+    }
+    if !folder.is_empty()
+        && target.contains('/')
+        && let Some(&i) = paths.get(&format!("{folder}/{target}"))
+    {
+        return Some((i, 1));
+    }
+    let name = target.rsplit('/').next().unwrap_or(target);
+    let suffix = format!("/{target}");
+    let mut matches: Vec<u32> = names
+        .get(name)?
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let path = key(i);
+            path == target || path.ends_with(&suffix)
+        })
+        .collect();
+    let count = matches.len();
+    if count > 1 {
+        matches.sort_by_cached_key(|&i| {
+            let r = rel(i);
+            let parent = r.rsplit_once('/').map_or("", |(p, _)| p).to_lowercase();
+            (parent != folder, r.matches('/').count(), r.to_lowercase())
+        });
+    }
+    matches.first().map(|&i| (i, count))
 }
 
 /// A path without its `.md` (any case).
@@ -292,8 +343,9 @@ pub enum Resolved<'a> {
     /// Several notes match; `picked` is the one Obsidian would open.
     Ambiguous { picked: &'a Entry, count: usize },
     NotFound,
-    /// An image or other file, not a note.
-    Attachment,
+    /// An image or other file, not a note: its path from the vault root,
+    /// or `None` when no such file is in the vault.
+    Attachment(Option<&'a str>),
 }
 
 impl<'a> Resolved<'a> {
@@ -301,12 +353,12 @@ impl<'a> Resolved<'a> {
     pub fn entry(&self) -> Option<&'a Entry> {
         match *self {
             Resolved::One(entry) | Resolved::Ambiguous { picked: entry, .. } => Some(entry),
-            Resolved::NotFound | Resolved::Attachment => None,
+            Resolved::NotFound | Resolved::Attachment(_) => None,
         }
     }
 }
 
-fn scan_dir(dir: &Path, rel: &str, depth: u16, out: &mut Vec<Entry>) -> io::Result<()> {
+fn scan_dir(dir: &Path, rel: &str, depth: u16, out: &mut Vec<Entry>, files: &mut Vec<Box<str>>) -> io::Result<()> {
     let mut folders = Vec::new();
     let mut notes = Vec::new();
 
@@ -324,6 +376,8 @@ fn scan_dir(dir: &Path, rel: &str, depth: u16, out: &mut Vec<Entry>) -> io::Resu
             folders.push(name.to_owned());
         } else if file_type.is_file() && has_md_extension(name) {
             notes.push(name.to_owned());
+        } else if file_type.is_file() && is_attachment(name) {
+            files.push(join(rel, name).into_boxed_str());
         }
     }
 
@@ -338,7 +392,7 @@ fn scan_dir(dir: &Path, rel: &str, depth: u16, out: &mut Vec<Entry>) -> io::Resu
             kind: Kind::Folder,
         });
         // An unreadable folder is shown but stays empty.
-        let _ = scan_dir(&dir.join(&name), &child_rel, depth + 1, out);
+        let _ = scan_dir(&dir.join(&name), &child_rel, depth + 1, out, files);
     }
     for name in notes {
         out.push(Entry {
@@ -396,7 +450,7 @@ pub(crate) mod tests {
         assert_eq!(v.resolve("missing"), Resolved::NotFound);
         // "040" must not match "sh040": only whole path components count.
         assert_eq!(v.resolve("040"), Resolved::NotFound);
-        assert_eq!(v.resolve("diagram.png"), Resolved::Attachment);
+        assert_eq!(v.resolve("diagram.png"), Resolved::Attachment(None));
     }
 
     #[test]
@@ -450,6 +504,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn attachments_resolve_from_any_folder() {
+        let v = vault(&["anim/sh040.md", "refs/brief.md", "shot.png.md"]).with_files(
+            ["refs/shot.png", "comp/sh040/shot.png", "comp/Plate.JPG", "refs/deck.pdf"]
+                .map(Box::from)
+                .to_vec(),
+        );
+        let at = |t: &str, from: Option<&str>| v.attachment(t, from).map(str::to_owned);
+        // By name from anywhere, any case.
+        assert_eq!(at("plate.jpg", None).as_deref(), Some("comp/Plate.JPG"));
+        assert_eq!(at("deck.pdf", Some("anim/sh040.md")).as_deref(), Some("refs/deck.pdf"));
+        // Two with that name: the linking note's folder first, else the
+        // shortest path, as Obsidian picks.
+        assert_eq!(at("shot.png", Some("comp/sh040/notes.md")).as_deref(), Some("comp/sh040/shot.png"));
+        assert_eq!(at("shot.png", Some("anim/sh040.md")).as_deref(), Some("refs/shot.png"));
+        // A path wins; `./` and `../` are relative; `|size` and `#page` go.
+        assert_eq!(at("sh040/shot.png", None).as_deref(), Some("comp/sh040/shot.png"));
+        assert_eq!(at("../refs/shot.png|300", Some("anim/sh040.md")).as_deref(), Some("refs/shot.png"));
+        assert_eq!(at("./deck.pdf#page=2", Some("refs/brief.md")).as_deref(), Some("refs/deck.pdf"));
+        assert_eq!(at("comp\\Plate.jpg", None).as_deref(), Some("comp/Plate.JPG"));
+        // Not in the vault: still an attachment, never a note to create.
+        assert_eq!(v.resolve("gone.png"), Resolved::Attachment(None));
+        assert_eq!(at("other/shot.png", None), None);
+        // Notes resolve as before; a note named like a picture stays a note
+        // only when linked with `.md`.
+        assert!(matches!(v.resolve("brief"), Resolved::One(e) if &*e.rel == "refs/brief.md"));
+        assert!(matches!(v.resolve("shot.png.md"), Resolved::One(e) if &*e.rel == "shot.png.md"));
+    }
+
+    #[test]
     fn scan_skips_hidden_and_non_markdown() {
         let dir = std::env::temp_dir().join(format!("obsession-scan-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -458,11 +541,18 @@ pub(crate) mod tests {
         fs::write(dir.join("anim/sh040.md"), "x").unwrap();
         fs::write(dir.join("README.md"), "x").unwrap();
         fs::write(dir.join("image.png"), "x").unwrap();
+        fs::write(dir.join("anim/Ref.JPG"), "x").unwrap();
+        fs::write(dir.join("anim/notes.txt"), "x").unwrap();
         fs::write(dir.join(".obsidian/app.md"), "x").unwrap();
+        fs::write(dir.join(".obsidian/icon.png"), "x").unwrap();
 
         let v = Vault::scan(&dir).unwrap();
         let rels: Vec<&str> = v.entries.iter().map(|e| &*e.rel).collect();
         assert_eq!(rels, ["anim", "anim/sh040.md", "README.md"]);
+        // Attachments are listed apart, hidden folders and other files not.
+        let files: Vec<&str> = v.files.iter().map(|f| &**f).collect();
+        assert_eq!(files, ["anim/Ref.JPG", "image.png"]);
+        assert_eq!(v.attachment("ref.jpg", None), Some("anim/Ref.JPG"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -461,7 +461,21 @@ impl App {
     fn scan(&mut self, path: PathBuf) -> Task<Message> {
         self.scanning = true;
         Task::perform(
-            async move { Vault::scan(path).map_err(|e| e.to_string()) },
+            async move {
+                let started = std::time::Instant::now();
+                let vault = Vault::scan(path).map_err(|e| e.to_string());
+                if std::env::var_os("OBSESSION_DEV_TIMING").is_some()
+                    && let Ok(v) = &vault
+                {
+                    eprintln!(
+                        "TIMING scan: {} ms, {} notes, {} attachments",
+                        started.elapsed().as_millis(),
+                        v.notes().count(),
+                        v.files.len()
+                    );
+                }
+                vault
+            },
             Message::Scanned,
         )
     }
@@ -3337,15 +3351,17 @@ impl App {
                 ));
                 task
             }
-            Resolved::Attachment => {
-                let path = ws.vault.root.join(target);
-                if path.is_file() {
-                    let _ = std::process::Command::new("rundll32")
-                        .arg("url.dll,FileProtocolHandler")
-                        .arg(&path)
-                        .spawn();
-                } else {
-                    self.status = Some(format!("Can't find {target} (attachments open from the vault root for now)"));
+            Resolved::Attachment(found) => {
+                // Opens in the app Windows uses for that kind of file.
+                let path = found.map(|rel| ws.vault.path(rel));
+                match path {
+                    Some(path) if path.is_file() => {
+                        let _ = std::process::Command::new("rundll32")
+                            .arg("url.dll,FileProtocolHandler")
+                            .arg(&path)
+                            .spawn();
+                    }
+                    _ => self.status = Some(format!("Can't find {target} in the vault")),
                 }
                 Task::none()
             }
