@@ -30,6 +30,7 @@ use obsession_core::syntax::LineState;
 
 use crate::highlight::{self, LinkStates, Statuses};
 use crate::live_text::{LiveText, Press};
+use crate::pictures::{self, PictureColumn, Pictures};
 use crate::right_click::right_click;
 use crate::theme;
 
@@ -97,6 +98,8 @@ pub enum Message {
     },
     /// The left mouse button went up (anywhere in the window).
     MouseUp,
+    /// Pictures came into view that haven't been looked up yet.
+    PicturesShown,
 }
 
 /// A selection being dragged across drawn lines: (doc line, byte column).
@@ -153,6 +156,10 @@ pub struct Live {
     reveal: u64,
     /// Each line's drawn height, once it has been on screen (0 = not yet).
     heights: Vec<Cell<f32>>,
+    /// The height of each line's pictures, the same way.
+    picture_heights: Vec<Cell<f32>>,
+    /// The width pictures were last laid out at (0 = not yet).
+    picture_column: Cell<f32>,
     /// Scroll offset and visible height of the page.
     scroll: (f32, f32),
     /// Reading mode and Split's mirror: links and status chips click, but
@@ -179,6 +186,8 @@ impl Live {
             content: text_editor::Content::new(),
             reveal: 0,
             heights: Vec::new(),
+            picture_heights: Vec::new(),
+            picture_column: Cell::new(0.0),
             scroll: (0.0, 1600.0),
             read_only: false,
             links: LinkStates::default(),
@@ -198,6 +207,7 @@ impl Live {
             .map(|i| render(self.doc.line(i), self.roles[i], format))
             .collect();
         self.heights = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
+        self.picture_heights = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
     }
 
     /// Replaces the whole text without editing it (Split's mirror).
@@ -226,6 +236,8 @@ impl Live {
         self.rendered
             .splice(range.clone(), std::iter::repeat_with(|| Rendered::Hidden).take(count));
         self.heights
+            .splice(range.clone(), std::iter::repeat_with(|| Cell::new(0.0)).take(count));
+        self.picture_heights
             .splice(range, std::iter::repeat_with(|| Cell::new(0.0)).take(count));
 
         self.blocks = live::blocks(self.doc.lines());
@@ -235,6 +247,7 @@ impl Live {
             if touched || self.roles[i] != *role {
                 self.rendered[i] = render(self.doc.line(i), *role, format);
                 self.heights[i].set(0.0);
+                self.picture_heights[i].set(0.0);
             }
         }
         self.roles = roles;
@@ -582,7 +595,7 @@ impl Live {
         self.cursor().0
     }
 
-    pub fn view<'a>(&'a self, statuses: &Statuses) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, statuses: &Statuses, pictures: &Pictures) -> Element<'a, Message> {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
         let mut editor_shown = false;
         let active = self.active.clone().unwrap_or(usize::MAX..usize::MAX);
@@ -611,7 +624,7 @@ impl Live {
             }
             if overlaps {
                 for i in block.lines.start..active.start.max(block.lines.start) {
-                    items.push(self.line_element(i));
+                    items.push(self.line_element(i, pictures));
                 }
                 if !editor_shown {
                     editor_shown = true;
@@ -619,12 +632,12 @@ impl Live {
                 }
                 for i in active.end.min(block.lines.end).max(block.lines.start)..block.lines.end {
                     if i >= active.end {
-                        items.push(self.line_element(i));
+                        items.push(self.line_element(i, pictures));
                     }
                 }
                 continue;
             }
-            items.push(self.block_element(block));
+            items.push(self.block_element(block, pictures));
         }
         if gap > 0.0 {
             items.push(Space::new().height(gap - SPACING).into());
@@ -656,6 +669,42 @@ impl Live {
         .into()
     }
 
+    /// The width to decode a picture for (see `Pictures::decode_width`).
+    fn decode_width(&self, spec: Option<u32>) -> Option<u32> {
+        Pictures::decode_width(spec, self.picture_column.get())
+    }
+
+    /// The picture embeds in the blocks `view` builds (near the visible
+    /// part of the page): (target as written, the width to decode it for).
+    /// Empty until pictures have been laid out once (the column's unknown).
+    pub fn pictures_near(&self) -> Vec<(String, u32)> {
+        let (offset, visible) = self.scroll;
+        let (top, bottom) = (offset - OVERSCAN, offset + visible + OVERSCAN);
+        let active = self.active.clone().unwrap_or(usize::MAX..usize::MAX);
+        let mut y = PAGE_PADDING.0;
+        let mut out = Vec::new();
+        for block in &self.blocks {
+            let height = self.block_height(block);
+            let near = y + height >= top && y <= bottom;
+            let editing = block.lines.start < active.end && active.start < block.lines.end;
+            y += height + SPACING;
+            if !near && !editing {
+                continue;
+            }
+            for i in block.lines.clone() {
+                if let Rendered::Line(drawn) = &self.rendered[i] {
+                    out.extend(
+                        drawn
+                            .pictures
+                            .iter()
+                            .filter_map(|p| Some((p.target.clone(), self.decode_width(p.width)?))),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// A line's height: measured if it has been drawn, estimated if not.
     fn line_height(&self, line: usize) -> f32 {
         let measured = self.heights.get(line).map_or(0.0, Cell::get);
@@ -665,7 +714,16 @@ impl Live {
             Rendered::Line(drawn) if drawn.rule => return 25.0,
             Rendered::Line(drawn) => {
                 let top = if drawn.heading > 0 { 10.0 } else { 0.0 };
-                (drawn, top)
+                let pictures = if drawn.pictures.is_empty() {
+                    0.0
+                } else {
+                    let measured = self.picture_heights[line].get();
+                    if measured > 0.0 { measured } else { pictures::estimate(drawn.pictures.len()) }
+                };
+                if pictures_only(drawn) {
+                    return top + pictures;
+                }
+                (drawn, top + pictures)
             }
         };
         if measured > 0.0 {
@@ -750,29 +808,29 @@ impl Live {
         (self.doc.len().saturating_sub(1), 1.0)
     }
 
-    fn block_element<'a>(&'a self, block: &Block) -> Element<'a, Message> {
+    fn block_element<'a>(&'a self, block: &Block, pictures: &Pictures) -> Element<'a, Message> {
         let lines = block.lines.clone();
         match block.kind {
-            BlockKind::Line => self.line_element(lines.start),
-            BlockKind::Fence => container(column(lines.map(|i| self.line_element(i))))
+            BlockKind::Line => self.line_element(lines.start, pictures),
+            BlockKind::Fence => container(column(lines.map(|i| self.line_element(i, pictures))))
                 .padding([8, 14])
                 .width(Fill)
                 .style(theme::boxed(theme::PANEL))
                 .into(),
             BlockKind::Frontmatter => container(
                 column![text("Properties").size(theme::SMALL).color(theme::FAINT)]
-                    .extend(lines.map(|i| self.line_element(i))),
+                    .extend(lines.map(|i| self.line_element(i, pictures))),
             )
             .padding([8, 14])
             .width(Fill)
             .style(theme::boxed(theme::PANEL))
             .into(),
-            BlockKind::Table => column(lines.map(|i| self.line_element(i))).into(),
-            BlockKind::Comment => column(lines.map(|i| self.line_element(i))).into(),
+            BlockKind::Table => column(lines.map(|i| self.line_element(i, pictures))).into(),
+            BlockKind::Comment => column(lines.map(|i| self.line_element(i, pictures))).into(),
         }
     }
 
-    fn line_element(&self, line: usize) -> Element<'_, Message> {
+    fn line_element<'a>(&'a self, line: usize, pictures: &Pictures) -> Element<'a, Message> {
         match &self.rendered[line] {
             Rendered::Hidden => Space::new().height(0).into(),
             Rendered::Cells(cells) => {
@@ -847,7 +905,14 @@ impl Live {
                 });
                 let widget: Element<'_, Message> = widget.into();
                 let top = if drawn.heading > 0 { 10.0 } else { 0.0 };
-                let mut element: Element<'_, Message> = container(widget)
+                // A line of only pictures shows just them; otherwise they go
+                // under its text.
+                let body: Element<'_, Message> = match self.picture_column(line, drawn, pictures) {
+                    None => widget,
+                    Some(pics) if pictures_only(drawn) => pics,
+                    Some(pics) => column![widget, pics].into(),
+                };
+                let mut element: Element<'_, Message> = container(body)
                     .padding(iced::Padding::new(0.0).top(top).left(indent_px(drawn.indent)))
                     .width(Fill)
                     .clip(mono)
@@ -871,6 +936,41 @@ impl Live {
                 element
             }
         }
+    }
+
+    /// A line's pictures, if it has any.
+    fn picture_column<'a>(&'a self, line: usize, drawn: &Drawn, pictures: &Pictures) -> Option<Element<'a, Message>> {
+        if drawn.pictures.is_empty() {
+            return None;
+        }
+        let items = drawn
+            .pictures
+            .iter()
+            .map(|p| pictures::Item {
+                name: p.target.rsplit('/').next().unwrap_or(&p.target).to_owned(),
+                width: p.width,
+                shown: pictures.shown(&p.target, self.decode_width(p.width)),
+            })
+            .collect();
+        // Each picture stands for its placeholder piece of the line.
+        let starts: Vec<(usize, usize)> = drawn
+            .pictures
+            .iter()
+            .map(|p| (p.seg, drawn.segs[..p.seg].iter().map(|s| s.text.len()).sum()))
+            .collect();
+        let read_only = self.read_only;
+        Some(
+            PictureColumn::new(items, &self.picture_heights[line], &self.picture_column, move |i, right, window| {
+                let (seg, offset) = starts[i];
+                Message::Press {
+                    line,
+                    cell: None,
+                    press: pictures::press(seg, offset, read_only, right, window),
+                }
+            })
+            .on_pending(Message::PicturesShown)
+            .into(),
+        )
     }
 
     fn editor_element<'a>(&'a self, statuses: &Statuses) -> Element<'a, Message> {
@@ -1156,6 +1256,16 @@ fn callout_color(kind: Option<&str>) -> iced::Color {
         "question" | "help" | "faq" | "example" => theme::MENTION,
         _ => theme::LINK,
     }
+}
+
+/// The line is nothing but picture embeds (and spaces).
+fn pictures_only(drawn: &Drawn) -> bool {
+    !drawn.pictures.is_empty()
+        && drawn
+            .segs
+            .iter()
+            .enumerate()
+            .all(|(i, s)| s.text.trim().is_empty() || drawn.pictures.iter().any(|p| p.seg == i))
 }
 
 fn heading_level(line: &str) -> u8 {

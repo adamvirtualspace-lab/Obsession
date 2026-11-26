@@ -37,7 +37,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `history.rs` | 316 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step { files: Vec<Change>, open, what, joined }` + `fingerprint`: undo for changes made from the open note's view to other notes (one step can hold several files), taken only while the open note's text matches its fingerprint from then; capped at 500 steps and 8 MB (`Step::bytes`). A `joined` step goes with the open note's own edit in one press (`undo_joined` after its undo; redone just before its redo). |
 | `syntax.rs` | 380 | Line tokenizer for highlighting: `scan_line(LineState, line)`, `LineState::{Start, Normal, Frontmatter, Fence, Comment}`, `can_hold_task`. Used by everything that must skip code and frontmatter. |
 | `status.rs` | 440 | Tasks and status formats: `task_box(line)`, `tasks(text)` → `(line, byte of [, char)`, `Format` (`builtin`, `index_of`, `get`, `next`, `is_finished`), `from_frontmatter`, `resolve(note, team)`. |
-| `live.rs` | 910 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s with raw-byte mapping, `table_cells`, `trailing_block_id`. |
+| `live.rs` | 1023 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s (and `pictures`: `Picture { seg, target, width }`, `is_picture`) with raw-byte mapping, `table_cells`, `trailing_block_id`. |
 | `links.rs` | 1021 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `build_cached` + `to_cache` + `save_cache` (`.obsessed/cache/links.txt`), `stamp`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `link_states`, `rewrite_links` for renames, `remove_links(text, pick)` + `link_words` (unlinking keeps the words), `task_at(text, sub, task_lines)` (which task a `#^block` / `#heading` link points at, for wires that end at a row). |
 | `preview.rs` | 430 | Obsidian → plain markdown (unused by the app now; kept for export). |
 | `fuzzy.rs` | 70 | `score(query, candidate)` for the quick switcher. |
@@ -58,9 +58,10 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 3915 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 4000 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1100 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. |
-| `live.rs` | 1350 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. |
+| `live.rs` | 1477 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys. Pictures: `picture_column` (a `PictureColumn` under the line, or alone for a line of only pictures), `picture_heights` in `line_height`, `pictures_near` (what `view` builds), `Message::PicturesShown`. |
+| `pictures.rs` | 534 | Pictures in notes: `Pictures` (decoded by `Key { rel, width }`, 64 MB `BUDGET`, `want` / `loaded` / `trim` / `forget`, the open note's targets, `decode_width`, scale factor), `decode` (off-thread, two at a time, EXIF, shrunk to the width drawn), `PictureColumn` widget. |
 | `live_text.rs` | 350 | One drawn line widget that reports which byte a press hit. |
 | `highlight.rs` | 200 | iced highlighter over `core::syntax`; status and link colours. |
 | `source_scroll.rs` | 230 | Tracks the Source editor's scroll for Split mode. |
@@ -88,6 +89,16 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 **Opening a note.** `App::open(rel)`: `save_now` the old one, `store.pin` +
 `store.get`, `Note::new`. Closes the function editor and picker. If the note is
 a `_nodes.md`, `rebuild_graph`.
+
+**Pictures.** `App::update` → `want_pictures` after every message:
+`Note::pictures_near` (the Live view on screen; nothing in Source, a graph,
+or before the scale factor is known) → `Vault::attachment` for each target
+→ `Pictures::set_targets` + `want` → a `pictures::decode` task per new one →
+`Message::PictureLoaded` → `Pictures::loaded` (trims to the budget).
+`Live::view(statuses, pictures)` draws from `Pictures::shown`. The scale
+factor: `window::scale_factor` at boot, `Rescaled` events →
+`Message::ScaleFactor`. `files_changed` forgets a changed picture;
+`VaultRefreshed` retries failed ones; a new vault clears them.
 
 **Typing and saving.** Editor actions → `Note::perform` (history, timers) →
 `Timer::Save` fires after 1 s → `save_now`: `store.set` + `LinkIndex::update` +

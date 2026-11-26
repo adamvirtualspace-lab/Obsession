@@ -628,10 +628,14 @@ raw editor always shows the exact text.
 
 | | Drawn in preview |
 |---|---|
-| **Standard markdown** | Headings, emphasis, lists, quotes, code (highlighted), links, images, rules |
+| **Standard markdown** | Headings, emphasis, lists, quotes, code (highlighted), links, rules, pictures (`![alt](shot.png)`, `![alt\|300](shot.png)`) |
 | **GitHub extras** | Tables, task lists, strikethrough, footnotes |
-| **Obsidian extras** | `[[links]]` in every form from section 6, `#tags`, frontmatter properties, `%% comments %%` (hidden), `==highlights==`, `> [!note]` callouts |
-| **Not yet** (shown as plain text) | `![[embeds]]`, math (`$...$`), Mermaid |
+| **Obsidian extras** | `[[links]]` in every form from section 6, `#tags`, frontmatter properties, `%% comments %%` (hidden), `==highlights==`, `> [!note]` callouts, picture embeds (`![[shot.png]]`, `![[shot.png\|300]]`) |
+| **Not yet** (shown as a 📎 placeholder or plain text) | Note embeds (`![[other note]]`), PDFs and videos, pictures from the web, math (`$...$`), Mermaid |
+
+Pictures (PNG, JPEG, GIF, WebP, BMP) are found like any attachment (section
+6), drawn under their line at their own size or the `|width` given, never
+wider than the text column. A line holding only pictures shows just them.
 
 Also: a backlinks panel, a quick switcher and vault search.
 
@@ -728,6 +732,6 @@ nothing yet.
 - Functions that call other saved functions.
 - A `_nodes.md` linking another folder's `_nodes.md`, drawn as a group card you
   can open.
-- Embeds, math and Mermaid in the preview.
+- Note embeds, PDFs, math and Mermaid in the preview.
 - Due dates and priorities on tasks.
 - More badges for crew cards.

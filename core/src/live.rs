@@ -181,6 +181,28 @@ pub struct Line {
     /// `> [!note]` style callout type, lowercased.
     pub callout: Option<String>,
     pub segs: Vec<Seg>,
+    /// Pictures the line embeds, drawn under (or instead of) its text.
+    pub pictures: Vec<Picture>,
+}
+
+/// A picture embed: `![[shot.png]]`, `![[shot.png|300]]`, `![alt](shot.png)`
+/// or `![alt|300](refs/shot%20b.png)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picture {
+    /// The placeholder piece in `Line::segs` that stands for it.
+    pub seg: usize,
+    /// The file as written (URL escapes decoded), to resolve in the vault.
+    pub target: String,
+    /// `|300` (or `|300x200`): the width to draw it at, in pixels.
+    pub width: Option<u32>,
+}
+
+/// The extensions drawn as pictures.
+pub fn is_picture(target: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    })
 }
 
 impl Line {
@@ -222,6 +244,72 @@ impl Line {
 
 /// Renders one ordinary line (a `BlockKind::Line` block).
 pub fn line(raw: &str, format: &Format) -> Line {
+    let mut out = line_inner(raw, format);
+    out.pictures = pictures(raw, &out.segs);
+    // The picture is drawn under the line, so its placeholder piece shows
+    // nothing (it keeps its raw range, for clicks and the caret).
+    for p in &out.pictures {
+        out.segs[p.seg].text.clear();
+    }
+    out
+}
+
+/// The line's embeds that are pictures, from their placeholder pieces.
+fn pictures(raw: &str, segs: &[Seg]) -> Vec<Picture> {
+    let mut out = Vec::new();
+    for (index, seg) in segs.iter().enumerate() {
+        if !seg.style.has(Style::FAINT) || seg.action.is_none() {
+            continue;
+        }
+        let Some(written) = raw.get(seg.raw.clone()) else {
+            continue;
+        };
+        let (target, size) = if let Some(inner) = written.strip_prefix("![[").and_then(|w| w.strip_suffix("]]")) {
+            let mut parts = inner.split('|');
+            let target = parts.next().unwrap_or("").trim().to_owned();
+            (target, parts.next_back())
+        } else if let Some((label, url, _)) = written.strip_prefix('!').and_then(markdown_link) {
+            if url.contains("://") || url.starts_with("data:") {
+                continue;
+            }
+            let alt = &written[1 + label.start..1 + label.end];
+            (percent_decode(url), alt.rsplit_once('|').map(|(_, size)| size))
+        } else {
+            continue;
+        };
+        if !is_picture(&target) {
+            continue;
+        }
+        let width = size
+            .map(|s| s.trim().split('x').next().unwrap_or(""))
+            .and_then(|w| w.parse::<u32>().ok())
+            .filter(|&w| w > 0);
+        out.push(Picture { seg: index, target, width });
+    }
+    out
+}
+
+/// `%20` and other escapes in a markdown link's path.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = s.get(i + 1..i + 3)
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
+fn line_inner(raw: &str, format: &Format) -> Line {
     let mut out = Line::default();
     let bytes = raw.as_bytes();
     let trimmed = raw.trim();
@@ -789,6 +877,31 @@ fn merge(segs: &mut Vec<Seg>) {
         out.push(seg);
     }
     *segs = out;
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    #[test]
+    fn pictures_in_a_line() {
+        let f = Format::builtin();
+        let l = line("See ![[shot.png|300]] and ![the plate|200x100](refs/plate%20b.JPG) ![[brief]] ![[deck.pdf]]", &f);
+        let got: Vec<(&str, Option<u32>)> = l.pictures.iter().map(|p| (p.target.as_str(), p.width)).collect();
+        assert_eq!(got, [("shot.png", Some(300)), ("refs/plate b.JPG", Some(200))]);
+        // Each points at its placeholder piece, which draws nothing (the
+        // picture goes under the line); other embeds keep theirs.
+        for p in &l.pictures {
+            assert!(l.segs[p.seg].style.has(Style::FAINT) && l.segs[p.seg].text.is_empty());
+        }
+        assert_eq!(l.text(), "See  and  📎 brief 📎 deck.pdf");
+        // A web picture, a note embed, code and an alias that isn't a size.
+        let l = line("![x](https://e.com/a.png) `![[a.png]]` ![[b.gif|the gif]]", &f);
+        let got: Vec<(&str, Option<u32>)> = l.pictures.iter().map(|p| (p.target.as_str(), p.width)).collect();
+        assert_eq!(got, [("b.gif", None)]);
+        assert!(line("- [ ] check ![[c.webp]]", &f).pictures.len() == 1);
+        assert!(is_picture("a/B.JpEg") && !is_picture("a.svg") && !is_picture("png"));
+    }
 }
 
 #[cfg(test)]

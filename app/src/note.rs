@@ -15,6 +15,7 @@ use obsession_core::{preview, syntax};
 
 use crate::highlight::{LinkStates, Statuses};
 use crate::live::{self, LINE_PX, Live};
+use crate::pictures::Pictures;
 use crate::source_scroll::SourceScroll;
 use crate::theme;
 
@@ -765,6 +766,8 @@ impl Note {
                     live.drag_to(line, cell, offset);
                 }
             }
+            // The app looks pictures up after every message.
+            live::Message::PicturesShown => {}
             live::Message::MouseUp => {
                 if let Body::Live(live) = &mut self.body {
                     outcome.focus = live.release();
@@ -1003,16 +1006,22 @@ impl Note {
 
     // ---- Views ----
 
-    pub fn view_live(&self) -> Option<Element<'_, live::Message>> {
+    pub fn view_live(&self, pictures: &Pictures) -> Option<Element<'_, live::Message>> {
         match &self.body {
-            Body::Live(live) => Some(live.view(&self.statuses)),
+            Body::Live(live) => Some(live.view(&self.statuses, pictures)),
             Body::Source(_) => None,
         }
     }
 
     /// Split mode's read-only view of the Source text.
-    pub fn view_mirror(&self) -> Option<Element<'_, live::Message>> {
-        self.mirror.as_ref().map(|mirror| mirror.view(&self.statuses))
+    pub fn view_mirror(&self, pictures: &Pictures) -> Option<Element<'_, live::Message>> {
+        self.mirror.as_ref().map(|mirror| mirror.view(&self.statuses, pictures))
+    }
+
+    /// The picture embeds near the visible part of the Live view on screen
+    /// (the note's own, or Split's): (target as written, `|width`).
+    pub fn pictures_near(&self) -> Vec<(String, u32)> {
+        self.shown_live_ref().map_or_else(Vec::new, Live::pictures_near)
     }
 
     /// The `@name` being typed right before the caret (without the `@`;

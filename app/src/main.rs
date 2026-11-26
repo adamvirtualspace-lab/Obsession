@@ -13,6 +13,7 @@ mod live;
 mod live_text;
 mod new_note;
 mod note;
+mod pictures;
 mod right_click;
 mod runs;
 mod settings;
@@ -50,6 +51,7 @@ use obsession_core::vault::{self, Kind, Resolved, Vault};
 use func_editor::{Context, Editor, Picker};
 use new_note::NewNote;
 use note::{Mode, Note, Timer};
+use pictures::Pictures;
 use sidebar::Tree;
 use status_menu::StatusMenu;
 use switcher::Switcher;
@@ -69,6 +71,11 @@ pub fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 enum Message {
+    /// The window's scale factor (at start, and when it moves to another
+    /// screen), for decoding pictures sharp.
+    ScaleFactor(f32),
+    /// A picture finished decoding (for the store's generation then).
+    PictureLoaded(pictures::Key, u64, Result<pictures::Decoded, String>),
     PickFolder,
     FolderPicked(Option<PathBuf>),
     Scanned(Result<Vault, String>),
@@ -328,6 +335,8 @@ struct App {
     settings: Option<SettingsForm>,
     /// Vault search, while open.
     find: Option<find::Find>,
+    /// Decoded pictures for the note on screen (and recent ones).
+    pictures: Pictures,
 }
 
 /// A search index built in the background, handed over once.
@@ -432,7 +441,9 @@ impl App {
             unlinking: None,
             settings: None,
             find: None,
+            pictures: Pictures::new(),
         };
+        let scale = window::latest().and_then(window::scale_factor).map(Message::ScaleFactor);
         let start = std::env::args_os()
             .nth(1)
             .map(PathBuf::from)
@@ -442,9 +453,9 @@ impl App {
             Some(path) => {
                 let mut app = app;
                 let task = app.scan(path);
-                (app, task)
+                (app, Task::batch([scale, task]))
             }
-            None => (app, Task::none()),
+            None => (app, scale),
         }
     }
 
@@ -456,6 +467,55 @@ impl App {
             },
             None => "Obsession".into(),
         }
+    }
+
+    /// Looks up the pictures near the visible part of the note on screen
+    /// and starts decoding the ones not held yet (each off the UI thread).
+    fn want_pictures(&mut self) -> Task<Message> {
+        let Some(ws) = &self.workspace else {
+            return Task::none();
+        };
+        let showing = self.mode != Mode::Source && !(self.show_graph && self.graph.is_some()) && self.pictures.ready();
+        let near = match &ws.note {
+            Some(note) if showing => note.pictures_near(),
+            _ => Vec::new(),
+        };
+        let from = ws.note.as_ref().map(|n| n.rel.to_string());
+        let mut targets = HashMap::new();
+        let mut keys = Vec::new();
+        for (target, width) in near {
+            let rel: Option<Box<str>> = ws.vault.attachment(&target, from.as_deref()).map(Box::from);
+            if let Some(rel) = &rel {
+                keys.push(pictures::Key { rel: rel.clone(), width });
+            }
+            targets.insert(target, rel);
+        }
+        self.pictures.set_targets(targets);
+        let start = self.pictures.want(keys);
+        let (scale, generation) = (self.pictures.scale(), self.pictures.generation());
+        let timing = std::env::var_os("OBSESSION_DEV_TIMING").is_some();
+        Task::batch(start.into_iter().map(|key| {
+            let path = ws.vault.path(&key.rel);
+            let tag = key.clone();
+            Task::perform(
+                async move {
+                    let started = std::time::Instant::now();
+                    let result = pictures::decode(path, key.width, scale);
+                    if timing && let Ok(d) = &result {
+                        eprintln!(
+                            "TIMING picture {}: {} ms, {}x{} kept as {:.1} MB",
+                            key.rel,
+                            started.elapsed().as_millis(),
+                            d.natural.0,
+                            d.natural.1,
+                            d.bytes as f64 / 1048576.0
+                        );
+                    }
+                    result
+                },
+                move |result| Message::PictureLoaded(tag.clone(), generation, result),
+            )
+        }))
     }
 
     fn scan(&mut self, path: PathBuf) -> Task<Message> {
@@ -482,6 +542,7 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        let task = Task::batch([task, self.want_pictures()]);
         // Split mode: scroll the read-only view to stay level with the editor.
         match self.note_mut().and_then(Note::take_mirror_scroll) {
             Some(y) => Task::batch([
@@ -497,6 +558,18 @@ impl App {
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ScaleFactor(scale) => {
+                self.pictures.set_scale(scale);
+                Task::none()
+            }
+            Message::PictureLoaded(key, generation, result) => {
+                self.pictures.loaded(key, generation, result);
+                if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+                    let (bytes, count) = self.pictures.held();
+                    eprintln!("TIMING pictures held: {:.1} MB in {count}", bytes as f64 / 1048576.0);
+                }
+                Task::none()
+            }
             Message::PickFolder | Message::Shortcut(Shortcut::OpenFolder) => {
                 let save = self.save_now();
                 let pick = Task::perform(
@@ -548,6 +621,7 @@ impl App {
                     },
                     |(root, index)| Message::Indexed(root, index),
                 );
+                self.pictures.clear();
                 let mut ws = Workspace {
                     vault,
                     store,
@@ -844,6 +918,7 @@ impl App {
                 ws.vault = vault;
                 ws.tree.refresh(&ws.vault);
                 ws.load_crew();
+                self.pictures.forget_failed();
                 self.rebuild_index();
                 self.refresh_links();
                 self.rebuild_graph();
@@ -2739,6 +2814,12 @@ impl App {
         let mut warnings: Vec<String> = Vec::new();
         for event in events {
             structural |= event.structural;
+            if let Ok(rel) = event.path.strip_prefix(&root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if obsession_core::live::is_picture(&rel) {
+                    self.pictures.forget(&rel);
+                }
+            }
             let Some(rel) = runs::rel_of(&root, &event.path) else { continue };
             match ws.store.check_outside(&rel) {
                 Outside::Same => {}
@@ -3410,6 +3491,10 @@ impl App {
             watch,
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
+            event::listen_with(|event, _, _| match event {
+                iced::Event::Window(window::Event::Rescaled(scale)) => Some(Message::ScaleFactor(scale)),
+                _ => None,
+            }),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             event::listen_with(|event, _, _| match event {
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
@@ -3464,11 +3549,11 @@ impl App {
                         let body = match self.mode {
                             _ if graph.is_some() => graph,
                             Mode::Live | Mode::Reading => {
-                                note.view_live().map(|view| view.map(Message::Live))
+                                note.view_live(&self.pictures).map(|view| view.map(Message::Live))
                             }
                             Mode::Source => editor(),
                             Mode::Split => editor().map(|editor| {
-                                let mirror: Element<'_, Message> = match note.view_mirror() {
+                                let mirror: Element<'_, Message> = match note.view_mirror(&self.pictures) {
                                     Some(view) => view.map(Message::Live),
                                     None => Space::new().into(),
                                 };

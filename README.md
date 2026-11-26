@@ -43,6 +43,14 @@ when you type or click; scrolling the view scrolls the editor back. **Reading** 
 off: links and status chips still click, nothing else does. All views centre
 the text in the same column.
 
+**Pictures:** `![[shot.png]]`, `![[shot.png|300]]` (300 pixels wide) and
+`![alt](refs/shot.png)` draw the picture in Live, Split and Reading, found from
+any folder like a link, fitted to the text column and turned the way the
+camera's EXIF says. PNG, JPEG, GIF (first frame), WebP and BMP. Clicking one
+in Live edits its line; in Reading it opens the file. A picture that isn't in
+the vault shows a ⚠ box. Pictures load in the background at the size they're
+drawn, and at most 64 MB of them are kept in memory.
+
 **Tasks:** click a task's status (in any view) to move it to the next status.
 Right-click a task (in any view) to pick any status. Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`

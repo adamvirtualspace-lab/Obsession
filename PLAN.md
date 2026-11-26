@@ -991,6 +991,39 @@ renaming an `id` from the editor, matching the cards to the Possess mockup.
    in Live, Split and Reading, fitted to the text column. Decoded off the UI
    thread at the size drawn, not full size; pictures far off screen are
    dropped from memory. (`app/src/live.rs`, iced's `image` feature)
+   ✅ **Done (November 2026).** Core: `live::line` lists a line's picture
+   embeds in `Line::pictures` (`Picture { seg, target, width }`, from
+   `![[x.png|300]]` and `![alt|300](path%20x.png)`; web pictures, code and
+   other embeds aren't), and their placeholder pieces draw nothing.
+   `app/src/pictures.rs`: `Pictures` (decoded pictures by file and width,
+   at most 64 MB, the least recently wanted that aren't near the screen
+   going first; the open note's target → file lookups) and `decode` (off
+   the UI thread, two at a time, EXIF rotation, shrunk with a box filter to
+   the width drawn times the scale factor, never enlarged), and the
+   `PictureColumn` widget (fits each picture to the column, writes its
+   height back for the page's sums, a 200 px box while loading, a ⚠ box
+   when missing or unreadable; a press is the embed's: Live edits the line,
+   Reading opens the file). The width decoded for is the column the
+   pictures were last laid out in, rounded up to 100 px, so a 360 px
+   column keeps a 3000×2000 photo as 2.1 MB, not 8.2 MB at the full 800
+   px. After every message `want_pictures` looks up the embeds `view`
+   builds (visible ± 900 px) and starts decoding new ones; a picture shown
+   before it's been looked up asks once (`PicturesShown`). Decoding waits
+   for the window's scale factor (`window::scale_factor`, `Rescaled`); a
+   changed picture file is decoded again; a rescan retries failures. iced's
+   `image-without-codecs` plus the `image` crate with PNG, JPEG, GIF, WebP
+   and BMP only. Checked by hand: the test note (a 64 px PNG at its size, a
+   4000×2250 JPEG fitted to the column, `|300` and `|200`, an EXIF-rotated
+   JPEG standing upright, a missing one's ⚠ box), a click in Live showing
+   `![[photo01.jpg]]` raw, Split's narrower preview, Reading, an outside
+   edit to a photo redrawn. Measured: a note with twenty 3000×2000 photos
+   opens at once and decodes the ten near the screen, about 65 ms each;
+   scrolling through all of it and back held 49.7 MB in 25 pictures
+   (process 147 MB); reopening it decoded nothing. Idle: 0 bytes written;
+   CPU 0 ms in Source view, but with pictures on screen an occasional
+   15.6 ms tick (one in about a minute) from a thread outside the app's
+   code (no messages arrive; probably the driver keeping the textures).
+   Core tests: 100 (1 new).
 3. **Crew portraits.** `portrait:` on a card is drawn on the crew hand, the
    graph and the card's note; bots without one keep their bot face.
    (`graph.rs`)
@@ -998,6 +1031,9 @@ renaming an `id` from the editor, matching the cards to the Possess mockup.
 *Budgets*, to be confirmed by measuring first: decoded pictures held in at
 most 64 MB, a note with 20 pictures opening in under 100 ms after the first
 time, idle CPU 0 ms. Note embeds (`![[other note]]`) stay out of version 1.
+Measured in item 2: 49.7 MB held after scrolling a 20-photo note; opening it
+doesn't wait for pictures, and the second time they're all held already;
+idle CPU see item 2.
 
 ## Risks
 
