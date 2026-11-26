@@ -11,11 +11,6 @@ iced = { workspace = true, features = ["wgpu", "thread-pool", "advanced", "canva
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 rfd.workspace = true
 anyhow.workspace = true
-
-# The vault watcher: our own on Windows (it sleeps until a change); notify
-# elsewhere (inotify, FSEvents).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
-
-[target.'cfg(not(windows))'.dependencies]
-notify = { version = "8.2.2", default-features = false }
+# The vault watcher, on every system. 9.0 or later: before, its Windows
+# backend woke every 100 ms.
+notify = { version = "9.0.0", default-features = false }

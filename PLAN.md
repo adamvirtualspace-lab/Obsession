@@ -671,9 +671,9 @@ Still not right, for later:
 ### CPU
 
 - **Nothing runs when idle.** No polling or repeating timers. The file watcher
-  is event-driven (on Windows our own, `app/src/watch.rs`: `notify`'s Windows
-  backend wakes every 100 ms), and the function timer only exists while a run
-  is pending. Checked by counting each thread's CPU cycles
+  is event-driven (`notify` 9 on every system; up to 8.2 its Windows backend
+  woke every 100 ms), and the function timer only exists while a run is
+  pending. Checked by counting each thread's CPU cycles
   (`bench/scripts/idle-threads.ps1`): idle, no thread runs at all.
 - **Bursts are spread out.** Many notes changed at once by another app (a git
   pull, a sync) are queued and read a slice at a time, off the UI thread,
@@ -1082,17 +1082,16 @@ idle CPU see item 2.
 - **The idle wakeup.** Counting CPU cycles per thread showed `notify`'s
   Windows watcher thread waking ten times a second (a 100 ms timeout on a
   wait nothing signals; that's how it picks up its own commands), with or
-  without pictures. On Windows the vault is now watched by `app/src/watch.rs`:
-  one thread asks for changes under the vault folder (`ReadDirectoryChangesW`,
-  overlapped) and sleeps on that and a stop event with no timeout; dropping
-  the subscription sets the stop. A buffer overflow is reported as the vault
-  folder (rescan). Other systems keep `notify` (inotify, FSEvents sleep until
-  a change); `Cargo.toml` takes `notify` only off Windows and `windows-sys`
-  (already in the build) only on it. The watcher lets a burst gather for 50
-  ms per batch, as each batch is a message and each message a redraw.
-  Checked: an outside edit to the open note, a new note, a rename, a delete
-  and a changed picture all reach the app; the app's own save isn't logged as
-  an outside change. Idle with photos on screen: no thread runs in 60 s.
+  without pictures. `notify` 9.0 fixed it (its Windows thread waits with no
+  timeout and every command wakes it), so the app moved from 8.2 to 9.0, on
+  every system alike. (In between, a Windows-only watcher of our own did the
+  same; it went once 9.0 was found, so all systems share one path.) The
+  watcher (`app/src/watch.rs`) lets a burst gather for 50 ms per batch, as
+  each batch is a message and each message a redraw, and turns a "rescan"
+  event (the system dropped changes) into a rescan of the vault. Checked on
+  9.0: an outside edit to the open note, a new note, a rename, a delete and
+  a changed picture all reach the app; the app's own save isn't logged as an
+  outside change. Idle with photos on screen: no app thread runs in 60 s.
 - **Bursts.** `files_changed` used to read every changed note at once on the
   UI thread. Now notes go in a queue (`OutsideQueue`); `drain_outside` takes
   a slice: notes the store holds are checked there (up to 4 ms), up to 64
