@@ -1518,8 +1518,8 @@ impl App {
         }
     }
 
-    /// Changes the text holding the edited function: the graph (undoable)
-    /// or `_funct.md`.
+    /// Changes the text holding the edited function: the graph, or
+    /// `_funct.md` (an `Elsewhere` step). Either way Ctrl+Z undoes it.
     fn edit_function(&mut self, change: Box<dyn FnOnce(&str) -> String>) -> Task<Message> {
         let Some(editor) = &self.editor else {
             return Task::none();
@@ -1527,10 +1527,8 @@ impl App {
         match editor.origin {
             Origin::Local => self.edit_graph(change, true),
             Origin::Saved => {
-                let Some(ws) = &mut self.workspace else {
-                    return Task::none();
-                };
-                let Ok(text) = ws.store.get(func::SAVED).map(str::to_owned) else {
+                let what = format!("Edited {} in {}", editor.name, func::SAVED);
+                let Some(text) = self.current_text(func::SAVED) else {
                     self.status = Some("⚠ Couldn't read _funct.md".into());
                     return Task::none();
                 };
@@ -1538,13 +1536,15 @@ impl App {
                 if new == text {
                     return Task::none();
                 }
-                ws.store.set(func::SAVED, new);
-                let task = match ws.store.take_save(func::SAVED) {
-                    Some(job) => Task::perform(async move { job.run() }, Message::Saved),
-                    None => Task::none(),
+                let file = history::Change {
+                    rel: func::SAVED.to_owned(),
+                    before: text,
+                    after: new,
                 };
-                self.rebuild_index();
-                self.rebuild_graph();
+                // Quiet like a graph edit; the step's words are for undo.
+                let status = self.status.take();
+                let task = self.edit_files(vec![file], what, false);
+                self.status = status;
                 task
             }
         }

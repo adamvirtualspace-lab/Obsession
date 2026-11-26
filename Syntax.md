@@ -567,6 +567,8 @@ Set Status(dst, s, find: target)
   heading too, and every graph's wires that use it.
 - **Editing a saved function updates every wire that uses it.** To make a
   variant, use **Duplicate** in the function library and edit the copy.
+  Ctrl+Z in the function editor undoes such an edit (unless `_funct.md`
+  was changed outside since).
 - The app creates `_funct.md` with these two functions the first time you open
   the function library.
 

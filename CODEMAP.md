@@ -34,7 +34,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `store.rs` | 520 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
-| `history.rs` | 283 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step { files: Vec<Change>, open, what, joined }` + `fingerprint`: undo for changes made from the open note's view to other notes (one step can hold several files), taken only while the open note's text matches its fingerprint from then. A `joined` step goes with the open note's own edit in one press (`undo_joined` after its undo; redone just before its redo). |
+| `history.rs` | 316 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step { files: Vec<Change>, open, what, joined }` + `fingerprint`: undo for changes made from the open note's view to other notes (one step can hold several files), taken only while the open note's text matches its fingerprint from then; capped at 500 steps and 8 MB (`Step::bytes`). A `joined` step goes with the open note's own edit in one press (`undo_joined` after its undo; redone just before its redo). |
 | `syntax.rs` | 380 | Line tokenizer for highlighting: `scan_line(LineState, line)`, `LineState::{Start, Normal, Frontmatter, Fence, Comment}`, `can_hold_task`. Used by everything that must skip code and frontmatter. |
 | `status.rs` | 440 | Tasks and status formats: `task_box(line)`, `tasks(text)` → `(line, byte of [, char)`, `Format` (`builtin`, `index_of`, `get`, `next`, `is_finished`), `from_frontmatter`, `resolve(note, team)`. |
 | `live.rs` | 910 | Live Preview model: `blocks(lines)`, `line(raw, format)` → drawn `Line` of `Seg`s with raw-byte mapping, `table_cells`, `trailing_block_id`. |
@@ -112,7 +112,8 @@ has a known function) or `open_picker` (it doesn't; creates `_funct.md` first
 via `ensure_saved_functions`). Picker → `picker_message` → `attach` (set the
 wire's function, maybe add a block) → `open_editor`. Editor events →
 `editor_message` → `Outcome::Edit` → `edit_function`: the open `_nodes.md`
-through `edit_graph`, or `_funct.md` through the store and a save; then
+through `edit_graph`, or `_funct.md` through `edit_files` (an `Elsewhere`
+step, so Ctrl+Z undoes it; the status line stays quiet); then
 `rebuild_graph` → `refresh_editor`, which finds the block again, gathers the
 wire's values and the wired notes (`Bind`s), and calls `Editor::refresh`
 (check + eval → live values). If the function's name isn't found, it takes

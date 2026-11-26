@@ -83,7 +83,8 @@ several ins or outs as a node; wire notes to its pins. To rename a function,
 click its name at the top of the panel, type the new one and press Enter: every
 wire, `fn` card and pin that uses it follows (in every graph, for a saved
 function), and one Ctrl+Z puts it all back. A name that's already taken is
-refused.
+refused. Every edit in the function editor undoes with Ctrl+Z, saved functions
+in `_funct.md` included, in turn with the graph's own edits.
 
 **Search:** Ctrl+Shift+F (or **Search** in the toolbar) finds every line that
 has all the words you type, in every note, ignoring case. Matches are

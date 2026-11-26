@@ -126,6 +126,13 @@ pub struct Step {
     pub joined: bool,
 }
 
+impl Step {
+    /// The size of the texts it keeps.
+    fn bytes(&self) -> usize {
+        self.files.iter().map(|f| f.before.len() + f.after.len()).sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub rel: String,
@@ -146,8 +153,11 @@ impl Elsewhere {
     pub fn push(&mut self, step: Step) {
         self.redo.clear();
         self.undo.push(step);
-        if self.undo.len() > MAX_STEPS {
-            self.undo.remove(0);
+        // Each step holds whole texts (`_funct.md` for a function edit), so
+        // the same byte cap as a note's history applies; the oldest go first.
+        let mut bytes: usize = self.undo.iter().map(Step::bytes).sum();
+        while self.undo.len() > MAX_STEPS || (bytes > MAX_BYTES && self.undo.len() > 1) {
+            bytes -= self.undo.remove(0).bytes();
         }
     }
 
@@ -279,5 +289,28 @@ mod tests {
         e.push(Step { joined: true, ..step("d.md", "graph 1") });
         assert_eq!(e.undo_joined(fingerprint("graph 2")), None);
         assert!(e.undo_joined(fingerprint("graph 1")).is_some_and(|s| s.joined));
+    }
+
+    #[test]
+    fn elsewhere_keeps_to_the_byte_cap() {
+        let mut e = Elsewhere::default();
+        let big = "x".repeat(MAX_BYTES / 4);
+        for i in 0..4 {
+            let mut s = step(&format!("{i}.md"), "graph");
+            s.files[0].before = big.clone();
+            e.push(s);
+        }
+        // Four steps of a quarter each, plus their "y"s: the oldest went.
+        let mut rels = Vec::new();
+        while let Some(s) = e.undo(fingerprint("graph")) {
+            rels.push(s.files[0].rel.clone());
+        }
+        assert_eq!(rels, ["3.md", "2.md", "1.md"]);
+        // One step bigger than the cap still stays.
+        let mut e = Elsewhere::default();
+        let mut s = step("huge.md", "graph");
+        s.files[0].before = "x".repeat(MAX_BYTES + 1);
+        e.push(s);
+        assert!(e.undo(fingerprint("graph")).is_some());
     }
 }

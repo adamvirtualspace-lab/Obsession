@@ -397,8 +397,8 @@ How it works:
 
 Known limits, for later:
 
-- Edits to a saved function in `_funct.md` are saved straight away but aren't
-  in Ctrl+Z (only the open note has undo history). → Milestone 9.
+- ~~Edits to a saved function in `_funct.md` are saved straight away but
+  aren't in Ctrl+Z.~~ Done in milestone 9, item 6.
 - ~~Renaming a function (its `fn` line) doesn't update the wires that use
   it.~~ Done in milestone 9, item 5: rename from the editor's title.
 - The editor's view and the inputs node's place aren't saved. The view is
@@ -784,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (5 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** (6 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -918,6 +918,22 @@ In this order:
 6. **Function edits undo.** Ctrl+Z in the function editor undoes its last edit
    wherever the function lives, `_funct.md` included (today only the open
    note has history). (`main.rs`, `history.rs`)
+   ✅ **Done (November 2026).** A local function already lived in the open
+   graph, so its edits were in the graph's history. A saved function's edit
+   now goes through `edit_files` as an `Elsewhere` step ("Edited Wait For
+   Done in _funct.md", shown only by Undone/Redone), so Ctrl+Z and Ctrl+Y
+   take it in turn with the graph's own edits, newest first, and refuse with
+   a message when `_funct.md` changed outside since. Saving goes through
+   `put_files` like any other note change (search and links kept up to date,
+   the run index rebuilt). `Elsewhere` now keeps to the same 8 MB cap as a
+   note's history, as each step holds `_funct.md` before and after. Checked
+   by hand: on *Wait For Done*, added a node and set its value; Ctrl+Z (with
+   the cursor still in the value box) took the value off, again took the
+   node, `_funct.md` back byte for byte; Ctrl+Y twice; then a wire value
+   (the graph) changed and three Ctrl+Z undid the wire value, the node value
+   and the node in that order, then "Nothing to undo"; an outside edit to
+   `_funct.md` made undo refuse and was kept. Idle: 0 ms CPU, 0 bytes
+   written over 10 s. Core tests: 98 (1 new).
 7. **The crew hand stays readable.** With many people or a narrow graph, cards
    overlap but each name and badge stays visible; the raised card shows in
    full. *Done when* eight people fit a 700-pixel-wide graph. (`graph.rs`
