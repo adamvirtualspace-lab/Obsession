@@ -109,7 +109,9 @@ it): hover a card to light up the nodes and tasks that mention them, drag it
 onto a task to add their `@name`, or onto a node to pick the task. Cards show
 **OVERLOADED** or **POWERHOUSE** when someone has 2× or 1.5× the open tasks of
 the rest of the crew (the median); on a crew card note, the status bar shows
-their open tasks across the vault.
+their open tasks across the vault. With many people or a narrow graph the
+cards overlap, each still showing its face, name and badge (shortened to
+fit); hover one to see it whole.
 
 **Runs:** a function runs when a note it reads changes, whether you edit it
 here or in Obsidian, VS Code or a `git pull`. If its changes change a note

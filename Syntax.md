@@ -178,6 +178,8 @@ The crew appears as a hand of cards in the graph view.
 - **Drag** a card onto a task to add their `@name` to the end of the task text.
   Drop it onto a node card to choose which tasks.
 - Each card shows the portrait, name, role and how many nodes mention them.
+  When the cards overlap, each keeps its portrait, name and badge in the part
+  that shows; the hovered card rises whole.
 - Double-click a card to open its note.
 
 ### Badges

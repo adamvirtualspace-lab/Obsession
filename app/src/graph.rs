@@ -235,6 +235,8 @@ pub struct Graph {
     /// Where this graph was last looked at: used instead of fitting it.
     pub saved_view: Option<SavedView>,
     cache: Cache,
+    /// The hand as the graph canvas last drew it, for `HandLayer`.
+    hand_now: Cell<Option<HandNow>>,
     /// What the cache was drawn for.
     drawn: Cell<Option<DrawKey>>,
     version: u64,
@@ -516,6 +518,7 @@ impl Graph {
             saved_view: None,
             fit: 0,
             cache: Cache::new(),
+            hand_now: Cell::new(None),
             drawn: Cell::new(None),
             version: 0,
         }
@@ -566,12 +569,25 @@ impl Graph {
     /// A crew card `lift` of the way (0 resting, 1 risen) up.
     fn hand_rect_at(&self, i: usize, size: Size, lift: f32) -> Rectangle {
         let n = self.hand.len() as f32;
-        let step = (HAND_W + 12.0).min((size.width - 80.0 - HAND_W) / (n - 1.0).max(1.0)).max(24.0);
+        let step = self.hand_step(size);
         let total = HAND_W + step * (n - 1.0);
         let x = size.width / 2.0 - total / 2.0 + i as f32 * step;
         let rest = size.height - HAND_PEEK;
         let top = size.height - HAND_H - 10.0;
         Rectangle::new(Point::new(x, rest + (top - rest) * lift), Size::new(HAND_W, HAND_H))
+    }
+
+    /// From one card's left edge to the next: a gap while they fit,
+    /// overlapping when they don't (20 px kept free at each side).
+    fn hand_step(&self, size: Size) -> f32 {
+        let n = self.hand.len() as f32;
+        (HAND_W + 12.0).min((size.width - 40.0 - HAND_W) / (n - 1.0).max(1.0)).max(24.0)
+    }
+
+    /// How much of resting card `i` shows: the last one whole, the others
+    /// up to where the next one covers them.
+    fn hand_visible(&self, i: usize, size: Size) -> f32 {
+        if i + 1 == self.hand.len() { HAND_W } else { self.hand_step(size).min(HAND_W) }
     }
 
     /// How far each glow has faded (0 just ran, 1 gone), by graph line.
@@ -642,7 +658,14 @@ impl Graph {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        Canvas::new(self).width(Fill).height(Fill).into()
+        // The hand in a canvas of its own above the graph: a canvas is one
+        // layer, its text above all its shapes, so graph labels would show
+        // through the cards. It only draws; the graph takes every event.
+        iced::widget::stack![
+            Canvas::new(self).width(Fill).height(Fill),
+            Canvas::new(HandLayer(self)).width(Fill).height(Fill),
+        ]
+        .into()
     }
 
     fn visible_wires(&self) -> impl Iterator<Item = (usize, &WireView)> {
@@ -1163,9 +1186,10 @@ impl canvas::Program<Message> for Graph {
 }
 
 impl Graph {
-    /// The crew: highlights for the hovered (or dragged) person, the hand,
-    /// and the card being dragged.
+    /// The crew: highlights for the hovered (or dragged) person, and what
+    /// the hand looks like now, for `HandLayer` to draw over the graph.
     fn draw_crew(&self, frame: &mut Frame, state: &State, view: View, size: Size) {
+        self.hand_now.set(None);
         if !self.hand_shown() {
             return;
         }
@@ -1226,25 +1250,47 @@ impl Graph {
                 Stroke::default().with_color(color).with_width(2.0),
             );
         }
-        // The hand: resting cards first, the raised one on top.
         let raised = match (state.interaction, state.hover) {
-            (Interaction::Idle, Some(Hover::Hand(h))) => Some(h),
+            (Interaction::Idle, Some(Hover::Hand(h))) => {
+                // Eases up over RISE_MS.
+                let t = state
+                    .rise
+                    .filter(|(r, _)| *r == h)
+                    .map_or(1.0, |(_, at)| (at.elapsed().as_secs_f32() * 1000.0 / RISE_MS).min(1.0));
+                Some((h, 1.0 - (1.0 - t) * (1.0 - t)))
+            }
             _ => None,
         };
-        for i in (0..self.hand.len()).filter(|&i| Some(i) != raised) {
-            self.draw_hand_card(frame, i, self.hand_rect(i, size, false));
+        let dealing = match state.interaction {
+            Interaction::Dealing { member, at } => Some((member, at)),
+            _ => None,
+        };
+        self.hand_now.set(Some(HandNow { size, raised, dealing }));
+    }
+
+    /// The hand, drawn by `HandLayer` in a layer above the graph: resting
+    /// cards, then the raised one, then the card being dragged.
+    fn draw_hand(&self, frame: &mut Frame, now: HandNow) {
+        let size = now.size;
+        let raised = now.raised.map(|(h, lift)| (h, self.hand_rect_at(h, size, lift)));
+        for i in (0..self.hand.len()).filter(|&i| Some(i) != raised.map(|(h, _)| h)) {
+            let r = self.hand_rect(i, size, false);
+            let mut left = r.x;
+            let right = r.x + self.hand_visible(i, size);
+            // A raised card to the left covers part of this one: lay its
+            // words out in what's left.
+            if let Some((h, top)) = raised
+                && h < i
+            {
+                left = left.max(top.x + top.width);
+            }
+            self.draw_hand_card(frame, i, r, left - r.x, right - left);
         }
-        if let Some(h) = raised {
-            // Eases up over RISE_MS.
-            let t = state
-                .rise
-                .filter(|(r, _)| *r == h)
-                .map_or(1.0, |(_, at)| (at.elapsed().as_secs_f32() * 1000.0 / RISE_MS).min(1.0));
-            let lift = 1.0 - (1.0 - t) * (1.0 - t);
-            self.draw_hand_card(frame, h, self.hand_rect_at(h, size, lift));
+        if let Some((h, r)) = raised {
+            self.draw_hand_card(frame, h, r, 0.0, HAND_W);
         }
         // The card being dragged: a small token under the cursor.
-        if let Interaction::Dealing { member, at } = state.interaction {
+        if let Some((member, at)) = now.dealing {
             let c = &self.hand[member];
             frame.fill(&Path::circle(at, 18.0), c.color);
             frame.stroke(&Path::circle(at, 18.0), Stroke::default().with_color(theme::HEADING).with_width(1.5));
@@ -1272,7 +1318,10 @@ impl Graph {
         }
     }
 
-    fn draw_hand_card(&self, frame: &mut Frame, i: usize, r: Rectangle) {
+    /// A crew card. `from` and `shown`: the part of its width no other card
+    /// covers; when that's less than the whole card, its face, name and
+    /// badge are laid out to fit that strip.
+    fn draw_hand_card(&self, frame: &mut Frame, i: usize, r: Rectangle, from: f32, shown: f32) {
         let c = &self.hand[i];
         let body = Path::rounded_rectangle(r.position(), r.size(), 10.0.into());
         frame.fill(&body, theme::RAISED);
@@ -1282,6 +1331,15 @@ impl Graph {
             weight: iced::font::Weight::Semibold,
             ..theme::UI_FONT
         };
+        // Text in a canvas is drawn above every shape in it, so nothing is
+        // written where another card covers this one.
+        if from > 0.5 || shown < r.width - 0.5 {
+            if shown >= 12.0 {
+                let strip = Rectangle::new(Point::new(r.x + from, r.y), r.size());
+                self.draw_hand_strip(frame, c, strip, shown, semibold);
+            }
+            return;
+        }
         let text = |frame: &mut Frame, content: String, x: f32, y: f32, size: f32, color: Color, font: Font| {
             frame.fill_text(Text {
                 content,
@@ -1312,10 +1370,7 @@ impl Graph {
         let role = if c.role.is_empty() { format!("@{}", c.key) } else { c.role.clone() };
         text(frame, fit(&role, r.width - 60.0, 11.0), 52.0, 31.0, 11.0, theme::MUTED, theme::UI_FONT);
         if let Some(badge) = c.badge {
-            let color = match badge {
-                Badge::Overloaded => theme::DANGER,
-                Badge::Powerhouse => theme::MENTION,
-            };
+            let color = badge_color(badge);
             let pill = Rectangle::new(Point::new(r.x + 10.0, r.y + 51.0), Size::new(r.width - 20.0, 17.0));
             frame.fill(&Path::rounded_rectangle(pill.position(), pill.size(), 8.5.into()), Color { a: 0.22, ..color });
             frame.fill_text(Text {
@@ -1337,6 +1392,112 @@ impl Graph {
         text(frame, nodes, 12.0, 80.0, 11.5, theme::TEXT, theme::UI_FONT);
         text(frame, format!("{} open task{} here", c.open, if c.open == 1 { "" } else { "s" }), 12.0, 96.0, 11.5, theme::MUTED, theme::UI_FONT);
         text(frame, "Drag onto a task".to_owned(), 12.0, 112.0, 10.5, theme::FAINT, theme::UI_FONT);
+    }
+
+    /// A resting card partly covered by the next one: face, name and badge
+    /// (or role) stacked and centred in the `shown` pixels that are visible.
+    fn draw_hand_strip(&self, frame: &mut Frame, c: &HandCard, r: Rectangle, shown: f32, semibold: Font) {
+        use iced::widget::text::Alignment;
+        let cx = r.x + shown / 2.0;
+        let inner = (shown - 8.0).max(0.0);
+        let centred = |frame: &mut Frame, content: String, y: f32, size: f32, color: Color, font: Font| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(cx, r.y + y),
+                color,
+                size: Pixels(size),
+                font,
+                align_x: Alignment::Center,
+                ..Text::default()
+            });
+        };
+        let radius = (shown / 2.0 - 5.0).clamp(6.0, 13.0);
+        let face = Point::new(cx, r.y + 10.0 + radius);
+        if c.bot {
+            let side = radius * 2.0;
+            frame.fill(&Path::rounded_rectangle(Point::new(face.x - radius, face.y - radius), Size::new(side, side), (radius * 0.4).into()), c.color);
+        } else {
+            frame.fill(&Path::circle(face, radius), c.color);
+        }
+        let initials = if radius >= 10.0 { 12.0 } else { 9.0 };
+        frame.fill_text(Text {
+            content: c.initials.clone(),
+            position: Point::new(face.x, face.y - initials * 0.62),
+            color: theme::BG,
+            size: Pixels(initials),
+            font: semibold,
+            align_x: Alignment::Center,
+            ..Text::default()
+        });
+        if inner < 24.0 {
+            // Too narrow for words: the badge as a coloured bar.
+            if let Some(badge) = c.badge {
+                let bar = Rectangle::new(Point::new(r.x + 4.0, r.y + 56.0), Size::new(inner, 6.0));
+                frame.fill(&Path::rounded_rectangle(bar.position(), bar.size(), 3.0.into()), badge_color(badge));
+            }
+            return;
+        }
+        centred(frame, fit(&c.name, inner, 11.5), 40.0, 11.5, theme::HEADING, semibold);
+        match c.badge {
+            Some(badge) => {
+                let color = badge_color(badge);
+                let pill = Rectangle::new(Point::new(r.x + 4.0, r.y + 55.0), Size::new(inner, 15.0));
+                // Capitals run wider than `fit` reckons: about 0.68 em.
+                let fits = |s: &str| s.chars().count() as f32 * 9.5 * 0.68 <= inner - 6.0;
+                let words = [badge.label(), badge_short(badge)].into_iter().find(|s| fits(s));
+                // No room for its word: a solid pill in the badge's colour.
+                let alpha = if words.is_some() { 0.22 } else { 0.85 };
+                frame.fill(&Path::rounded_rectangle(pill.position(), pill.size(), 7.5.into()), Color { a: alpha, ..color });
+                if let Some(words) = words {
+                    centred(frame, words.to_owned(), 56.5, 9.5, color, semibold);
+                }
+            }
+            None => {
+                let role = if c.role.is_empty() { format!("@{}", c.key) } else { c.role.clone() };
+                centred(frame, fit(&role, inner, 10.0), 56.0, 10.0, theme::MUTED, theme::UI_FONT);
+            }
+        }
+    }
+}
+
+/// What the hand looks like this frame: the canvas size, the raised card
+/// and how far it has risen (0 to 1), and the card being dragged.
+#[derive(Debug, Clone, Copy)]
+struct HandNow {
+    size: Size,
+    raised: Option<(usize, f32)>,
+    dealing: Option<(usize, Point)>,
+}
+
+/// Draws the crew hand above the graph (see `Graph::view`). The graph
+/// canvas is drawn first and leaves `hand_now` for it.
+struct HandLayer<'a>(&'a Graph);
+
+impl canvas::Program<Message> for HandLayer<'_> {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, _: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let Some(now) = self.0.hand_now.get() else {
+            return Vec::new();
+        };
+        let mut frame = Frame::new(renderer, bounds.size());
+        self.0.draw_hand(&mut frame, now);
+        vec![frame.into_geometry()]
+    }
+}
+
+fn badge_color(badge: Badge) -> Color {
+    match badge {
+        Badge::Overloaded => theme::DANGER,
+        Badge::Powerhouse => theme::MENTION,
+    }
+}
+
+/// A badge's word for a narrow card.
+fn badge_short(badge: Badge) -> &'static str {
+    match badge {
+        Badge::Overloaded => "OVERLOAD",
+        Badge::Powerhouse => "POWER",
     }
 }
 

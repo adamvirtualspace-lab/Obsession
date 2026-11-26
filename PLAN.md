@@ -784,7 +784,7 @@ performance budgets checked.
 | 6 | **Running functions** ✅ | File watcher, throttled runs, chains, loop guard, batched atomic writes, undo log in `.obsessed/`, outside edits |
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
-| 9 | **Graph and functions, finished** (6 of 7 done) | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
+| 9 | **Graph and functions, finished** ✅ | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
@@ -938,6 +938,25 @@ In this order:
    overlap but each name and badge stays visible; the raised card shows in
    full. *Done when* eight people fit a 700-pixel-wide graph. (`graph.rs`
    `draw_crew`)
+   ✅ **Done (November 2026).** A resting card that the next one covers
+   draws its face, name and badge stacked and centred in the strip that
+   still shows (`draw_hand_strip`): the name shortened with … to fit, the
+   badge as its word, a short one (OVERLOAD, POWER) when that doesn't fit,
+   or a solid pill in its colour when no word does; the role (or `@name`)
+   when there's no badge. Below 24 px a strip keeps just the initials and a
+   badge bar. The hand keeps 20 px free at each side (was 40). The raised
+   card is drawn whole, and cards it covers lay their words out in what
+   it leaves showing. Text in an iced canvas is drawn above every shape in
+   it, so graph labels (a card's title, the ƒ) showed over the hand and a
+   covered card's words through the raised one: the hand now draws in a
+   canvas of its own stacked over the graph (`HandLayer`), which only draws;
+   the graph canvas keeps every event and leaves what the hand looks like
+   this frame in `hand_now`. Checked by hand with eight people on a 696 px
+   graph: every name (two shortened) and every badge or role readable;
+   hovering a middle card raises it whole with nothing showing through;
+   dragging a card still deals the `@bob` token and lights Bob's nodes;
+   **Crew** still hides the hand; on a 390 px graph the strips keep their
+   initials and badge colours. Idle: 0 ms CPU, 0 bytes written over 10 s.
 
 *Milestone done when* each item is checked by hand in the real window (as in
 "Checked by hand" above), core tests cover the new text edits, and idle CPU is
