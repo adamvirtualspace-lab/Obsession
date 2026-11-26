@@ -9,12 +9,14 @@
 //! is drawn, and zoomed out, cards are drawn as blocks without their tasks.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use iced::keyboard;
 use iced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, LineDash, Path, Stroke, Text};
-use iced::{Color, Element, Fill, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::widget::image::Handle;
+use iced::{Color, Element, Fill, Font, Pixels, Point, Radians, Rectangle, Renderer, Size, Theme, Vector};
 
 use obsession_core::crew::{self, Badge, Member};
 use obsession_core::func::{self, Library, PortKind};
@@ -100,6 +102,8 @@ pub struct HandCard {
     /// Their open tasks in this graph.
     pub open: u32,
     pub badge: Option<Badge>,
+    /// Their portrait (`portrait:` on the card, resolved in the vault).
+    pub portrait: Option<Box<str>>,
 }
 
 /// A card, and on a function card, one of its pins (an output pin at the
@@ -237,6 +241,11 @@ pub struct Graph {
     cache: Cache,
     /// The hand as the graph canvas last drew it, for `HandLayer`.
     hand_now: Cell<Option<HandNow>>,
+    /// Decoded crew portraits, by file (the app keeps them up to date).
+    faces: HashMap<Box<str>, Handle>,
+    /// Crew card notes (lower case) and their portrait files, for the faces
+    /// on node cards.
+    card_faces: HashMap<String, Box<str>>,
     /// What the cache was drawn for.
     drawn: Cell<Option<DrawKey>>,
     version: u64,
@@ -519,6 +528,8 @@ impl Graph {
             fit: 0,
             cache: Cache::new(),
             hand_now: Cell::new(None),
+            faces: HashMap::new(),
+            card_faces: HashMap::new(),
             drawn: Cell::new(None),
             version: 0,
         }
@@ -526,10 +537,17 @@ impl Graph {
 
     /// Deals the crew: who appears where in this graph, and the badges
     /// from open mentions among its nodes.
-    pub fn set_crew(&mut self, crew: &[Member]) {
+    /// The crew, with each one's portrait file (or `None`).
+    pub fn set_crew(&mut self, crew: &[Member], portraits: &[Option<Box<str>>]) {
+        self.card_faces = crew
+            .iter()
+            .zip(portraits)
+            .filter_map(|(m, p)| Some((m.rel.to_lowercase(), p.clone()?)))
+            .collect();
         let mut hand: Vec<HandCard> = crew
             .iter()
-            .map(|m| {
+            .zip(portraits)
+            .map(|(m, portrait)| {
                 let mentions = |c: &Card| c.tasks.iter().filter(|t| t.people.contains(&m.key)).count();
                 HandCard {
                     key: m.key.clone(),
@@ -546,6 +564,7 @@ impl Graph {
                         .filter(|t| !t.done && t.people.contains(&m.key))
                         .count() as u32,
                     badge: None,
+                    portrait: portrait.clone(),
                 }
             })
             .collect();
@@ -650,6 +669,35 @@ impl Graph {
     /// Something about the cards changed: redraw them.
     pub fn touch(&mut self) {
         self.version += 1;
+    }
+
+    /// The portrait files the graph shows: the hand's, and those of crew
+    /// cards that are nodes.
+    pub fn portraits(&self) -> Vec<Box<str>> {
+        let mut out: Vec<Box<str>> = self.hand.iter().filter_map(|h| h.portrait.clone()).collect();
+        out.extend(self.card_faces.values().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The decoded portraits, by file. Redraws the cards when they change.
+    pub fn set_faces(&mut self, faces: HashMap<Box<str>, Handle>) {
+        if faces != self.faces {
+            self.faces = faces;
+            self.touch();
+        }
+    }
+
+    /// The face to draw for a person in the hand.
+    fn hand_face(&self, c: &HandCard) -> Option<&Handle> {
+        self.faces.get(c.portrait.as_deref()?)
+    }
+
+    /// The face on a node card whose note is a crew card.
+    fn card_face(&self, card: &Card) -> Option<&Handle> {
+        let portrait = self.card_faces.get(&card.rel.as_deref()?.to_lowercase())?;
+        self.faces.get(portrait)
     }
 
     /// Every card's position, for the layout comment.
@@ -1068,7 +1116,7 @@ impl canvas::Program<Message> for Graph {
             }
             for (i, card) in self.cards.iter().enumerate() {
                 if Some(i) != lifted {
-                    draw_card(frame, view, card, card.pos, screen);
+                    draw_card(frame, view, card, card.pos, screen, self.card_face(card));
                 }
             }
         });
@@ -1095,7 +1143,7 @@ impl canvas::Program<Message> for Graph {
         }
         if let Some(i) = lifted {
             let r = self.card_rect(i, state);
-            draw_card(&mut frame, view, &self.cards[i], r.position(), screen);
+            draw_card(&mut frame, view, &self.cards[i], r.position(), screen, self.card_face(&self.cards[i]));
         }
         let outline = |frame: &mut Frame, i: usize, color: Color| {
             let r = self.card_rect(i, state);
@@ -1298,15 +1346,18 @@ impl Graph {
                 weight: iced::font::Weight::Semibold,
                 ..theme::UI_FONT
             };
-            frame.fill_text(Text {
-                content: c.initials.clone(),
-                position: Point::new(at.x, at.y - 8.0),
-                color: theme::BG,
-                size: Pixels(13.0),
-                font: semibold,
-                align_x: iced::widget::text::Alignment::Center,
-                ..Text::default()
-            });
+            match self.hand_face(c) {
+                Some(portrait) => draw_face(frame, portrait, at, 17.0, false),
+                None => frame.fill_text(Text {
+                    content: c.initials.clone(),
+                    position: Point::new(at.x, at.y - 8.0),
+                    color: theme::BG,
+                    size: Pixels(13.0),
+                    font: semibold,
+                    align_x: iced::widget::text::Alignment::Center,
+                    ..Text::default()
+                }),
+            }
             frame.fill_text(Text {
                 content: format!("@{}", c.key),
                 position: Point::new(at.x + 24.0, at.y - 8.0),
@@ -1357,15 +1408,18 @@ impl Graph {
         } else {
             frame.fill(&Path::circle(face, 17.0), c.color);
         }
-        frame.fill_text(Text {
-            content: c.initials.clone(),
-            position: Point::new(face.x, face.y - 8.5),
-            color: theme::BG,
-            size: Pixels(14.0),
-            font: semibold,
-            align_x: iced::widget::text::Alignment::Center,
-            ..Text::default()
-        });
+        match self.hand_face(c) {
+            Some(portrait) => draw_face(frame, portrait, face, 17.0, c.bot),
+            None => frame.fill_text(Text {
+                content: c.initials.clone(),
+                position: Point::new(face.x, face.y - 8.5),
+                color: theme::BG,
+                size: Pixels(14.0),
+                font: semibold,
+                align_x: iced::widget::text::Alignment::Center,
+                ..Text::default()
+            }),
+        }
         text(frame, fit(&c.name, r.width - 60.0, 13.0), 52.0, 13.0, 13.0, theme::HEADING, semibold);
         let role = if c.role.is_empty() { format!("@{}", c.key) } else { c.role.clone() };
         text(frame, fit(&role, r.width - 60.0, 11.0), 52.0, 31.0, 11.0, theme::MUTED, theme::UI_FONT);
@@ -1420,15 +1474,18 @@ impl Graph {
             frame.fill(&Path::circle(face, radius), c.color);
         }
         let initials = if radius >= 10.0 { 12.0 } else { 9.0 };
-        frame.fill_text(Text {
-            content: c.initials.clone(),
-            position: Point::new(face.x, face.y - initials * 0.62),
-            color: theme::BG,
-            size: Pixels(initials),
-            font: semibold,
-            align_x: Alignment::Center,
-            ..Text::default()
-        });
+        match self.hand_face(c) {
+            Some(portrait) => draw_face(frame, portrait, face, radius, c.bot),
+            None => frame.fill_text(Text {
+                content: c.initials.clone(),
+                position: Point::new(face.x, face.y - initials * 0.62),
+                color: theme::BG,
+                size: Pixels(initials),
+                font: semibold,
+                align_x: Alignment::Center,
+                ..Text::default()
+            }),
+        }
         if inner < 24.0 {
             // Too narrow for words: the badge as a coloured bar.
             if let Some(badge) = c.badge {
@@ -2041,7 +2098,23 @@ fn label(frame: &mut Frame, text: String, at: Point, size: f32, color: Color, fo
     });
 }
 
-fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rectangle) {
+/// A portrait in a circle (a rounded square for a bot) centred at `at`.
+/// Drawn in its own clip: the corner radius rounds the clip, not the image.
+fn draw_face(frame: &mut Frame, portrait: &Handle, at: Point, radius: f32, bot: bool) {
+    let rect = Rectangle::new(Point::new(at.x - radius, at.y - radius), Size::new(radius * 2.0, radius * 2.0));
+    let image = iced::advanced::image::Image {
+        handle: portrait.clone(),
+        filter_method: iced::advanced::image::FilterMethod::Linear,
+        rotation: Radians(0.0),
+        border_radius: (if bot { radius * 0.4 } else { radius }).into(),
+        opacity: 1.0,
+        snap: false,
+    };
+    // The clipped frame keeps the outer frame's coordinates.
+    frame.with_clip(rect, |f| f.draw_image(rect, image));
+}
+
+fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rectangle, face: Option<&Handle>) {
     let z = view.zoom;
     let size = card.size();
     let p = view.screen(pos);
@@ -2125,12 +2198,21 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
     let pad = 12.0 * z;
     let inner = size.width - 24.0;
     let title_color = if card.kind == CardKind::Missing { theme::LINK_MISSING } else { theme::HEADING };
+    // A crew card's note: their face at the top right, the title beside it.
+    let title_width = match face {
+        Some(portrait) => {
+            let r = 13.0 * z;
+            draw_face(frame, portrait, Point::new(p.x + rect.width - pad - r, p.y + 8.0 * z + r), r, false);
+            inner - 34.0
+        }
+        None => inner,
+    };
 
     // Zoomed out: a block with the title.
     if z < DETAIL_ZOOM {
         label(
             frame,
-            fit(&card.title, inner, 15.0),
+            fit(&card.title, title_width, 15.0),
             Point::new(p.x + pad, p.y + 14.0 * z),
             15.0 * z,
             title_color,
@@ -2139,14 +2221,14 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
         return;
     }
 
-    label(frame, fit(&card.title, inner, 15.0), Point::new(p.x + pad, p.y + 11.0 * z), 15.0 * z, title_color, semibold);
+    label(frame, fit(&card.title, title_width, 15.0), Point::new(p.x + pad, p.y + 11.0 * z), 15.0 * z, title_color, semibold);
     let subtitle = match card.kind {
         CardKind::Missing => "No such note yet · double-click to create".to_owned(),
         CardKind::Ambiguous => format!("⚠ several notes match · {}", card.folder),
         _ => card.folder.clone(),
     };
     let subtitle_color = if card.kind == CardKind::Ambiguous { theme::WARNING } else { theme::FAINT };
-    label(frame, fit(&subtitle, inner, 11.0), Point::new(p.x + pad, p.y + 31.0 * z), 11.0 * z, subtitle_color, theme::UI_FONT);
+    label(frame, fit(&subtitle, title_width, 11.0), Point::new(p.x + pad, p.y + 31.0 * z), 11.0 * z, subtitle_color, theme::UI_FONT);
 
     let mut y = HEADER;
     for task in card.tasks.iter().take(MAX_ROWS) {

@@ -163,10 +163,10 @@ Anything else about Ika: notes, links, contacts. It's a normal note.
 |---|---|
 | `name` | Shown on the card. Defaults to the file name. |
 | `role` | Shown under the portrait. |
-| `portrait` | Optional image, relative to the card file. Without one, the app draws initials in `color`. |
+| `portrait` | Optional picture (PNG, JPEG, GIF, WebP, BMP), relative to the card file, or found by its name anywhere in the vault like a link. Drawn round, from its middle square, on the hand, the dragged card, a node for the card and at the top of the card note. Without one (or if the file isn't there), the app draws initials in `color`. |
 | `color` | Card accent color. |
 | `skills` | Optional tags shown as icons on the card. |
-| `kind` | `human` (default) or `bot`. Bots get a bot portrait by default. |
+| `kind` | `human` (default) or `bot`. Bots get a rounded square instead of a circle, with or without a portrait. |
 
 All fields are optional.
 

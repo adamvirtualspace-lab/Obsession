@@ -785,7 +785,7 @@ performance budgets checked.
 | 7 | **Crew** ✅ | `_crew/` cards, `@` autocomplete, drag a card onto a task, hover to highlight, OVERLOADED and POWERHOUSE badges |
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
 | 9 | **Graph and functions, finished** ✅ | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
-| 10 | **Images** | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
+| 10 | **Images** ✅ | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
 
 ## Next
 
@@ -1027,6 +1027,29 @@ renaming an `id` from the editor, matching the cards to the Possess mockup.
 3. **Crew portraits.** `portrait:` on a card is drawn on the crew hand, the
    graph and the card's note; bots without one keep their bot face.
    (`graph.rs`)
+   ✅ **Done (November 2026).** `portrait_of` (main.rs) finds the file the
+   way a link would: as the card gives it (relative to the card), else by
+   its name anywhere in the vault; only pictures count. Portraits are
+   decoded like note pictures but cropped to their middle square (a third
+   of the way down a tall one, where faces are) at 96 px times the scale
+   factor (`Key::portrait`, 0.2 MB each at 225%). The graph gets the
+   decoded ones from `want_pictures` (`Graph::portraits` / `set_faces`,
+   redrawing only when they change) and draws them with `draw_face`: a
+   circle (a rounded square for a bot) on the hand's cards, whole or in a
+   strip, on the card being dragged, and at the top right of a node card
+   whose note is a crew card. A face is drawn in a clip of its own, since
+   an image's corner radius rounds its clip; that clip keeps the frame's
+   coordinates. Without a portrait, or when the file isn't there, the card
+   keeps its initials (or bot square). A crew card's note shows the
+   portrait, 96 px round, above its text in Live, Split and Reading; the
+   page counts it in its sums (`Live::header`), so clicks still land on the
+   right character. Checked by hand: Ika's PNG beside her card, Bob's
+   `portrait: bob.jpg` found in `refs/` by name, Unit 7's bot square, Maya's
+   missing file keeping her initials; the raised card, the dragged token and
+   Ika's node card with their faces; Ika's note with the portrait and a
+   click landing in "ani|mation"; a move to the 100% monitor and back
+   re-decoding for the new scale. Idle on the graph with portraits: 0 ms
+   CPU, 0 bytes written over 60 s.
 
 *Budgets*, to be confirmed by measuring first: decoded pictures held in at
 most 64 MB, a note with 20 pictures opening in under 100 ms after the first

@@ -475,7 +475,11 @@ impl App {
         let Some(ws) = &self.workspace else {
             return Task::none();
         };
-        let showing = self.mode != Mode::Source && !(self.show_graph && self.graph.is_some()) && self.pictures.ready();
+        if !self.pictures.ready() {
+            return Task::none();
+        }
+        let graph = self.show_graph && self.graph.is_some();
+        let showing = self.mode != Mode::Source && !graph;
         let near = match &ws.note {
             Some(note) if showing => note.pictures_near(),
             _ => Vec::new(),
@@ -486,12 +490,28 @@ impl App {
         for (target, width) in near {
             let rel: Option<Box<str>> = ws.vault.attachment(&target, from.as_deref()).map(Box::from);
             if let Some(rel) = &rel {
-                keys.push(pictures::Key { rel: rel.clone(), width });
+                keys.push(pictures::Key { rel: rel.clone(), width, square: false });
             }
             targets.insert(target, rel);
         }
         self.pictures.set_targets(targets);
+        // Portraits: the graph's crew, and the open crew card's own.
+        let header = ws
+            .crew
+            .iter()
+            .find(|m| showing && from.as_deref().is_some_and(|f| m.rel.eq_ignore_ascii_case(f)))
+            .and_then(|m| portrait_of(&ws.vault, m));
+        let faces = match &self.graph {
+            Some(g) if graph => g.portraits(),
+            _ => Vec::new(),
+        };
+        keys.extend(faces.iter().chain(&header).map(|rel| pictures::Key::portrait(rel.clone())));
+        self.pictures.set_header(header);
         let start = self.pictures.want(keys);
+        if let Some(g) = &mut self.graph {
+            let decoded = faces.into_iter().filter_map(|rel| Some((rel.clone(), self.pictures.portrait(&rel)?))).collect();
+            g.set_faces(decoded);
+        }
         let (scale, generation) = (self.pictures.scale(), self.pictures.generation());
         let timing = std::env::var_os("OBSESSION_DEV_TIMING").is_some();
         Task::batch(start.into_iter().map(|key| {
@@ -500,7 +520,7 @@ impl App {
             Task::perform(
                 async move {
                     let started = std::time::Instant::now();
-                    let result = pictures::decode(path, key.width, scale);
+                    let result = pictures::decode(path, key.width, scale, key.square);
                     if timing && let Ok(d) = &result {
                         eprintln!(
                             "TIMING picture {}: {} ms, {}x{} kept as {:.1} MB",
@@ -1478,7 +1498,8 @@ impl App {
         for c in &mut graph.cards {
             c.stale = c.line.and_then(|l| ws.runs.out_of_date.get(&(rel.to_string(), l)).cloned());
         }
-        graph.set_crew(&ws.crew);
+        let portraits: Vec<Option<Box<str>>> = ws.crew.iter().map(|m| portrait_of(&ws.vault, m)).collect();
+        graph.set_crew(&ws.crew, &portraits);
         graph.show_hand = self.show_hand;
         graph.pulses = ws
             .runs
@@ -3997,4 +4018,17 @@ fn shortcut_from_event(
 /// Whether `link`, written in `source`, leads to the note `target`.
 fn leads_to(vault: &Vault, source: &str, link: &links::Link, target: &str) -> bool {
     !link.target.is_empty() && vault.resolve_from(&link.target, Some(source)).entry().is_some_and(|e| &*e.rel == target)
+}
+
+/// A crew member's portrait file in the vault: `portrait:` as the card
+/// gives it (relative to the card), else found by its name anywhere, like
+/// a link.
+fn portrait_of(vault: &Vault, member: &Member) -> Option<Box<str>> {
+    let written = member.portrait.as_deref()?;
+    let name = written.rsplit('/').next().unwrap_or(written);
+    vault
+        .attachment(written, Some(&member.rel))
+        .or_else(|| vault.attachment(name, Some(&member.rel)))
+        .filter(|rel| obsession_core::live::is_picture(rel))
+        .map(Box::from)
 }

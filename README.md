@@ -112,7 +112,10 @@ in the toolbar picks the crew folder (type it, pick it, or **Browse…**); it's 
 whole team. Type `@` in a
 note for suggestions (Tab or click picks one). A click on `@ika` opens Ika's
 card; an `@name` without a card shows in amber, and clicking it creates the
-card. In a graph the crew is a hand of cards along the bottom (**Crew** hides
+card. `portrait: ika.png` on a card gives them a face: on their card in the graph's
+hand, on the card being dragged, on a node for their card, and at the top of
+their card note (the file is found next to the card, or by name anywhere).
+In a graph the crew is a hand of cards along the bottom (**Crew** hides
 it): hover a card to light up the nodes and tasks that mention them, drag it
 onto a task to add their `@name`, or onto a node to pick the task. Cards show
 **OVERLOADED** or **POWERHOUSE** when someone has 2× or 1.5× the open tasks of

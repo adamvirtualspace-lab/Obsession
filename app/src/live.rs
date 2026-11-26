@@ -160,6 +160,8 @@ pub struct Live {
     picture_heights: Vec<Cell<f32>>,
     /// The width pictures were last laid out at (0 = not yet).
     picture_column: Cell<f32>,
+    /// What's above the first line: a crew card's portrait, or nothing.
+    header: Cell<f32>,
     /// Scroll offset and visible height of the page.
     scroll: (f32, f32),
     /// Reading mode and Split's mirror: links and status chips click, but
@@ -188,6 +190,7 @@ impl Live {
             heights: Vec::new(),
             picture_heights: Vec::new(),
             picture_column: Cell::new(0.0),
+            header: Cell::new(0.0),
             scroll: (0.0, 1600.0),
             read_only: false,
             links: LinkStates::default(),
@@ -609,6 +612,23 @@ impl Live {
         let mut y = PAGE_PADDING.0;
         let mut gap = 0.0;
 
+        // A crew card's portrait, above its text.
+        self.header.set(0.0);
+        if let Some(portrait) = pictures.header() {
+            items.push(
+                container(
+                    iced::widget::image(portrait)
+                        .width(Length::Fixed(pictures::PORTRAIT as f32))
+                        .height(Length::Fixed(pictures::PORTRAIT as f32))
+                        .border_radius(pictures::PORTRAIT as f32 / 2.0),
+                )
+                .padding(iced::Padding::new(0.0).bottom(12.0))
+                .into(),
+            );
+            y += pictures::PORTRAIT as f32 + 12.0;
+            self.header.set(pictures::PORTRAIT as f32 + 12.0);
+        }
+
         for block in &self.blocks {
             let overlaps = block.lines.start < active.end && active.start < block.lines.end;
             let height = self.block_height(block);
@@ -681,7 +701,7 @@ impl Live {
         let (offset, visible) = self.scroll;
         let (top, bottom) = (offset - OVERSCAN, offset + visible + OVERSCAN);
         let active = self.active.clone().unwrap_or(usize::MAX..usize::MAX);
-        let mut y = PAGE_PADDING.0;
+        let mut y = PAGE_PADDING.0 + self.header.get();
         let mut out = Vec::new();
         for block in &self.blocks {
             let height = self.block_height(block);
@@ -771,7 +791,7 @@ impl Live {
     /// The page y of a point `frac` of the way down `line` (measured
     /// heights where lines have been drawn, estimates elsewhere).
     pub fn y_of(&self, line: usize, frac: f32) -> f32 {
-        let mut y = PAGE_PADDING.0;
+        let mut y = PAGE_PADDING.0 + self.header.get();
         for block in &self.blocks {
             if block.lines.end <= line {
                 y += self.block_height(block) + SPACING;
@@ -788,7 +808,7 @@ impl Live {
 
     /// The line at page y `y`, and how far into it.
     pub fn at(&self, y: f32) -> (usize, f32) {
-        let mut top = PAGE_PADDING.0;
+        let mut top = PAGE_PADDING.0 + self.header.get();
         for block in &self.blocks {
             let height = self.block_height(block);
             if y >= top + height + SPACING {

@@ -45,11 +45,24 @@ const PLACEHOLDER: f32 = 34.0;
 /// line tall, more pictures would seem near the screen and load too.)
 pub const LOADING: f32 = 200.0;
 
-/// One picture file at one drawn width (logical pixels).
+/// One picture file at one drawn width (logical pixels). `square`: a crew
+/// portrait, cropped to its middle square.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     pub rel: Box<str>,
     pub width: u32,
+    pub square: bool,
+}
+
+/// Portraits are decoded this wide (logical pixels): enough for the card
+/// note's header, and shrunk on the GPU for the hand's faces.
+pub const PORTRAIT: u32 = 96;
+
+impl Key {
+    /// A crew portrait.
+    pub fn portrait(rel: Box<str>) -> Self {
+        Self { rel, width: PORTRAIT, square: true }
+    }
 }
 
 /// A decoded picture, ready to draw.
@@ -105,6 +118,8 @@ pub struct Pictures {
     /// For the note on screen: each picture's target as written, and the
     /// file it resolves to (`None`: not in the vault).
     targets: HashMap<String, Option<Box<str>>>,
+    /// The open note is a crew card with this portrait.
+    header: Option<Box<str>>,
 }
 
 impl Pictures {
@@ -167,13 +182,30 @@ impl Pictures {
         let Some(width) = width else {
             return Shown::Pending;
         };
-        let key = Key { rel: rel.clone(), width };
+        let key = Key { rel: rel.clone(), width, square: false };
         match self.entries.get(&key).map(|e| &e.slot) {
             None => Shown::Pending,
             Some(Slot::Loading) => Shown::Loading,
             Some(Slot::Ready(d)) => Shown::Ready(d.clone()),
             Some(Slot::Failed(why)) => Shown::Failed(why.clone()),
         }
+    }
+
+    /// A crew portrait (`portrait:` on a card, resolved), if decoded.
+    pub fn portrait(&self, rel: &str) -> Option<Handle> {
+        match &self.entries.get(&Key::portrait(rel.into()))?.slot {
+            Slot::Ready(d) => Some(d.handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// The portrait at the top of the open note (a crew card), if any.
+    pub fn set_header(&mut self, rel: Option<Box<str>>) {
+        self.header = rel;
+    }
+
+    pub fn header(&self) -> Option<Handle> {
+        self.portrait(self.header.as_deref()?)
     }
 
     /// The pictures near the visible part of the page: marks them as in
@@ -265,7 +297,7 @@ impl Pictures {
 
 /// Reads and decodes a picture for drawing `width` logical pixels wide at
 /// `scale`: shrunk to that (never enlarged), rotated as its EXIF says.
-pub fn decode(path: PathBuf, width: u32, scale: f32) -> Result<Decoded, String> {
+pub fn decode(path: PathBuf, width: u32, scale: f32, square: bool) -> Result<Decoded, String> {
     use image::ImageDecoder;
     // Two at a time: decoding needs the whole picture at full size for a
     // moment, and a page of big photos shouldn't need them all at once.
@@ -289,6 +321,15 @@ pub fn decode(path: PathBuf, width: u32, scale: f32) -> Result<Decoded, String> 
     let mut picture = image::DynamicImage::from_decoder(decoder).map_err(|e| fail(&e))?;
     picture.apply_orientation(orientation);
 
+    if square {
+        // A portrait: its middle square (a little above the middle on a
+        // tall one, where faces usually are).
+        let (w, h) = (picture.width(), picture.height());
+        let side = w.min(h).max(1);
+        let x = (w - side) / 2;
+        let y = if h > w { (h - side) / 3 } else { 0 };
+        picture = picture.crop_imm(x, y, side, side);
+    }
     let (w, h) = (picture.width().max(1), picture.height().max(1));
     let target = ((width as f32 * scale).ceil() as u32).clamp(1, w);
     let rgba = if target < w {
