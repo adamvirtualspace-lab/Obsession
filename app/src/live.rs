@@ -10,10 +10,17 @@
 //! Moving between blocks: Up/Down/Left/Right at the edge of the editor,
 //! Enter (splits a line, continuing lists), Backspace at the start and
 //! Delete at the end (join lines), a click on a drawn line (the caret lands
-//! on the clicked character), Escape to stop editing.
+//! on the clicked character), Escape to stop editing. Up/Down keep the
+//! column they started from through shorter (or blank) lines.
+//!
+//! Selecting: a drag across drawn lines; past the page's top or bottom edge
+//! the page scrolls along. Editable, the lines it covered open in the
+//! editor with that text selected; read-only (Reading, Split's mirror), the
+//! selection stays highlighted and Ctrl+C copies its drawn text.
 
 use std::cell::Cell;
 use std::ops::Range;
+use std::time::Duration;
 
 use iced::advanced::text::Span;
 use iced::font::{Style as FontStyle, Weight};
@@ -21,7 +28,7 @@ use iced::keyboard::{Key, key::Named};
 use iced::widget::text::LineHeight;
 use iced::widget::text_editor::{self, Action, Binding, Cursor, KeyPress, Position};
 use iced::widget::{Id, Space, column, container, mouse_area, row, rule, scrollable, text};
-use iced::{Background, Border, Element, Fill, Font, Length, Point};
+use iced::{Background, Border, Element, Fill, Font, Length, Point, Rectangle};
 
 use obsession_core::doc::Doc;
 use obsession_core::live::{self, Block, BlockKind, Line as Drawn, Style};
@@ -61,8 +68,17 @@ fn indent_px(columns: u8) -> f32 {
     let space = *SPACE.get_or_init(|| text_width(" ", theme::MONO_FONT, theme::TEXT_SIZE));
     f32::from(columns) * space
 }
+/// A table cell's padding: top/bottom, left/right.
+const CELL_PADDING: (f32, f32) = (4.0, 10.0);
 /// Text inset per `>` level of a quote.
 const QUOTE_INDENT: f32 = 16.0;
+/// While selecting, the page scrolls when the pointer is this close to its
+/// top or bottom edge (or past it)...
+const EDGE: f32 = 24.0;
+/// ...by this much a step per pixel into that band (2–60 px a step)...
+const EDGE_SPEED: f32 = 0.5;
+/// ...a step this often.
+pub const EDGE_STEP: Duration = Duration::from_millis(16);
 
 pub fn editor_id() -> Id {
     Id::new("live-editor")
@@ -98,6 +114,11 @@ pub enum Message {
     },
     /// The left mouse button went up (anywhere in the window).
     MouseUp,
+    /// While selecting: where the pointer is (a window point), anywhere in
+    /// the window, for scrolling at the page's edges.
+    Pointer(Point),
+    /// A step of scrolling while a selection is dragged at an edge.
+    EdgeScroll,
     /// Pictures came into view that haven't been looked up yet.
     PicturesShown,
 }
@@ -156,6 +177,9 @@ pub struct Live {
     reveal: u64,
     /// Each line's drawn height, once it has been on screen (0 = not yet).
     heights: Vec<Cell<f32>>,
+    /// Each line's estimated height until then, worked out once for the
+    /// page's width (0 = not yet).
+    estimates: Vec<Cell<f32>>,
     /// The height of each line's pictures, the same way.
     picture_heights: Vec<Cell<f32>>,
     /// The width pictures were last laid out at (0 = not yet).
@@ -171,6 +195,19 @@ pub struct Live {
     pub links: LinkStates,
     /// A selection being dragged, until the button goes up.
     drag: Option<Drag>,
+    /// A finished selection in a read-only view: highlighted until the next
+    /// press; Ctrl+C copies it.
+    kept: Option<Drag>,
+    /// The page on screen (window coordinates) and its content's height.
+    bounds: Rectangle,
+    content_height: f32,
+    /// While selecting: the pointer, and whether an edge scroll step is
+    /// pending.
+    pointer: Option<Point>,
+    edge_scrolling: bool,
+    /// The column (in characters) Up/Down aim for, kept while the caret
+    /// passes through shorter lines.
+    goal: Option<usize>,
     /// The button went down in the editor (a drag may leave it).
     editor_pressed: bool,
     /// `@name` suggestions are showing: Tab completes.
@@ -188,6 +225,7 @@ impl Live {
             content: text_editor::Content::new(),
             reveal: 0,
             heights: Vec::new(),
+            estimates: Vec::new(),
             picture_heights: Vec::new(),
             picture_column: Cell::new(0.0),
             header: Cell::new(0.0),
@@ -195,6 +233,12 @@ impl Live {
             read_only: false,
             links: LinkStates::default(),
             drag: None,
+            kept: None,
+            bounds: Rectangle::default(),
+            content_height: 0.0,
+            pointer: None,
+            edge_scrolling: false,
+            goal: None,
             editor_pressed: false,
             completing: false,
         };
@@ -210,6 +254,7 @@ impl Live {
             .map(|i| render(self.doc.line(i), self.roles[i], format))
             .collect();
         self.heights = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
+        self.estimates = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
         self.picture_heights = (0..self.doc.len()).map(|_| Cell::new(0.0)).collect();
     }
 
@@ -221,7 +266,36 @@ impl Live {
     }
 
     pub fn scrolled(&mut self, viewport: scrollable::Viewport) {
+        // A new width wraps lines differently: measure and estimate again.
+        if (viewport.bounds().width - self.bounds.width).abs() > 0.5 {
+            for cell in self.heights.iter().chain(&self.estimates) {
+                cell.set(0.0);
+            }
+        }
         self.scroll = (viewport.absolute_offset().y, viewport.bounds().height);
+        self.bounds = viewport.bounds();
+        self.content_height = viewport.content_bounds().height;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+            // How far the estimates were off, for the lines drawn so far.
+            let (mut count, mut off, mut net) = (0, 0.0f32, 0.0f32);
+            for line in 0..self.doc.len() {
+                if self.heights[line].get() > 0.0 {
+                    let error = self.height(line, false) - self.height(line, true);
+                    count += 1;
+                    off += error.abs();
+                    net += error;
+                }
+            }
+            let ours = self.y_of(self.doc.len().saturating_sub(1), 1.0) + PAGE_PADDING.0 + 240.0;
+            let tables: f32 = (0..self.doc.len()).filter(|&i| matches!(self.rendered[i], Rendered::Cells(_))).map(|i| self.line_height(i)).sum();
+            let rules = (0..self.doc.len()).filter(|&i| matches!(&self.rendered[i], Rendered::Line(d) if d.rule)).count();
+            eprintln!(
+                "TIMING live heights: {count} of {} lines drawn, estimates off by {off:.0} px ({net:+.0} net), content {:.0} px, ours {ours:.0} px, table rows {tables:.0} px, rules {rules}",
+                self.doc.len(),
+                self.content_height
+            );
+        }
     }
 
     pub fn text(&self) -> String {
@@ -240,6 +314,8 @@ impl Live {
             .splice(range.clone(), std::iter::repeat_with(|| Rendered::Hidden).take(count));
         self.heights
             .splice(range.clone(), std::iter::repeat_with(|| Cell::new(0.0)).take(count));
+        self.estimates
+            .splice(range.clone(), std::iter::repeat_with(|| Cell::new(0.0)).take(count));
         self.picture_heights
             .splice(range, std::iter::repeat_with(|| Cell::new(0.0)).take(count));
 
@@ -250,6 +326,7 @@ impl Live {
             if touched || self.roles[i] != *role {
                 self.rendered[i] = render(self.doc.line(i), *role, format);
                 self.heights[i].set(0.0);
+                self.estimates[i].set(0.0);
                 self.picture_heights[i].set(0.0);
             }
         }
@@ -282,6 +359,7 @@ impl Live {
         });
         self.active = Some(range);
         self.reveal += 1;
+        self.goal = None;
     }
 
     pub fn deactivate(&mut self) {
@@ -314,12 +392,17 @@ impl Live {
         let click = matches!(action, Action::Click(_));
         let drag = matches!(action, Action::Drag(_));
         self.content.perform(action);
+        self.goal = None;
         if click {
             self.editor_pressed = true;
         }
-        // A selection that left the editor and came back into it.
+        // A selection that left the editor and came back into it (not while
+        // the page scrolls at an edge: the pointer is then off the editor).
         let cursor = self.cursor();
-        if drag && let Some(selection) = &mut self.drag {
+        if drag
+            && !self.edge_scrolling
+            && let Some(selection) = &mut self.drag
+        {
             selection.head = cursor;
             selection.moved = true;
         }
@@ -363,6 +446,13 @@ impl Live {
             return false;
         };
         let (line, column) = self.cursor();
+        let vertical = matches!(intent, Intent::Up | Intent::Down);
+        // The column Up/Down aim for: kept from the first of a run of them.
+        let want = match self.goal {
+            Some(goal) if vertical => goal,
+            _ => chars_before(self.doc.line(line), column),
+        };
+        self.goal = None;
         match intent {
             // The app completes the `@name`; it never gets here.
             Intent::Complete => false,
@@ -382,6 +472,9 @@ impl Live {
                 };
                 self.content.perform(Action::Move(motion));
                 if self.content.cursor().position != before {
+                    if vertical {
+                        self.goal = Some(want);
+                    }
                     return false;
                 }
                 match intent {
@@ -390,15 +483,22 @@ impl Live {
                         let column = if intent == Intent::Left {
                             self.doc.line(target).len()
                         } else {
-                            column
+                            byte_at_char(self.doc.line(target), want)
                         };
                         self.activate(target, column);
                     }
                     Intent::Down | Intent::Right if range.end < self.doc.len() => {
-                        let column = if intent == Intent::Right { 0 } else { column };
+                        let column = if intent == Intent::Right {
+                            0
+                        } else {
+                            byte_at_char(self.doc.line(range.end), want)
+                        };
                         self.activate(range.end, column);
                     }
                     _ => {}
+                }
+                if vertical {
+                    self.goal = Some(want);
                 }
                 false
             }
@@ -469,10 +569,12 @@ impl Live {
         {
             return Some(action);
         }
-        if press.right || self.read_only {
+        if press.right {
             return None;
         }
-        // Editing starts when the button goes up: a drag selects instead.
+        self.kept = None;
+        // Editing starts when the button goes up: a drag selects instead
+        // (read-only, a drag selects and a click does nothing).
         let raw_len = self.doc.line(line).len();
         let column = drawn.map_or(raw_len, |d| d.raw_offset(press.offset, raw_len));
         self.drag = Some(Drag {
@@ -485,7 +587,7 @@ impl Live {
 
     /// Whether a selection may be dragged now (drawn lines then report
     /// where the cursor is).
-    fn dragging(&self) -> bool {
+    pub fn dragging(&self) -> bool {
         self.drag.is_some() || self.editor_pressed
     }
 
@@ -498,6 +600,11 @@ impl Live {
         };
         let raw_len = self.doc.line(line).len();
         let column = drawn.map_or(raw_len, |d| d.raw_offset(offset, raw_len));
+        self.drag_head(line, column);
+    }
+
+    /// Moves the end of the selection being dragged to (line, byte column).
+    fn drag_head(&mut self, line: usize, column: usize) {
         if self.drag.is_none() && self.editor_pressed && self.active.is_some() {
             // The drag began in the editor: its anchor is where it began.
             let start = self.active.as_ref().map_or(0, |r| r.start);
@@ -520,9 +627,15 @@ impl Live {
     /// whether the editor should take the keyboard.
     pub fn release(&mut self) -> bool {
         self.editor_pressed = false;
+        self.pointer = None;
+        self.edge_scrolling = false;
         let Some(drag) = self.drag.take() else {
             return false;
         };
+        if self.read_only {
+            self.kept = drag.moved.then_some(drag);
+            return false;
+        }
         if !drag.moved {
             self.activate(drag.anchor.0, drag.anchor.1);
             return true;
@@ -553,13 +666,102 @@ impl Live {
             position: head,
             selection: Some(anchor),
         });
+        // No reveal: the end the drag reached is on screen, and revealing
+        // the editor would scroll back to the selection's first line.
         self.active = Some(start..end);
-        self.reveal += 1;
     }
 
-    /// The raw bytes of `line` inside the selection being dragged.
+    /// The pointer moved while selecting. Returns whether a step of edge
+    /// scrolling should start (`Message::EdgeScroll` after `EDGE_STEP`).
+    pub fn pointer(&mut self, at: Point) -> bool {
+        if !self.dragging() {
+            return false;
+        }
+        self.pointer = Some(at);
+        if self.edge_scrolling || self.edge_speed() == 0.0 {
+            return false;
+        }
+        self.edge_scrolling = true;
+        true
+    }
+
+    /// How far a step of edge scrolling goes: up is negative; 0 when the
+    /// pointer isn't near an edge, or the page can't go further that way.
+    fn edge_speed(&self) -> f32 {
+        let Some(p) = self.pointer else {
+            return 0.0;
+        };
+        let b = self.bounds;
+        if b.height <= 0.0 {
+            return 0.0;
+        }
+        let (offset, visible) = self.scroll;
+        let max = (self.content_height - visible).max(0.0);
+        let speed = |into: f32| (into * EDGE_SPEED).clamp(2.0, 60.0);
+        if p.y < b.y + EDGE && offset > 0.5 {
+            -speed(b.y + EDGE - p.y)
+        } else if p.y > b.y + b.height - EDGE && offset < max - 0.5 {
+            speed(p.y - (b.y + b.height - EDGE))
+        } else {
+            0.0
+        }
+    }
+
+    /// A step of edge scrolling: the selection's end moves to the line at
+    /// the pointer's height after it. Returns how far to scroll, or `None`
+    /// when it should stop.
+    pub fn edge_scroll(&mut self) -> Option<f32> {
+        let speed = if self.dragging() { self.edge_speed() } else { 0.0 };
+        let Some(p) = self.pointer.filter(|_| speed != 0.0) else {
+            self.edge_scrolling = false;
+            return None;
+        };
+        let (offset, visible) = self.scroll;
+        let max = (self.content_height - visible).max(0.0);
+        let after = (offset + speed).clamp(0.0, max);
+        // Counted as scrolled now, in case the next step comes before the
+        // scrollable reports it.
+        self.scroll.0 = after;
+        let (line, _) = self.at(after + (p.y - self.bounds.y).clamp(0.0, visible));
+        let column = if speed > 0.0 { self.doc.line(line).len() } else { 0 };
+        self.drag_head(line, column);
+        Some(after - offset)
+    }
+
+    /// The kept selection's text as drawn (Reading's Ctrl+C): lines joined
+    /// with newlines, table cells with tabs.
+    pub fn selection_text(&self) -> Option<String> {
+        let kept = self.kept?;
+        let (from, to) = if kept.anchor <= kept.head { (kept.anchor, kept.head) } else { (kept.head, kept.anchor) };
+        let last = self.doc.len().saturating_sub(1);
+        let mut out = Vec::new();
+        for line in from.0.min(last)..=to.0.min(last) {
+            match &self.rendered[line] {
+                Rendered::Hidden => {}
+                Rendered::Cells(cells) => out.push(cells.iter().map(drawn_text).collect::<Vec<_>>().join("\t")),
+                Rendered::Line(drawn) => {
+                    let text = drawn_text(drawn);
+                    let piece = self
+                        .selected(line)
+                        .and_then(|raw| drawn_range(drawn, raw))
+                        .and_then(|r| text.get(r))
+                        .unwrap_or("");
+                    out.push(piece.to_owned());
+                }
+            }
+        }
+        Some(out.join("\n"))
+    }
+
+    /// Drops the kept selection. Returns whether there was one.
+    pub fn clear_selection(&mut self) -> bool {
+        self.kept.take().is_some()
+    }
+
+    /// The raw bytes of `line` inside the selection being dragged (or the
+    /// one kept in a read-only view).
     fn selected(&self, line: usize) -> Option<Range<usize>> {
-        let drag = self.drag.filter(|d| d.moved)?;
+        let drag = self.drag.filter(|d| d.moved).or(self.kept)?;
         let (from, to) = if drag.anchor <= drag.head {
             (drag.anchor, drag.head)
         } else {
@@ -727,10 +929,31 @@ impl Live {
 
     /// A line's height: measured if it has been drawn, estimated if not.
     fn line_height(&self, line: usize) -> f32 {
-        let measured = self.heights.get(line).map_or(0.0, Cell::get);
+        self.height(line, true)
+    }
+
+    /// A line's height, measured (if `measured` and it has been drawn) or
+    /// estimated.
+    fn height(&self, line: usize, measured: bool) -> f32 {
+        let measured = if measured { self.heights.get(line).map_or(0.0, Cell::get) } else { 0.0 };
         let (text, extra) = match &self.rendered[line] {
             Rendered::Hidden => return 0.0,
-            Rendered::Cells(_) => return LINE_PX + 10.0,
+            // The tallest cell, and the cells' padding.
+            Rendered::Cells(_) if measured > 0.0 => return measured + CELL_PADDING.0 * 2.0,
+            Rendered::Cells(cells) => {
+                let cell = &self.estimates[line];
+                if cell.get() == 0.0 {
+                    let width = self.text_column() / cells.len().max(1) as f32 - CELL_PADDING.1 * 2.0;
+                    let size = TEXT_SIZE - 1.0;
+                    let rows = cells
+                        .iter()
+                        .map(|c| wrapped_rows(&drawn_text(c), size, width.max(size * 2.0), false))
+                        .max()
+                        .unwrap_or(1);
+                    cell.set(rows as f32 * size * 1.5);
+                }
+                return cell.get() + CELL_PADDING.0 * 2.0;
+            }
             Rendered::Line(drawn) if drawn.rule => return 25.0,
             Rendered::Line(drawn) => {
                 let top = if drawn.heading > 0 { 10.0 } else { 0.0 };
@@ -756,12 +979,27 @@ impl Live {
         if mono {
             return CODE_SIZE * 1.25;
         }
-        let size = heading_size(text.heading);
-        let row = size * 1.5;
-        // About 0.5 em per character, on a page about 800 px wide.
-        let chars = text.segs.iter().map(|s| s.text.chars().count()).sum::<usize>() as f32;
-        let rows = ((chars * size * 0.5) / 800.0).ceil().max(1.0);
-        rows * row + extra
+        let cell = &self.estimates[line];
+        if cell.get() == 0.0 {
+            cell.set(self.estimate(text));
+        }
+        cell.get() + extra
+    }
+
+    /// The text column's width: the page, as wide as the view allows,
+    /// minus its side padding.
+    fn text_column(&self) -> f32 {
+        let page = if self.bounds.width > 0.0 { self.bounds.width.min(PAGE_WIDTH) } else { PAGE_WIDTH };
+        page - 2.0 * PAGE_PADDING.1
+    }
+
+    /// A line's text height before it's drawn: its words wrapped at the
+    /// width it will get, with each character's real width.
+    fn estimate(&self, drawn: &Drawn) -> f32 {
+        let width = self.text_column() - indent_px(drawn.indent) - f32::from(drawn.quote) * QUOTE_INDENT;
+        let size = heading_size(drawn.heading);
+        let rows = wrapped_rows(&drawn_text(drawn), size, width.max(size * 4.0), drawn.heading > 0);
+        rows as f32 * size * 1.5
     }
 
     fn block_height(&self, block: &Block) -> f32 {
@@ -867,13 +1105,13 @@ impl Live {
                             cell: Some(c),
                             offset,
                         })
+                        .measure_tallest(&self.heights[line])
                         .size(TEXT_SIZE - 1.0)
                         .line_height(LINE_HEIGHT)
                         .font(theme::UI_FONT)
-                        .color(theme::TEXT)
-                        .read_only(self.read_only),
+                        .color(theme::TEXT),
                     )
-                    .padding([4, 10])
+                    .padding([CELL_PADDING.0, CELL_PADDING.1])
                     .width(Fill)
                     .style(theme::cell(header))
                     .into()
@@ -908,8 +1146,7 @@ impl Live {
                 .measure(&self.heights[line])
                 .size(if mono { CODE_SIZE } else { size })
                 .line_height(if mono { CODE_LINE_HEIGHT } else { LINE_HEIGHT })
-                .color(theme::TEXT)
-                .read_only(self.read_only);
+                .color(theme::TEXT);
                 if mono {
                     widget = widget.no_wrap();
                 }
@@ -1312,6 +1549,65 @@ fn heading_size(level: u8) -> f32 {
     }
 }
 
+/// How many characters come before byte `byte` of `text`.
+fn chars_before(text: &str, byte: usize) -> usize {
+    text[..floor_char_boundary(text, byte.min(text.len()))].chars().count()
+}
+
+/// The byte where character `chars` of `text` starts (the end if it's
+/// shorter).
+fn byte_at_char(text: &str, chars: usize) -> usize {
+    text.char_indices().nth(chars).map_or(text.len(), |(i, _)| i)
+}
+
+/// How many rows `text` takes when wrapped at `width` (words kept whole
+/// unless one is wider than a row), in the UI font at `size`.
+fn wrapped_rows(text: &str, size: f32, width: f32, bold: bool) -> usize {
+    // Semibold headings run a little wider.
+    let k = if bold { size * 1.05 } else { size };
+    let (mut rows, mut x) = (1, 0.0f32);
+    for word in text.split_inclusive(' ') {
+        let body = word.trim_end_matches(' ');
+        let w = body.chars().map(advance).sum::<f32>() * k;
+        let spaces = (word.len() - body.len()) as f32 * advance(' ') * k;
+        if x > 0.0 && x + w > width {
+            rows += 1;
+            x = 0.0;
+        }
+        if w > width {
+            for c in body.chars() {
+                let a = advance(c) * k;
+                if x > 0.0 && x + a > width {
+                    rows += 1;
+                    x = 0.0;
+                }
+                x += a;
+            }
+        } else {
+            x += w;
+        }
+        x += spaces;
+    }
+    rows
+}
+
+/// A character's width in the UI font, per pixel of size (measured once).
+fn advance(c: char) -> f32 {
+    thread_local! {
+        static ADVANCES: std::cell::RefCell<std::collections::HashMap<char, f32>> = Default::default();
+    }
+    ADVANCES.with_borrow_mut(|known| {
+        *known
+            .entry(c)
+            .or_insert_with(|| text_width(c.encode_utf8(&mut [0; 4]), theme::UI_FONT, 100.0) / 100.0)
+    })
+}
+
+/// A drawn line's text, as shown.
+fn drawn_text(drawn: &Drawn) -> String {
+    drawn.segs.iter().map(|s| s.text.as_str()).collect()
+}
+
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
@@ -1493,5 +1789,50 @@ mod tests {
         assert_eq!(continuation("9. nine", &f).as_deref(), Some("10. "));
         assert_eq!(continuation("> quoted", &f).as_deref(), Some("> "));
         assert_eq!(continuation("plain", &f), None);
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_through_blank_lines() {
+        let f = Format::builtin();
+        let mut live = Live::new("abcdefghij\n\nklmnopqrst\nuv\nwxyzwxyzwx\n", &f);
+        live.activate(0, 7);
+        live.key(Intent::Down, &f);
+        assert_eq!(live.cursor(), (1, 0));
+        live.key(Intent::Down, &f);
+        assert_eq!(live.cursor(), (2, 7));
+        live.key(Intent::Down, &f);
+        assert_eq!(live.cursor(), (3, 2));
+        live.key(Intent::Down, &f);
+        assert_eq!(live.cursor(), (4, 7));
+        live.key(Intent::Up, &f);
+        live.key(Intent::Up, &f);
+        assert_eq!(live.cursor(), (2, 7));
+        // A move to the side starts afresh from where the caret is.
+        live.key(Intent::Left, &f);
+        live.key(Intent::Down, &f);
+        live.key(Intent::Down, &f);
+        assert_eq!(live.cursor(), (4, 6));
+    }
+
+    #[test]
+    fn reading_keeps_a_selection_and_copies_what_is_shown() {
+        let f = Format::builtin();
+        let mut live = Live::new("# Title\n\nSome **bold** text\n", &f);
+        live.read_only = true;
+        let press = |offset| Press {
+            offset,
+            link: None,
+            right: false,
+            window: Point::ORIGIN,
+        };
+        assert_eq!(live.press(0, None, press(0)), None);
+        live.drag_to(2, None, 9);
+        assert!(!live.release(), "Reading doesn't start editing");
+        assert_eq!(live.active, None);
+        assert_eq!(live.selection_text().as_deref(), Some("Title\n\nSome bold"));
+        // A click (no drag) drops it.
+        live.press(2, None, press(1));
+        live.release();
+        assert_eq!(live.selection_text(), None);
     }
 }

@@ -95,6 +95,9 @@ pub struct LiveOutcome {
     pub focus: bool,
     /// Scroll the page by this much.
     pub scroll: Option<f32>,
+    /// A selection is being dragged at the page's edge: send
+    /// `live::Message::EdgeScroll` after `live::EDGE_STEP`.
+    pub edge_step: bool,
     /// A fresh editor appeared: lay the page out once more next frame (iced
     /// works out the caret and selection shapes before the editor's mixed
     /// fonts are applied, and only redoes them on the next layout).
@@ -762,14 +765,23 @@ impl Note {
             live::Message::Reveal(dy) => outcome.scroll = Some(dy),
             live::Message::Scrolled(viewport) => self.view_scrolled(viewport),
             live::Message::DragAt { line, cell, offset } => {
-                if let Body::Live(live) = &mut self.body {
+                if let Some(live) = self.shown_live() {
                     live.drag_to(line, cell, offset);
+                }
+            }
+            live::Message::Pointer(at) => {
+                outcome.edge_step = self.shown_live().is_some_and(|live| live.pointer(at));
+            }
+            live::Message::EdgeScroll => {
+                if let Some(dy) = self.shown_live().and_then(Live::edge_scroll) {
+                    outcome.scroll = Some(dy);
+                    outcome.edge_step = true;
                 }
             }
             // The app looks pictures up after every message.
             live::Message::PicturesShown => {}
             live::Message::MouseUp => {
-                if let Body::Live(live) = &mut self.body {
+                if let Some(live) = self.shown_live() {
                     outcome.focus = live.release();
                     outcome.settle = outcome.focus;
                 }
@@ -796,6 +808,22 @@ impl Note {
             Body::Live(live) => Some(live),
             Body::Source(_) => self.mirror.as_mut(),
         }
+    }
+
+    /// A selection is being dragged in the Live view (the app then follows
+    /// the pointer, for scrolling at the edges).
+    pub fn live_dragging(&self) -> bool {
+        self.shown_live_ref().is_some_and(Live::dragging)
+    }
+
+    /// The text selected in Reading (or Split's mirror), to copy.
+    pub fn selection_text(&self) -> Option<String> {
+        self.shown_live_ref().and_then(Live::selection_text)
+    }
+
+    /// Drops a selection kept in Reading. Returns whether there was one.
+    pub fn clear_selection(&mut self) -> bool {
+        self.shown_live().is_some_and(Live::clear_selection)
     }
 
     /// Takes an undo snapshot if this edit starts a new step.

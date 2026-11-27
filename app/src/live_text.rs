@@ -30,14 +30,14 @@ pub struct Press {
 
 pub struct LiveText<'a, Message> {
     measure: Option<&'a Cell<f32>>,
+    /// `measure` keeps the tallest of several (a table row's cells).
+    tallest: bool,
     spans: Vec<Span<'a, usize, Font>>,
     size: Pixels,
     line_height: LineHeight,
     font: Font,
     color: Color,
     wrapping: Wrapping,
-    /// Plain text shows the arrow, not the text caret (Reading mode).
-    read_only: bool,
     /// While a selection is being dragged: called with the text offset
     /// under the cursor as it moves over this line.
     on_drag: Option<Box<dyn Fn(usize) -> Message + 'a>>,
@@ -51,13 +51,13 @@ impl<'a, Message> LiveText<'a, Message> {
     ) -> Self {
         Self {
             measure: None,
+            tallest: false,
             spans,
             size: Pixels(15.0),
             line_height: LineHeight::Relative(1.5),
             font: Font::DEFAULT,
             color: Color::WHITE,
             wrapping: Wrapping::WordOrGlyph,
-            read_only: false,
             on_drag: None,
             on_press: Box::new(on_press),
         }
@@ -65,6 +65,14 @@ impl<'a, Message> LiveText<'a, Message> {
 
     /// Writes the laid-out height here, so the page can skip drawing lines
     /// that are off screen and still know how tall they are.
+    /// Like `measure`, but keeps the tallest height any widget reports into
+    /// `cell` (one cell shared by a table row's cells).
+    pub fn measure_tallest(mut self, cell: &'a Cell<f32>) -> Self {
+        self.measure = Some(cell);
+        self.tallest = true;
+        self
+    }
+
     pub fn measure(mut self, cell: &'a Cell<f32>) -> Self {
         self.measure = Some(cell);
         self
@@ -93,11 +101,6 @@ impl<'a, Message> LiveText<'a, Message> {
 
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
-        self
-    }
-
-    pub fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
         self
     }
 
@@ -170,7 +173,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         let min = state.paragraph.min_bounds();
         let height = min.height.max(line);
         if let Some(cell) = self.measure {
-            cell.set(height);
+            cell.set(if self.tallest { cell.get().max(height) } else { height });
         }
         layout::Node::new(Size::new(limits.max().width, height))
     }
@@ -332,8 +335,6 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         }
         if tree.state.downcast_ref::<State>().hovered_link.is_some() {
             mouse::Interaction::Pointer
-        } else if self.read_only {
-            mouse::Interaction::None
         } else {
             mouse::Interaction::Text
         }

@@ -269,12 +269,15 @@ How Live Preview works:
 
 Known limits, for later:
 
-- Selecting by dragging works in Live, but the page doesn't scroll by itself
+- ~~Selecting by dragging works in Live, but the page doesn't scroll by itself
   when you drag past its top or bottom edge yet (scroll with the wheel while
-  holding the button). Selecting text in Reading isn't possible yet.
-- Up/Down through a blank line forgets the column.
-- The scrollbar can shift slightly while scrolling a long note for the first
-  time, as estimated heights are replaced by measured ones.
+  holding the button). Selecting text in Reading isn't possible yet.~~ Done
+  in milestone 11, item 1.
+- ~~Up/Down through a blank line forgets the column.~~ Done in milestone 11,
+  item 1.
+- ~~The scrollbar can shift slightly while scrolling a long note for the first
+  time, as estimated heights are replaced by measured ones.~~ Done in
+  milestone 11, item 1 (it shifted a lot in a narrow window).
 - Images and embeds show as a placeholder (📎, 🖼), not the picture. →
   Milestone 10 (images; note embeds stay out of version 1).
 
@@ -798,10 +801,11 @@ performance budgets checked.
 | 8 | **Polish** ✅ | Animation pass, compact mode, vault search, performance on large vaults |
 | 9 | **Graph and functions, finished** ✅ | The toolbar fits, views are remembered, wires reach rows, link wires can be deleted, function renames reach their wires, function edits undo, the crew hand stays readable |
 | 10 | **Images** ✅ | Pictures in notes, crew portraits, attachments from any folder, within a memory budget |
+| 11 | **Known limits** | The editor's rough edges, links, scale and search, the graph and crew finished |
 
 ## Next
 
-Milestones 1–8 cover version 1's scope. These two finish what's half done
+Milestones 1–8 cover version 1's scope. These finish what's half done
 (each milestone's "Known limits, for later") before anything from
 [Not in version 1](#not-in-version-1). Each item says where the work goes;
 anything that changes file text goes in core with tests.
@@ -1139,6 +1143,64 @@ Panning a 300-card graph with 565 dashed wires by itself
 
 So about 100 frames a second while panning even this graph: the soft edges
 stay on while panning. Idle is unchanged (no app thread runs).
+
+### Milestone 11: Known limits
+
+The rest of the earlier milestones' "Known limits, for later", in this order:
+
+1. **The editor's rough edges.** Dragging a selection past the page's edge,
+   selecting in Reading, Up/Down through blank lines, the scrollbar shifting.
+
+   ✅ **Done (November 2026).** All in `app/src/live.rs`:
+
+   - **Scrolling while selecting.** With a selection being dragged, the page
+     scrolls when the pointer is within 24 px of its top or bottom edge or
+     past it, faster the further in (2–60 px a step, a step every 16 ms);
+     the selection's end follows the line at the pointer's height. The app
+     listens to the pointer only while a selection is dragged
+     (`Note::live_dragging`), and the step timer only runs at an edge
+     (`Message::Pointer`, `Message::EdgeScroll`). On release the page stays
+     where the drag ended: the editor isn't revealed back at the
+     selection's first line.
+   - **Selecting in Reading** (and Split's mirror): a drag selects; the
+     selection stays highlighted until the next press or Escape, and Ctrl+C
+     (when no text box has the keyboard, `Shortcut::Copy`) copies its text
+     as drawn: lines joined with newlines, table cells with tabs, no
+     markdown. Plain text shows the text cursor there too.
+   - **Up/Down keep their column** (in characters) through blank and shorter
+     lines, from the first of a run of them; any other key or a click starts
+     afresh.
+   - **Steadier heights.** Lines not drawn yet were estimated at half an em
+     a character on an 800 px page; with the sidebar and backlinks open the
+     page is much narrower, so a long note grew as it was scrolled. Now each
+     line's words are wrapped at the page's real width with each
+     character's real width (measured once per character), cached per line
+     until it changes or the width does (a resize measures again). Table
+     rows are measured too (their tallest cell) and estimated per cell.
+     Sweeping a copy of this file (1,180 lines) in a 1000 × 640 window:
+
+     | | Page height as lines get drawn |
+     |---|---|
+     | Before | grew from 31,800 to 45,600 px, jumping up to 2,100 px at tables |
+     | After | stays between 53,168 and 53,240 px |
+
+     `OBSESSION_DEV_TIMING` prints the estimates' error on each scroll;
+     `OBSESSION_DEV_VSCROLL` takes a list of offsets.
+
+   Known limits, for later: table cells don't show the selection highlight
+   while dragging (they're still selected); copying a whole list line from
+   Reading keeps its `•`.
+
+2. **Links.** Folders can be renamed; relative links inside a moved note are
+   adjusted; backlink snippets are drawn formatted; unlinked mentions are
+   listed. Core: `links.rs`, `vault.rs`, with tests; app: `backlinks.rs`.
+3. **Scale and search.** The function index and the out-of-date check move
+   off the UI thread; search ignores case beyond ASCII (`É` matches `é`);
+   find out why memory with search built grows by more than its text.
+4. **The graph and crew, finished.** Cards matched to the Possess mockup;
+   the inputs node's place saved; an `id` renamed from the editor;
+   highlighting and drop targets past a card's first 8 rows; status formats
+   on the Settings page; an unknown `@name` amber on the line being edited.
 
 ## Risks
 

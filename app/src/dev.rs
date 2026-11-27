@@ -14,7 +14,8 @@
 //! - `OBSESSION_DEV_LDRAG=line,offset`  after LPRESS, drag to here before letting go
 //! - `OBSESSION_DEV_LTYPE=text{enter}…`  type into the Live Preview editor
 //! - `OBSESSION_DEV_SCROLL=lines[,steps]`  wheel the Source editor
-//! - `OBSESSION_DEV_VSCROLL=y`  scroll the Live view (Split's right pane) to `y`
+//! - `OBSESSION_DEV_VSCROLL=y[,y…]`  scroll the Live view (Split's right pane)
+//!   to `y`, then to each next `y` 400 ms later
 //! - `OBSESSION_DEV_RENAME=new/name`  rename the open note
 //! - `OBSESSION_DEV_FOLLOW=wiki:target#sub`  follow a link from the open note
 //! - `OBSESSION_DEV_GRAPH=move,0,10,20;connect,0,1`  graph actions on the open `_nodes.md`
@@ -275,11 +276,13 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
         }
     }
     // Scroll Split's right pane to an offset.
-    if let Some(y) = var("OBSESSION_DEV_VSCROLL").and_then(|v| v.parse().ok()) {
-        tasks.push(Task::perform(
-            crate::timer::after(Duration::from_millis(900)),
-            move |()| Message::Dev(Step::ScrollView(y)),
-        ));
+    if let Some(list) = var("OBSESSION_DEV_VSCROLL") {
+        for (i, y) in list.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).enumerate() {
+            tasks.push(Task::perform(
+                crate::timer::after(Duration::from_millis(900 + 400 * i as u64)),
+                move |()| Message::Dev(Step::ScrollView(y)),
+            ));
+        }
     }
     if let Some(typed) = var("OBSESSION_DEV_TYPE") {
         for ch in typed.chars() {

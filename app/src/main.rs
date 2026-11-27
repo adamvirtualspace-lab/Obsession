@@ -165,6 +165,8 @@ enum Shortcut {
     Escape,
     /// Tab that no widget used: completes an `@name` if suggestions show.
     Tab,
+    /// Ctrl+C that no text box used: copies a selection made in Reading.
+    Copy,
 }
 
 struct Workspace {
@@ -1346,7 +1348,17 @@ impl App {
             Shortcut::Redo => self.undo(true),
             Shortcut::Save => self.save_now(),
             Shortcut::OpenFolder => self.update(Message::PickFolder),
-            Shortcut::Up | Shortcut::Down | Shortcut::Escape | Shortcut::Tab => Task::none(),
+            Shortcut::Copy => match self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).and_then(Note::selection_text) {
+                Some(text) => iced::clipboard::write(text),
+                None => Task::none(),
+            },
+            Shortcut::Escape => {
+                if let Some(note) = self.note_mut() {
+                    note.clear_selection();
+                }
+                Task::none()
+            }
+            Shortcut::Up | Shortcut::Down | Shortcut::Tab => Task::none(),
         }
     }
 
@@ -3212,6 +3224,11 @@ impl App {
                 iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: dy },
             ));
         }
+        if outcome.edge_step {
+            tasks.push(Task::perform(timer::after(live::EDGE_STEP), |()| {
+                Message::Live(live::Message::EdgeScroll)
+            }));
+        }
         if let Some((task, at)) = outcome.menu {
             self.menu = Some(StatusMenu { task, at });
         }
@@ -3749,8 +3766,22 @@ impl App {
             .workspace
             .as_ref()
             .map_or_else(Subscription::none, |ws| watch::watch(ws.vault.root.clone()).map(Message::Fs));
+        // Only while a selection is dragged: the pointer anywhere in the
+        // window, for scrolling at the page's edges.
+        let dragging = self.workspace.as_ref().and_then(|ws| ws.note.as_ref()).is_some_and(Note::live_dragging);
+        let pointer = if dragging {
+            event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::Live(live::Message::Pointer(position)))
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             watch,
+            pointer,
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
             event::listen_with(|event, _, _| match event {
@@ -4241,6 +4272,8 @@ fn shortcut_from_event(
             Key::Character("z") if modifiers.shift() => Some(Shortcut::Redo),
             Key::Character("z") => Some(Shortcut::Undo),
             Key::Character("y") => Some(Shortcut::Redo),
+            // Only when no text box copied first (Reading has none).
+            Key::Character("c") if status == event::Status::Ignored => Some(Shortcut::Copy),
             _ => None,
         };
     }
