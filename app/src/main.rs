@@ -330,6 +330,23 @@ fn run_files(ws: &mut Workspace) -> HashMap<String, String> {
         .collect()
 }
 
+/// Each `@name` in `text`, keyed as the link states look it up: `Ok` with
+/// a crew card, `Missing` without (drawn amber).
+fn mention_states(text: &str, crew: &[Member]) -> Vec<(String, links::LinkState)> {
+    let mut out: Vec<(String, links::LinkState)> = Vec::new();
+    for line in text.lines() {
+        for (_, name) in crew::mentions(line) {
+            let key = format!("@{name}");
+            if out.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            let known = crew.iter().any(|m| m.key == name);
+            out.push((key, if known { links::LinkState::Ok } else { links::LinkState::Missing }));
+        }
+    }
+    out
+}
+
 /// The vault-root settings note.
 const SETTINGS_NOTE: &str = "_settings.md";
 
@@ -414,6 +431,56 @@ struct SettingsForm {
     compact: bool,
     /// Why the picked folder can't be used.
     error: Option<String>,
+    /// The team's status format as typed, in click order (empty: the
+    /// built-in `[ ]` / `[x]`).
+    statuses: Vec<StatusRow>,
+    /// Why the statuses can't be saved as they are.
+    statuses_error: Option<String>,
+}
+
+/// One status on the Settings page, as typed.
+#[derive(Debug, Clone, Default)]
+struct StatusRow {
+    ch: String,
+    symbol: String,
+    label: String,
+}
+
+impl StatusRow {
+    fn from(status: &status::Status) -> Self {
+        Self { ch: status.ch.to_string(), symbol: status.symbol.to_string(), label: status.label.to_string() }
+    }
+}
+
+/// The rows as statuses, or a sentence saying which one isn't usable.
+fn statuses_from(rows: &[StatusRow]) -> Result<Vec<status::Status>, String> {
+    let mut out: Vec<status::Status> = Vec::new();
+    for (n, row) in rows.iter().enumerate() {
+        let which = n + 1;
+        let mut chars = row.ch.chars();
+        let ch = match (chars.next(), chars.next()) {
+            (Some(c), None) if !matches!(c, '[' | ']') => c,
+            (None, _) => return Err(format!("Status {which} needs the character between the brackets (a space for [ ])")),
+            _ => return Err(format!("Status {which}: one character between the brackets, not [ or ]")),
+        };
+        let symbol = row.symbol.trim();
+        if symbol.is_empty() || symbol.contains(char::is_whitespace) {
+            return Err(format!("Status [{ch}] needs one symbol, like ✅ (no spaces)"));
+        }
+        if out.iter().any(|s| s.ch == ch) {
+            return Err(format!("[{ch}] is listed twice"));
+        }
+        out.push(status::Status { ch, symbol: symbol.into(), label: row.label.trim().into() });
+    }
+    Ok(out)
+}
+
+/// Which part of a status row is being typed in.
+#[derive(Debug, Clone, Copy)]
+pub enum StatusField {
+    Char,
+    Symbol,
+    Label,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +492,12 @@ pub enum SettingsMessage {
     /// The folder picker closed.
     Picked(Option<PathBuf>),
     Compact(bool),
+    /// A status row's field typed in.
+    Status(usize, StatusField, String),
+    /// Move a status up (`true`) or down in the click order.
+    StatusMove(usize, bool),
+    StatusRemove(usize),
+    StatusAdd,
     Save,
     Close,
 }
@@ -2233,6 +2306,10 @@ impl App {
             return Task::none();
         };
         match message {
+            graph::Message::Rows(card) => {
+                graph.toggle_rows(card);
+                Task::none()
+            }
             graph::Message::Viewed(view) => {
                 // Kept for coming back from the function editor, and written
                 // to `.obsessed/views.txt` when you leave the graph.
@@ -2538,12 +2615,7 @@ impl App {
         };
         let text = note.text();
         let mut states = links::link_states(&text, &note.rel, &ws.vault, &ws.links);
-        for line in text.lines() {
-            for (_, name) in crew::mentions(line) {
-                let known = ws.crew.iter().any(|m| m.key == name);
-                states.insert(format!("@{name}"), if known { links::LinkState::Ok } else { links::LinkState::Missing });
-            }
-        }
+        states.extend(mention_states(&text, &ws.crew));
         note.set_link_states(LinkStates::new(states));
         if ws.indexed {
             ws.mentions = ws.links.mention_counts(ws.team.as_ref(), None);
@@ -2792,6 +2864,11 @@ impl App {
             let text = note.text();
             note.analyze(&text);
             ws.links.update(&note.rel, &text);
+            // An `@name` typed since: amber at once if it has no crew card
+            // (the line being edited too), not only after a full refresh.
+            if let Some(states) = note.link_states().with(mention_states(&text, &ws.crew)) {
+                note.set_link_states(states);
+            }
             if let Some(search) = &mut ws.search { search.update(&note.rel, &text); }
             if ws.store.get(&note.rel).ok() != Some(text.as_str()) {
                 changed = Some(note.rel.to_string());
@@ -3535,6 +3612,8 @@ impl App {
                     crew: ws.crew_folder.clone(),
                     compact: theme::compact(),
                     error: None,
+                    statuses: ws.team.as_ref().map(|f| f.statuses().iter().map(StatusRow::from).collect()).unwrap_or_default(),
+                    statuses_error: None,
                 });
                 Task::none()
             }
@@ -3577,6 +3656,50 @@ impl App {
                 theme::set_compact(on);
                 Task::none()
             }
+            SettingsMessage::Status(i, field, value) => {
+                if let Some(form) = &mut self.settings
+                    && let Some(row) = form.statuses.get_mut(i)
+                {
+                    match field {
+                        StatusField::Char => row.ch = value,
+                        StatusField::Symbol => row.symbol = value,
+                        StatusField::Label => row.label = value,
+                    }
+                    form.statuses_error = None;
+                }
+                Task::none()
+            }
+            SettingsMessage::StatusMove(i, up) => {
+                if let Some(form) = &mut self.settings {
+                    let j = if up { i.checked_sub(1) } else { Some(i + 1) };
+                    if let Some(j) = j.filter(|&j| j < form.statuses.len()) {
+                        form.statuses.swap(i, j);
+                    }
+                    form.statuses_error = None;
+                }
+                Task::none()
+            }
+            SettingsMessage::StatusRemove(i) => {
+                if let Some(form) = &mut self.settings
+                    && i < form.statuses.len()
+                {
+                    form.statuses.remove(i);
+                    form.statuses_error = None;
+                }
+                Task::none()
+            }
+            SettingsMessage::StatusAdd => {
+                if let Some(form) = &mut self.settings {
+                    // A new list starts from the built-in two.
+                    if form.statuses.is_empty() {
+                        form.statuses = status::Format::builtin().statuses().iter().map(StatusRow::from).collect();
+                    } else {
+                        form.statuses.insert(form.statuses.len().saturating_sub(1), StatusRow::default());
+                    }
+                    form.statuses_error = None;
+                }
+                Task::none()
+            }
             SettingsMessage::Picked(None) => Task::none(),
             SettingsMessage::Picked(Some(path)) => {
                 let Some(ws) = &self.workspace else {
@@ -3602,8 +3725,16 @@ impl App {
                 Task::none()
             }
             SettingsMessage::Save => {
-                let Some(form) = self.settings.take() else {
+                let Some(mut form) = self.settings.take() else {
                     return Task::none();
+                };
+                let statuses = match statuses_from(&form.statuses) {
+                    Ok(statuses) => statuses,
+                    Err(why) => {
+                        form.statuses_error = Some(why);
+                        self.settings = Some(form);
+                        return Task::none();
+                    }
                 };
                 let folder = form.crew.replace('\\', "/").trim().trim_matches('/').to_owned();
                 let folder = if folder.is_empty() { crew::FOLDER.to_owned() } else { folder };
@@ -3616,21 +3747,29 @@ impl App {
                 let Some(ws) = &mut self.workspace else {
                     return Task::none();
                 };
-                if folder == ws.crew_folder {
+                let team_was: Vec<status::Status> = ws.team.as_ref().map(|f| f.statuses().to_vec()).unwrap_or_default();
+                let crew_changed = folder != ws.crew_folder;
+                let team_changed = statuses != team_was;
+                if !crew_changed && !team_changed {
                     return Task::none();
                 }
+                // One write for both.
+                let change = |text: &str| -> String {
+                    let text = if crew_changed { crew::set_frontmatter(text, crew::SETTING, &folder) } else { text.to_owned() };
+                    if team_changed { status::set_statuses(&text, &statuses) } else { text }
+                };
                 let exists = ws.vault.note(SETTINGS_NOTE).is_some();
                 let task = if exists {
                     let Some(text) = self.current_text(SETTINGS_NOTE) else {
                         self.status = Some("⚠ Couldn't read _settings.md".into());
                         return Task::none();
                     };
-                    let new = crew::set_frontmatter(&text, crew::SETTING, &folder);
+                    let new = change(&text);
                     let save = self.put_text(SETTINGS_NOTE, &new);
                     Task::batch([save, self.note_changed(SETTINGS_NOTE)])
                 } else {
                     let path = ws.vault.path(SETTINGS_NOTE);
-                    let text = crew::set_frontmatter("", crew::SETTING, &folder);
+                    let text = change("");
                     if let Err(error) = obsession_core::write::atomic_write(&path, text.as_bytes()) {
                         self.status = Some(format!("⚠ Couldn't create _settings.md: {error}"));
                         return Task::none();
@@ -3642,17 +3781,77 @@ impl App {
                     return task;
                 };
                 ws.crew_folder = folder.clone();
+                ws.team = status::Format::from_statuses(statuses.clone());
                 ws.load_crew();
+                // The open note's statuses follow, unless it has its own.
+                if let Some(note) = &mut ws.note {
+                    note.refresh_format(ws.team.as_ref());
+                }
                 let n = ws.crew.len();
-                self.status = Some(format!(
-                    "Crew folder: {folder} · {n} {} · saved in _settings.md",
-                    if n == 1 { "person" } else { "people" }
-                ));
+                let mut said = Vec::new();
+                if crew_changed {
+                    said.push(format!("Crew folder: {folder} · {n} {}", if n == 1 { "person" } else { "people" }));
+                }
+                if team_changed {
+                    said.push(match statuses.len() {
+                        0 => "Statuses: the default [ ] / [x]".to_owned(),
+                        k => format!("Statuses: {k} for the team"),
+                    });
+                }
+                self.status = Some(format!("{} · saved in _settings.md", said.join(" · ")));
                 self.refresh_links();
                 self.rebuild_graph();
                 task
             }
         }
+    }
+
+    /// The team's statuses on the Settings page: a row each (character,
+    /// symbol, label; up, down, remove), and "+ Add status".
+    fn view_status_rows<'a>(&'a self, form: &'a SettingsForm) -> Element<'a, Message> {
+        let field = |value: &'a str, placeholder: &'a str, width: f32, i: usize, which: StatusField| {
+            iced::widget::text_input(placeholder, value)
+                .on_input(move |v| Message::Settings(SettingsMessage::Status(i, which, v)))
+                .on_submit(Message::Settings(SettingsMessage::Save))
+                .padding([5, 6])
+                .size(theme::SMALL)
+                .width(iced::Length::Fixed(width))
+                .style(theme::search)
+        };
+        let small = |label: &'static str, message: Option<SettingsMessage>| {
+            button(text(label).size(theme::SMALL))
+                .on_press_maybe(message.map(Message::Settings))
+                .padding([3, 8])
+                .style(theme::tool(false))
+        };
+        let last = form.statuses.len().saturating_sub(1);
+        let mut rows = column![].spacing(4);
+        if form.statuses.is_empty() {
+            rows = rows.push(text("None: notes use the default [ ] to do / [x] done.").size(theme::SMALL).color(theme::FAINT));
+        }
+        for (i, row) in form.statuses.iter().enumerate() {
+            let finished = i == last;
+            rows = rows.push(
+                row![
+                    text("[").size(theme::SMALL).color(theme::MUTED),
+                    field(&row.ch, " ", 28.0, i, StatusField::Char),
+                    text("]").size(theme::SMALL).color(theme::MUTED),
+                    field(&row.symbol, "✅", 52.0, i, StatusField::Symbol),
+                    field(&row.label, if finished { "done" } else { "label" }, 190.0, i, StatusField::Label),
+                    small("↑", (i > 0).then_some(SettingsMessage::StatusMove(i, true))),
+                    small("↓", (i < last).then_some(SettingsMessage::StatusMove(i, false))),
+                    small("×", Some(SettingsMessage::StatusRemove(i))),
+                    text(if finished { "finished" } else { "" }).size(11).color(theme::FAINT),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            );
+        }
+        rows = rows.push(small("+ Add status", Some(SettingsMessage::StatusAdd)));
+        if let Some(why) = &form.statuses_error {
+            rows = rows.push(text(format!("⚠ {why}")).size(theme::SMALL).color(theme::WARNING));
+        }
+        rows.into()
     }
 
     fn view_settings<'a>(&'a self, form: &'a SettingsForm, ws: &'a Workspace) -> Element<'a, Message> {
@@ -3721,6 +3920,12 @@ impl App {
                 None => text(preview).size(theme::SMALL).color(theme::MENTION),
             },
             picks,
+            rule::horizontal(1),
+            text("Status format").size(theme::TEXT_SIZE).color(theme::HEADING),
+            text("Click order, top to bottom; the last one counts as finished. Notes with their own statuses: keep them.")
+                .size(theme::SMALL)
+                .color(theme::MUTED),
+            self.view_status_rows(form),
             rule::horizontal(1),
             text("This computer").size(theme::TEXT_SIZE).color(theme::HEADING),
             iced::widget::checkbox(form.compact)

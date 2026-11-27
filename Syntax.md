@@ -398,7 +398,7 @@ Set Status(dst, st, find: target, from: "- ")  @680,60
 | `param name = value` | A value the wire can set, with a default. |
 | `id = Node(args)` | A node with a result. `id` uses letters, digits, `-` and `_`. |
 | `Node(args)` | An action node (no result). |
-| `@x,y` | Optional, at the end of a node line: its position in the function editor. |
+| `@x,y` | Optional, at the end of a node line: its position in the function editor. At the end of the `fn` line: where the inputs node sits. |
 | `// text` | A comment. |
 
 - Arguments are positional or named (`ignore case: true`). An argument is a node

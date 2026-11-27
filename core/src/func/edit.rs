@@ -63,6 +63,21 @@ pub fn set_pos(text: &str, step: &Step, x: f32, y: f32) -> String {
     lines.join()
 }
 
+/// Moves the inputs node in the editor: `@x,y` at the end of the block's
+/// `fn` line (added, or replaced).
+pub fn set_entry_pos(text: &str, block: &Block, x: f32, y: f32) -> String {
+    let mut lines = Lines::new(text);
+    let end = block.close.min(lines.lines.len());
+    let Some(i) = (block.open + 1..end).find(|&i| lines.lines[i].trim_start().starts_with("fn ")) else {
+        return text.to_owned();
+    };
+    let raw = lines.lines[i].clone();
+    let (indent, code, comment) = parts(&raw);
+    let (name, _) = super::split_pos(code);
+    lines.lines[i] = format!("{indent}{name}  @{},{}{comment}", x.round() as i64, y.round() as i64);
+    lines.join()
+}
+
 /// The arguments for a node's inputs, written the usual way: required
 /// inputs in order without names while none is missing, the rest by name.
 pub fn args_for(op: &str, values: &[Option<Value>]) -> Vec<Arg> {
@@ -181,6 +196,107 @@ pub fn remove_step(text: &str, block: &Block, index: usize) -> String {
     lines.join()
 }
 
+/// Renames step `index`'s id to `new`: its own `id =`, and every argument
+/// of another step that reads it. Only those names change on each line
+/// (spacing, `@x,y`, quoted text and comments stay as written). Refused
+/// with a sentence when `new` isn't a name or is taken by another step, an
+/// `in`, an `out` or a param.
+pub fn rename_step(text: &str, f: &Function, index: usize, new: &str) -> Result<String, String> {
+    check_step_rename(f, index, new)?;
+    let step = &f.steps[index];
+    let old = step.id.as_deref().unwrap_or_default();
+    let new = new.trim();
+    if new == old {
+        return Ok(text.to_owned());
+    }
+    let mut lines = Lines::new(text);
+    // The step's own `old =`.
+    if let Some(raw) = lines.lines.get(step.line).cloned() {
+        let (indent, code, comment) = parts(&raw);
+        if let Some(rest) = code.strip_prefix(old)
+            && rest.trim_start().starts_with('=')
+        {
+            lines.lines[step.line] = format!("{indent}{new}{rest}{comment}");
+        }
+    }
+    // Every argument that reads it.
+    for other in &f.steps {
+        if !other.args.iter().any(|a| matches!(&a.value, Value::Ref(r) if r == old)) {
+            continue;
+        }
+        let Some(raw) = lines.lines.get(other.line).cloned() else { continue };
+        let (indent, code, comment) = parts(&raw);
+        lines.lines[other.line] = format!("{indent}{}{comment}", rename_refs(code, old, new));
+    }
+    Ok(lines.join())
+}
+
+/// Whether step `index`'s id may become `new` (see `rename_step`).
+pub fn check_step_rename(f: &Function, index: usize, new: &str) -> Result<(), String> {
+    let step = f.steps.get(index).ok_or("That node is gone.")?;
+    let old = step.id.as_deref().ok_or("This node has no id to rename.")?;
+    let new = new.trim();
+    if new == old {
+        return Ok(());
+    }
+    if !super::is_name(new) {
+        return Err(format!("`{new}` can't be an id: use letters, digits, - and _, not starting with a digit"));
+    }
+    let taken = f.steps.iter().enumerate().any(|(i, s)| i != index && s.id.as_deref() == Some(new))
+        || f.inputs.iter().chain(&f.outputs).any(|p| p.name == new)
+        || f.params.iter().any(|p| p.name == new);
+    if taken {
+        return Err(format!("`{new}` is already used in this function"));
+    }
+    Ok(())
+}
+
+/// `code` (one step) with every argument that is the name `old` written
+/// `new`: inside the call's parentheses, outside quotes, and not an
+/// argument's own name (`find: x`).
+fn rename_refs(code: &str, old: &str, new: &str) -> String {
+    let Some(open) = code.find('(') else {
+        return code.to_owned();
+    };
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let mut out = String::with_capacity(code.len() + new.len());
+    out.push_str(&code[..=open]);
+    let rest = &code[open + 1..];
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '"' {
+            // A quoted literal, escapes and all.
+            out.push(c);
+            let mut escaped = false;
+            for (_, q) in chars.by_ref() {
+                out.push(q);
+                if escaped {
+                    escaped = false;
+                } else if q == '\\' {
+                    escaped = true;
+                } else if q == '"' {
+                    break;
+                }
+            }
+        } else if is_name_char(c) {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if !is_name_char(d) {
+                    break;
+                }
+                end = j + d.len_utf8();
+                chars.next();
+            }
+            let word = &rest[i..end];
+            let names_an_arg = rest[end..].trim_start().starts_with(':');
+            out.push_str(if word == old && !names_an_arg { new } else { word });
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Adds an `in`, `out` or `param` line after the block's other ports and
 /// params (before the first step).
 pub fn add_header(text: &str, block: &Block, line: &str) -> String {
@@ -241,8 +357,14 @@ pub fn rename(text: &str, block: &Block, new: &str, heading: bool) -> String {
     let old = block.function.name.clone();
     let end = block.close.min(lines.lines.len());
     if let Some(i) = (block.open + 1..end).find(|&i| lines.lines[i].trim_start().starts_with("fn ")) {
-        let (indent, _, comment) = parts(&lines.lines[i]);
-        lines.lines[i] = format!("{indent}fn {new}{comment}");
+        let raw = lines.lines[i].clone();
+        let (indent, code, comment) = parts(&raw);
+        // The inputs node's `@x,y` stays.
+        let pos = match super::split_pos(code) {
+            (name, Some(_)) => code[name.len()..].to_owned(),
+            (_, None) => String::new(),
+        };
+        lines.lines[i] = format!("{indent}fn {new}{pos}{comment}");
     }
     if heading {
         // The nearest heading above, unless a fence comes first.
@@ -272,6 +394,54 @@ pub fn wire_call(name: &str, args: &[Arg]) -> String {
 mod tests {
     use super::super::{blocks, parse_call};
     use super::*;
+
+    #[test]
+    fn keeps_the_inputs_node_place_on_the_fn_line() {
+        let text = "```obsession\nfn Wait For Done // waits\nin src: File\n```\n";
+        let block = &blocks(text)[0];
+        assert_eq!(block.function.entry, None);
+        let moved = set_entry_pos(text, block, -220.4, 60.0);
+        assert_eq!(moved, "```obsession\nfn Wait For Done  @-220,60 // waits\nin src: File\n```\n");
+        let block = &blocks(&moved)[0];
+        assert_eq!(block.function.name, "Wait For Done");
+        assert_eq!(block.function.entry, Some((-220.0, 60.0)));
+        // Moved again: replaced, not added.
+        let again = set_entry_pos(&moved, block, 10.0, 20.0);
+        assert!(again.contains("fn Wait For Done  @10,20 // waits"), "{again}");
+        // A rename keeps it.
+        let renamed = rename(&again, &blocks(&again)[0], "Hold", false);
+        assert!(renamed.contains("fn Hold  @10,20 // waits"), "{renamed}");
+        // An `@` that isn't a place stays in the name.
+        assert_eq!(blocks("```obsession\nfn Ping @ika\n```\n")[0].function.name, "Ping @ika");
+    }
+
+    #[test]
+    fn renames_a_step_id_and_what_reads_it() {
+        let text = "```obsession\nfn Wait\nin src: File\nout dst: File\nparam task = \"\"\n\nt  = Find Task(src, task)   @40,60\ns  = Status(t)              @320,60 // the status\nok = Equal(s, \"t\")\nSet Status(dst, s, find: t)  @600,60\n```\n";
+        let block = &blocks(text)[0];
+        let f = &block.function;
+        let out = rename_step(text, f, 0, "task_row").unwrap();
+        assert!(out.contains("task_row  = Find Task(src, task)   @40,60\n"), "{out}");
+        assert!(out.contains("s  = Status(task_row)              @320,60 // the status\n"), "{out}");
+        // Quoted text stays; `find: t` names the argument `find`, and its
+        // value `t` is the step.
+        assert!(out.contains("ok = Equal(s, \"t\")\n"), "{out}");
+        assert!(out.contains("Set Status(dst, s, find: task_row)  @600,60"), "{out}");
+        // Still the same function, renamed.
+        let again = &blocks(&out)[0].function;
+        assert_eq!(again.steps[0].id.as_deref(), Some("task_row"));
+        // The same problems as before (this sample has one on purpose:
+        // `find` wants text), so every reference still resolves.
+        let before = super::super::check::check(f).first_problem().map(str::to_owned);
+        assert_eq!(super::super::check::check(again).first_problem().map(str::to_owned), before);
+
+        assert_eq!(rename_step(text, f, 0, "t").unwrap(), text);
+        assert!(rename_step(text, f, 0, "s").unwrap_err().contains("already used"));
+        assert!(rename_step(text, f, 0, "src").unwrap_err().contains("already used"));
+        assert!(rename_step(text, f, 0, "task").unwrap_err().contains("already used"));
+        assert!(rename_step(text, f, 0, "2x").unwrap_err().contains("can't be an id"));
+        assert!(rename_step(text, f, 3, "x").unwrap_err().contains("no id"));
+    }
 
     const FILE: &str = "## Functions\r\n```obsession\r\nfn Wait\r\nin src: File\r\nout dst: File\r\n\r\n// find it\r\n  t  = Find Task(src, \"a\")   @40,60   // first\r\ns = Status(t)\r\nSet Status(dst, s, find: \"b\")\r\n\r\n```\r\nafter\r\n";
 

@@ -366,7 +366,8 @@ Known limits, for later:
 - ~~Link wires can't be removed from the graph yet (Syntax.md wants it to ask
   whether to remove the link from the note); Delete says where the link is.~~
   Done in milestone 9, item 4.
-- The card look is a first pass, to be matched to the Possess mockup.
+- ~~The card look is a first pass, to be matched to the Possess mockup.~~
+  Done in milestone 11, item 4.
 
 ### Function editor (milestone 5)
 
@@ -406,9 +407,11 @@ Known limits, for later:
   aren't in Ctrl+Z.~~ Done in milestone 9, item 6.
 - ~~Renaming a function (its `fn` line) doesn't update the wires that use
   it.~~ Done in milestone 9, item 5: rename from the editor's title.
-- The editor's view and the inputs node's place aren't saved. The view is
-  done in milestone 9, item 2; the inputs node's place stays for later.
-- An `id` can't be renamed from the editor (edit the text).
+- ~~The editor's view and the inputs node's place aren't saved.~~ The view
+  is done in milestone 9, item 2; the inputs node's place in milestone 11,
+  item 4.
+- ~~An `id` can't be renamed from the editor (edit the text).~~ Done in
+  milestone 11, item 4.
 - `Find Task` and `Set Status`'s `find` ignore case (Syntax.md says so now).
 
 ### Running functions (milestone 6)
@@ -492,13 +495,15 @@ Known limits, for later:
 - Portraits aren't drawn yet: every card shows initials in its colour (bots a
   square face). `portrait:` is read and kept for when images arrive. →
   Milestone 10.
-- Highlighting and drop targets cover the first 8 task rows a card shows.
+- ~~Highlighting and drop targets cover the first 8 task rows a card
+  shows.~~ Done in milestone 11, item 4 ("+N more" opens a card).
 - ~~Hover highlighting was checked by reading the code, not by an automated
   screenshot (the dev hooks can't hover the canvas).~~ Checked by hand in
   November 2026 (see "Checked by hand").
 - `@` suggestions only list people in the crew folder.
-- The Settings page has one setting so far (the crew folder). Status formats
-  are still edited in `_settings.md` itself.
+- ~~The Settings page has one setting so far (the crew folder). Status
+  formats are still edited in `_settings.md` itself.~~ Done in milestone 11,
+  item 4.
 
 ### Polish (milestone 8)
 
@@ -579,8 +584,8 @@ Still not right, for later:
   milestone 9, item 1.
 - With six crew cards and the backlinks panel open, the hand overlaps enough
   that badges run into each other. → Milestone 9.
-- An unknown `@name` is amber only when its line is drawn, not on the line
-  being edited.
+- ~~An unknown `@name` is amber only when its line is drawn, not on the line
+  being edited.~~ Done in milestone 11, item 4.
 - The run glow (1.2 s, starting about a second after a change) is easy to miss;
   `OBSESSION_DEV_PULSE_MS` slows it down to look at.
 
@@ -985,6 +990,7 @@ In this order:
 
 Left for later: the inputs node's place in the editor (needs a syntax line),
 renaming an `id` from the editor, matching the cards to the Possess mockup.
+→ All three done in milestone 11, item 4.
 
 ### Milestone 10: Images
 
@@ -1320,6 +1326,53 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
    the inputs node's place saved; an `id` renamed from the editor;
    highlighting and drop targets past a card's first 8 rows; status formats
    on the Settings page; an unknown `@name` amber on the line being edited.
+
+   ✅ **Done (November 2026).**
+
+   - **Cards as in the Possess mockup** (`css/graph.css`, `crates/ui/src/
+     graph.rs` there): 264 wide, 10 px corners and a soft shadow; a 54 px
+     header with the department's colour as a strip, the title and the
+     note's path in the mono font (⚠ at the right for unknown statuses, or a
+     crew card's face); 30 px task rows with the status centred in a 22 px
+     box, the text cut with "…", and the row's `@names` apart at the right
+     (mono, amber); "No tasks" in italics; a 28 px footer with "in N · out
+     M" (the wires drawn) and "K open of T", the done share as a thin green
+     line along its top. A missing note's card is just its dashed header
+     ("missing · double-click to create"). Wire ends, hover bands and drop
+     targets follow the new rows.
+   - **Past the eighth row.** A card longer than 8 tasks ends with "+N more":
+     a click opens it to every row ("Show less" closes it; it stays open
+     across rebuilds), and a crew card dragged onto "+N more" opens it after
+     350 ms, so any row takes the drop. Hovering a crew member lights their
+     rows, and a closed card's "+N more" when a hidden row is theirs. A wire
+     to a hidden row ends at the card's edge until the row shows.
+   - **An `id` renamed from the editor.** The selected step's id is a field
+     beside its node's name; Enter renames it and every input that reads it
+     (`func::edit::rename_step`), changing only those names on each line
+     (spacing, `@x,y`, quoted text and comments stay). A name that isn't
+     one, or is taken by another step, an `in`, an `out` or a param, is
+     refused with a sentence.
+   - **The inputs node's place saved.** It drags like a step, and its place
+     goes at the end of the `fn` line (`fn Wait For Done  @-240,60`,
+     Syntax.md section 8); renaming the function keeps it.
+   - **Status formats on the Settings page.** A row per status (character,
+     symbol, label; up, down, remove; "+ Add status", which starts from the
+     built-in two), saved with the crew folder in one write as a `statuses:`
+     list in `_settings.md` (`status::set_statuses`, replacing a block or
+     flow list where it was; an empty list removes it). Refused with a
+     sentence: two statuses with one character, a missing or spaced symbol.
+   - **Unknown `@names` amber while editing.** The editor's highlighter marks
+     an `@name` the link states call missing; each save re-checks the note's
+     `@names` against the crew (`mention_states`), so a new one turns amber
+     about a second after it's typed.
+
+   Checked in scratch vaults (`--profile measure` with the mouse, and dev
+   hooks `rows`, `edid`, `edentry`, `stadd` / `stset` for screenshots): a
+   12-task card opens and closes; resting a dragged crew card on "+4 more"
+   opened it and the drop wrote `@ika` on task 11; renaming `t` to
+   `task_row` changed only Wait For Done's two lines; the inputs node
+   dragged by mouse saved `@130,781`; Settings saved three statuses and the
+   open note took them; idle stayed at 0.
 
 ## Risks
 

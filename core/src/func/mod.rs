@@ -180,6 +180,9 @@ pub struct Step {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Function {
     pub name: String,
+    /// The inputs node's place in the editor: `@x,y` at the end of the
+    /// `fn` line.
+    pub entry: Option<(f32, f32)>,
     pub inputs: Vec<Port>,
     pub outputs: Vec<Port>,
     pub params: Vec<Param>,
@@ -301,7 +304,11 @@ pub fn parse_lines(lines: &[&str], first: usize) -> Function {
         }
         if !named {
             match text.strip_prefix("fn ") {
-                Some(name) if !name.trim().is_empty() => f.name = name.trim().to_owned(),
+                Some(rest) if !rest.trim().is_empty() => {
+                    let (name, entry) = split_pos(rest);
+                    f.name = name.trim().to_owned();
+                    f.entry = entry;
+                }
                 _ => f.errors.push((line, "The first line must be `fn Name`".into())),
             }
             named = true;
@@ -535,6 +542,17 @@ pub fn parse_call(s: &str) -> Result<(String, Vec<Arg>), String> {
         }
     }
     Ok((name, args))
+}
+
+/// `text` without a trailing `@x,y`, and the point, when it ends with one
+/// (two numbers). Anything else after an `@` stays part of the text.
+pub fn split_pos(text: &str) -> (&str, Option<(f32, f32)>) {
+    let Some(at) = text.rfind('@') else { return (text, None) };
+    let Some((x, y)) = text[at + 1..].split_once(',') else { return (text, None) };
+    match (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => (text[..at].trim_end(), Some((x, y))),
+        _ => (text, None),
+    }
 }
 
 fn step(text: &str, line: usize) -> Result<Step, String> {

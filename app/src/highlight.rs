@@ -26,6 +26,19 @@ impl LinkStates {
         Self(Arc::new(map))
     }
 
+    /// These states with `updates` (keyed as `get` looks them up), or
+    /// `None` if nothing changes.
+    pub fn with(&self, updates: impl IntoIterator<Item = (String, LinkState)>) -> Option<Self> {
+        let mut map: Option<HashMap<String, LinkState>> = None;
+        for (key, state) in updates {
+            let key = links::dest_key(&key);
+            if self.0.get(&key) != Some(&state) {
+                map.get_or_insert_with(|| (*self.0).clone()).insert(key, state);
+            }
+        }
+        map.map(Self::new)
+    }
+
     /// The state of a link to `dest` (`target#sub`, maybe `|alias`).
     /// Unknown links (typed since the last check) count as fine.
     pub fn get(&self, dest: &str) -> LinkState {
@@ -72,6 +85,8 @@ pub enum Mark {
     Finished,
     Unknown,
     Link(LinkState),
+    /// An `@name` with no crew card (amber, as Live Preview draws it).
+    UnknownMention,
 }
 
 pub struct Markdown {
@@ -136,6 +151,9 @@ impl highlighter::Highlighter for Markdown {
                             None => Mark::Syntax(Kind::Link),
                         }
                     }
+                    // The same check as a drawn line: an `@name` the link
+                    // states mark missing has no crew card.
+                    Kind::Mention if self.statuses.links.get(&line[range.clone()]) == LinkState::Missing => Mark::UnknownMention,
                     kind => Mark::Syntax(kind),
                 };
                 (range, mark)
@@ -160,7 +178,7 @@ pub fn is_markup(kind: Kind) -> bool {
 pub fn live_format(mark: &Mark, theme: &Theme) -> Format<Font> {
     let markup = match mark {
         Mark::Open | Mark::Finished | Mark::Unknown => true,
-        Mark::Link(_) => false,
+        Mark::Link(_) | Mark::UnknownMention => false,
         Mark::Syntax(kind) => is_markup(*kind),
     };
     Format {
@@ -187,6 +205,7 @@ pub fn format(mark: &Mark, _: &Theme) -> Format<Font> {
         Mark::Finished => theme::SUCCESS,
         Mark::Unknown => theme::DANGER,
         Mark::Link(state) => link_color(*state),
+        Mark::UnknownMention => theme::WARNING,
         Mark::Syntax(kind) => match kind {
             Kind::Heading => theme::HEADING,
             Kind::ListMarker | Kind::Quote | Kind::Frontmatter => theme::MUTED,

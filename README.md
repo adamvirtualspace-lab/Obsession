@@ -54,7 +54,8 @@ drawn, and at most 64 MB of them are kept in memory.
 **Tasks:** click a task's status (in any view) to move it to the next status.
 In a note with the default `[ ]` / `[x]`, a click checks and unchecks it; with
 a status format of your own, the last status stays put (no un-finishing by
-accident). Right-click a task (in any view) to pick any status. Status
+accident). Right-click a task (in any view) to pick any status. Settings has
+a Status format section for the team's statuses (saved in `_settings.md`). Status
 formats come from `statuses:` in the note's frontmatter, then `_settings.md`
 at the vault root, then the default `[ ]` / `[x]`. See Syntax.md, sections 1–3.
 

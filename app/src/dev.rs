@@ -194,6 +194,7 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 }
                 // The ƒ button on wire `n`.
                 Some("fn") => Message::Graph(G::Function(n(1) as usize)),
+                Some("rows") => Message::Graph(G::Rows(n(1) as usize)),
                 // Runs: run the graph's out-of-date functions, show the
                 // Runs panel, undo the newest run.
                 Some("run") => Message::RunGraph,
@@ -213,6 +214,18 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 Some("settings") => Message::Settings(crate::SettingsMessage::Open),
                 Some("crew") => Message::Settings(crate::SettingsMessage::Crew(parts[1..].join(","))),
                 Some("save") => Message::Settings(crate::SettingsMessage::Save),
+                // Status rows: `stadd`, `stset,row,c|s|l,value`, `stup,row`, `strm,row`.
+                Some("stadd") => Message::Settings(crate::SettingsMessage::StatusAdd),
+                Some("stset") => {
+                    let field = match parts.get(2) {
+                        Some(&"c") => crate::StatusField::Char,
+                        Some(&"s") => crate::StatusField::Symbol,
+                        _ => crate::StatusField::Label,
+                    };
+                    Message::Settings(crate::SettingsMessage::Status(n(1) as usize, field, parts[3.min(parts.len())..].join(",")))
+                }
+                Some("stup") => Message::Settings(crate::SettingsMessage::StatusMove(n(1) as usize, true)),
+                Some("strm") => Message::Settings(crate::SettingsMessage::StatusRemove(n(1) as usize)),
                 Some("compact") => Message::Settings(crate::SettingsMessage::Compact(parts.get(1) != Some(&"off"))),
                 // Vault search: `search` opens it, `query,words` types, `pickhit`
                 // opens the selected line.
@@ -233,7 +246,7 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 }
                 // The function editor: `edadd,Op`, `edsel,step`,
                 // `edwire,step,input,source`, `edset,step,input,value`,
-                // `edparam,k,value`, `edhead,line`, `edback`.
+                // `edparam,k,value`, `edhead,line`, `edid,step,new`, `edentry,x,y`, `edback`.
                 Some(op) if op.starts_with("ed") => {
                     use crate::func_editor::{Message as E, Sel};
                     let text = |i: usize| parts[i.min(parts.len())..].join(",");
@@ -265,6 +278,13 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                             tasks.push(later(delay + 50, Message::Editor(E::HeaderDraft(text(1)))));
                             delay += 100;
                             E::HeaderSubmit
+                        }
+                        "edentry" => E::Moved(crate::func_editor::ENTRY, iced::Point::new(n(1), n(2))),
+                        "edid" => {
+                            tasks.push(later(delay, Message::Editor(E::Select(Some(Sel::Step(n(1) as usize))))));
+                            tasks.push(later(delay + 50, Message::Editor(E::IdDraft(text(2)))));
+                            delay += 100;
+                            E::IdSubmit
                         }
                         "edback" => E::Back,
                         _ => continue,

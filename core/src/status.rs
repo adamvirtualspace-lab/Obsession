@@ -205,6 +205,63 @@ pub fn from_frontmatter<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Op
     Some(lookup)
 }
 
+/// `[c] symbol label`, as a `statuses:` entry is written.
+pub fn entry_text(status: &Status) -> String {
+    let mut out = format!("[{}] {}", status.ch, status.symbol);
+    if !status.label.is_empty() {
+        out.push(' ');
+        out.push_str(&status.label);
+    }
+    out
+}
+
+/// `text` with its frontmatter's `statuses:` set to these, as a block list
+/// (`  - "[x] ✅ done"`), replacing the one there (block or flow list) where
+/// it was. An empty list removes the key, so the next format applies.
+/// Frontmatter is added when there's none. Other keys and lines stay.
+pub fn set_statuses(text: &str, statuses: &[Status]) -> String {
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned()).collect();
+    let mut block: Vec<String> = Vec::new();
+    if !statuses.is_empty() {
+        block.push("statuses:".to_owned());
+        for status in statuses {
+            let entry = entry_text(status).replace('\\', "\\\\").replace('"', "\\\"");
+            block.push(format!("  - \"{entry}\""));
+        }
+    }
+    let has = lines.first().is_some_and(|l| l.trim_start_matches('\u{feff}').trim_end() == "---");
+    let close = if has { (1..lines.len()).find(|&i| matches!(lines[i].trim_end(), "---" | "...")) } else { None };
+    let Some(close) = close else {
+        if block.is_empty() {
+            return text.to_owned();
+        }
+        let mut out = vec!["---".to_owned()];
+        out.extend(block);
+        out.push("---".to_owned());
+        if !(lines.len() == 1 && lines[0].is_empty()) {
+            out.append(&mut lines);
+        } else {
+            out.push(String::new());
+        }
+        return out.join(ending);
+    };
+    // The key's line, then its list items (indented, or `- ` lines).
+    let start = (1..close).find(|&i| !lines[i].starts_with([' ', '\t']) && lines[i].split_once(':').is_some_and(|(k, _)| k.trim() == "statuses"));
+    let (at, end) = match start {
+        Some(i) => {
+            let mut end = i + 1;
+            while end < close && (lines[end].starts_with([' ', '\t']) || lines[end].trim_start().starts_with("- ") || lines[end].trim() == "-") {
+                end += 1;
+            }
+            (i, end)
+        }
+        None => (close, close),
+    };
+    lines.splice(at..end, block);
+    lines.join(ending)
+}
+
 /// Picks the format for a note: its own, then the team's, then the default.
 pub fn resolve(note: Option<&Lookup>, settings: Option<&Format>) -> (Format, Source) {
     if let Some(format) = note.and_then(|l| l.format.as_ref()) {
@@ -379,6 +436,39 @@ mod tests {
         assert_eq!(task_box("- [x]text"), None);
         assert_eq!(task_box("- [](x)"), None);
         assert_eq!(task_box("- [link](x)"), None);
+    }
+
+    #[test]
+    fn writes_statuses_that_read_back() {
+        let wanted = vec![
+            Status { ch: '-', symbol: "⚪".into(), label: "cannot start".into() },
+            Status { ch: ' ', symbol: "🔳".into(), label: "ready".into() },
+            Status { ch: '"', symbol: "💬".into(), label: "say \"hi\"".into() },
+            Status { ch: 'x', symbol: "✅".into(), label: String::new().into() },
+        ];
+        let read = |text: &str| from_frontmatter(text.lines()).and_then(|l| l.format).map(|f| f.statuses().to_vec());
+
+        // Into a note with no frontmatter.
+        let fresh = set_statuses("Notes\n", &wanted);
+        assert!(fresh.starts_with("---\nstatuses:\n  - \"[-] ⚪ cannot start\"\n"), "{fresh}");
+        assert!(fresh.ends_with("---\nNotes\n"), "{fresh}");
+        assert_eq!(read(&fresh).as_deref(), Some(&wanted[..]));
+
+        // Over a flow list, keeping the other keys where they were.
+        let crlf = "---\r\ncrew: people\r\nstatuses: [\"[ ] todo\", \"[x] ✅ done\"]\r\ntitle: x\r\n---\r\nbody\r\n";
+        let replaced = set_statuses(crlf, &wanted[..2]);
+        assert_eq!(
+            replaced,
+            "---\r\ncrew: people\r\nstatuses:\r\n  - \"[-] ⚪ cannot start\"\r\n  - \"[ ] 🔳 ready\"\r\ntitle: x\r\n---\r\nbody\r\n"
+        );
+        // Over a block list.
+        let again = set_statuses(&replaced, &wanted[3..]);
+        assert_eq!(again, "---\r\ncrew: people\r\nstatuses:\r\n  - \"[x] ✅\"\r\ntitle: x\r\n---\r\nbody\r\n");
+        // Emptied: the key goes, and the built-in format applies.
+        let none = set_statuses(&again, &[]);
+        assert_eq!(none, "---\r\ncrew: people\r\ntitle: x\r\n---\r\nbody\r\n");
+        assert_eq!(read(&none), None);
+        assert_eq!(set_statuses("plain\n", &[]), "plain\n");
     }
 
     #[test]

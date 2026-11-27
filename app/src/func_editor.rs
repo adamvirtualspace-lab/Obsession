@@ -82,6 +82,10 @@ pub enum Message {
     /// The title being typed in, and Enter on it: rename the function.
     NameDraft(String),
     NameSubmit,
+    /// The selected step's id being typed in, and Enter on it: rename it
+    /// (and every input that reads it).
+    IdDraft(String),
+    IdSubmit,
     RemoveLine(usize),
     PaletteQuery(String),
     AddNode(&'static str),
@@ -110,6 +114,10 @@ pub enum Outcome {
     Status(String),
 }
 
+/// The inputs node, as the step index of a drag (`Interaction::Dragging`,
+/// `Message::Moved`).
+pub const ENTRY: usize = usize::MAX;
+
 pub struct Editor {
     pub name: String,
     pub origin: Origin,
@@ -128,6 +136,8 @@ pub struct Editor {
     header_draft: String,
     /// The editable title.
     name_draft: String,
+    /// The selected step's editable id.
+    id_draft: String,
     palette: Option<Palette>,
     /// Bumped when a different function opens, so the view fits it.
     pub fit: u64,
@@ -165,6 +175,7 @@ impl Editor {
     pub fn new(name: String, origin: Origin, context: Context) -> Self {
         Self {
             name_draft: name.clone(),
+            id_draft: String::new(),
             name,
             origin,
             context,
@@ -240,6 +251,10 @@ impl Editor {
     fn reset_drafts(&mut self) {
         let Some(block) = &self.block else { return };
         let f = &block.function;
+        self.id_draft = match self.selected {
+            Some(Sel::Step(i)) => f.steps.get(i).and_then(|s| s.id.clone()).unwrap_or_default(),
+            _ => String::new(),
+        };
         self.drafts = match self.selected {
             Some(Sel::Step(i)) => {
                 let bound = self.checked.bound.get(i).cloned().unwrap_or_default();
@@ -288,10 +303,10 @@ impl Editor {
             .collect();
         let min_x = self.step_pos.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         let min_y = self.step_pos.iter().map(|p| p.y).fold(f32::MAX, f32::min);
-        self.entry_pos = if n == 0 {
-            Point::new(-NODE_W - 60.0, 40.0)
-        } else {
-            Point::new(min_x - NODE_W - 80.0, min_y)
+        self.entry_pos = match f.entry {
+            Some((x, y)) => Point::new(x, y),
+            None if n == 0 => Point::new(-NODE_W - 60.0, 40.0),
+            None => Point::new(min_x - NODE_W - 80.0, min_y),
         };
     }
 
@@ -339,8 +354,12 @@ impl Editor {
         Rectangle::new(pos, self.step_size(i))
     }
 
-    fn entry_rect(&self) -> Rectangle {
-        Rectangle::new(self.entry_pos, self.entry_size())
+    fn entry_rect(&self, state: &State) -> Rectangle {
+        let pos = match state.interaction {
+            Interaction::Dragging { step: ENTRY, at, .. } => at,
+            _ => self.entry_pos,
+        };
+        Rectangle::new(pos, self.entry_size())
     }
 
     fn in_pin(&self, i: usize, k: usize, state: &State) -> Point {
@@ -353,8 +372,8 @@ impl Editor {
         Point::new(r.x + r.width, r.y + HEAD / 2.0)
     }
 
-    fn entry_pin(&self, row: usize) -> Point {
-        let r = self.entry_rect();
+    fn entry_pin(&self, row: usize, state: &State) -> Point {
+        let r = self.entry_rect(state);
         Point::new(r.x + r.width, r.y + HEAD + row as f32 * ROW + ROW / 2.0)
     }
 
@@ -364,7 +383,7 @@ impl Editor {
             Source::Step(j) => Some(self.out_pin(j, state)),
             _ => {
                 let row = self.entry_rows().iter().position(|(n, _, _)| n == name)?;
-                Some(self.entry_pin(row))
+                Some(self.entry_pin(row, state))
             }
         }
     }
@@ -435,11 +454,11 @@ impl Editor {
             }
         }
         for (row, (name, _, _)) in self.entry_rows().iter().enumerate() {
-            if near(self.entry_pin(row)) {
-                return Some(Hit::Out(name.clone(), self.entry_pin(row)));
+            if near(self.entry_pin(row, state)) {
+                return Some(Hit::Out(name.clone(), self.entry_pin(row, state)));
             }
         }
-        if self.entry_rect().contains(g) {
+        if self.entry_rect(state).contains(g) {
             return Some(Hit::Entry);
         }
         None
@@ -465,6 +484,10 @@ impl Editor {
 
     /// Handles a message; returns what the app should do.
     pub fn update(&mut self, message: Message) -> Outcome {
+        if let Message::IdDraft(value) = message {
+            self.id_draft = value;
+            return Outcome::None;
+        }
         if let Message::NameDraft(value) = message {
             self.name_draft = value;
             return Outcome::None;
@@ -477,6 +500,12 @@ impl Editor {
         };
         let f = &block.function;
         match message {
+            Message::Moved(ENTRY, at) => {
+                self.entry_pos = at;
+                self.version += 1;
+                let block = block.clone();
+                Outcome::Edit(Box::new(move |text| obsession_core::func::edit::set_entry_pos(text, &block, at.x, at.y)))
+            }
             Message::Moved(i, at) => {
                 let Some(step) = f.steps.get(i).cloned() else {
                     return Outcome::None;
@@ -626,7 +655,24 @@ impl Editor {
                 self.header_draft.clear();
                 Outcome::Edit(Box::new(move |text| obsession_core::func::edit::add_header(text, &block, &line)))
             }
-            Message::NameDraft(_) => Outcome::None,
+            Message::NameDraft(_) | Message::IdDraft(_) => Outcome::None,
+            Message::IdSubmit => {
+                let Some(Sel::Step(i)) = self.selected else {
+                    return Outcome::None;
+                };
+                let new = self.id_draft.trim().to_owned();
+                if let Err(why) = obsession_core::func::edit::check_step_rename(f, i, &new) {
+                    self.id_draft = f.steps.get(i).and_then(|s| s.id.clone()).unwrap_or_default();
+                    return Outcome::Status(format!("⚠ {why}"));
+                }
+                if f.steps[i].id.as_deref() == Some(new.as_str()) {
+                    return Outcome::None;
+                }
+                let f = f.clone();
+                Outcome::Edit(Box::new(move |text| {
+                    obsession_core::func::edit::rename_step(text, &f, i, &new).unwrap_or_else(|_| text.to_owned())
+                }))
+            }
             Message::NameSubmit => {
                 let new = self.name_draft.trim().to_owned();
                 if new.is_empty() {
@@ -831,13 +877,27 @@ impl Editor {
                 let Some(spec) = library::find(&step.op) else {
                     return col.push(text(format!("⚠ There's no node called {}", step.op)).size(theme::SMALL).color(theme::WARNING)).into();
                 };
-                let title = match &step.id {
-                    Some(id) => format!("{id} = {}", spec.name),
-                    None => spec.name.to_owned(),
+                // The id is editable: Enter renames it everywhere it's read.
+                let title: Element<'_, Message> = match &step.id {
+                    Some(_) => row![
+                        text_input("id", &self.id_draft)
+                            .on_input(Message::IdDraft)
+                            .on_submit(Message::IdSubmit)
+                            .padding([3, 6])
+                            .size(theme::TEXT_SIZE)
+                            .width(Length::Fixed(110.0))
+                            .style(theme::search),
+                        text(format!("= {}", spec.name)).size(theme::TEXT_SIZE).color(theme::HEADING),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Center)
+                    .into(),
+                    None => text(spec.name).size(theme::TEXT_SIZE).color(theme::HEADING).into(),
                 };
-                col = col
-                    .push(text(title).size(theme::TEXT_SIZE).color(theme::HEADING))
-                    .push(text(spec.help).size(theme::SMALL).color(theme::MUTED));
+                col = col.push(title).push(text(spec.help).size(theme::SMALL).color(theme::MUTED));
+                if step.id.as_deref().is_some_and(|id| id != self.id_draft.trim()) {
+                    col = col.push(small("Enter renames it, and every input that reads it".into()));
+                }
                 for (k, input) in spec.inputs.iter().enumerate() {
                     let placeholder = match input.default {
                         Def::Required => "required: a name, \"text\", a number…".to_owned(),
@@ -1025,7 +1085,15 @@ impl canvas::Program<Message> for Editor {
                         };
                         Some(canvas::Action::publish(Message::Select(Some(Sel::Step(i)))).and_capture())
                     }
-                    Some(Hit::Entry) => Some(canvas::Action::publish(Message::Select(Some(Sel::Entry))).and_capture()),
+                    Some(Hit::Entry) => {
+                        state.interaction = Interaction::Dragging {
+                            step: ENTRY,
+                            grab: view.graph(p) - self.entry_pos,
+                            at: self.entry_pos,
+                            moved: false,
+                        };
+                        Some(canvas::Action::publish(Message::Select(Some(Sel::Entry))).and_capture())
+                    }
                     None => {
                         let now = Instant::now();
                         let double = state.last_click.is_some_and(|t| now.duration_since(t).as_millis() < 450);
@@ -1157,9 +1225,15 @@ impl canvas::Program<Message> for Editor {
         };
         let f = &block.function;
         let touches = |i: usize| -> bool {
+            if lifted == Some(ENTRY) {
+                // Steps that read an `in` or a param: their wires move.
+                return self.checked.bound.get(i).is_some_and(|b| {
+                    b.iter().flatten().any(|v| matches!(v, Value::Ref(r) if !matches!(self.checked.source(r), Some(Source::Step(_)))))
+                });
+            }
             Some(i) == lifted
                 || lifted.is_some_and(|l| {
-                    f.steps[l].id.as_deref().is_some_and(|id| {
+                    f.steps.get(l).and_then(|s| s.id.as_deref()).is_some_and(|id| {
                         self.checked
                             .bound
                             .get(i)
@@ -1171,7 +1245,9 @@ impl canvas::Program<Message> for Editor {
         let mut fresh = None;
         let still = self.cache.draw(renderer, bounds.size(), |frame| {
             draw_grid(frame, view);
-            self.draw_entry(frame, view);
+            if lifted != Some(ENTRY) {
+                self.draw_entry(frame, view, state);
+            }
             let mut shapes = Shapes::new();
             for i in 0..f.steps.len() {
                 if !touches(i) {
@@ -1203,8 +1279,10 @@ impl canvas::Program<Message> for Editor {
                 self.draw_wires_into(&mut over, view, state, i);
             }
         }
-        if let Some(i) = lifted {
-            self.draw_step(&mut frame, view, state, i);
+        match lifted {
+            Some(ENTRY) => self.draw_entry(&mut frame, view, state),
+            Some(i) => self.draw_step(&mut frame, view, state, i),
+            None => {}
         }
         if let Some(Sel::Step(i)) = self.selected
             && i < f.steps.len()
@@ -1216,7 +1294,7 @@ impl canvas::Program<Message> for Editor {
             );
         }
         if self.selected == Some(Sel::Entry) {
-            let r = self.entry_rect();
+            let r = self.entry_rect(state);
             frame.stroke(
                 &Path::rounded_rectangle(view.screen(r.position()), r.size() * zoom, (7.0 * zoom).into()),
                 Stroke::default().with_color(theme::ACCENT).with_width(1.5),
@@ -1343,9 +1421,9 @@ fn say(frame: &mut Frame, content: String, at: Point, size: f32, color: Color, f
 }
 
 impl Editor {
-    fn draw_entry(&self, frame: &mut Frame, view: View) {
+    fn draw_entry(&self, frame: &mut Frame, view: View, state: &State) {
         let z = view.zoom;
-        let r = self.entry_rect();
+        let r = self.entry_rect(state);
         let p = view.screen(r.position());
         let body = Path::rounded_rectangle(p, r.size() * z, (7.0 * z).into());
         frame.fill(&body, theme::RAISED);
@@ -1356,7 +1434,7 @@ impl Editor {
         };
         say(frame, "Inputs".into(), Point::new(p.x + 10.0 * z, p.y + 7.0 * z), 13.0 * z, theme::MENTION, semibold, false);
         for (row, (_, label, ty)) in self.entry_rows().iter().enumerate() {
-            let pin = view.screen(self.entry_pin(row));
+            let pin = view.screen(self.entry_pin(row, state));
             frame.fill(&Path::circle(pin, 4.5 * z), ty.map_or(theme::MUTED, type_color));
             say(frame, fit(label, NODE_W - 30.0, 12.0), Point::new(p.x + 10.0 * z, pin.y - 7.5 * z), 12.0 * z, theme::TEXT, theme::UI_FONT, false);
         }

@@ -451,6 +451,10 @@ impl Note {
     // ---- Links ----
 
     /// Sets how the note's links stand (re-colours them if that changed).
+    pub fn link_states(&self) -> &LinkStates {
+        &self.statuses.links
+    }
+
     pub fn set_link_states(&mut self, states: LinkStates) {
         if self.statuses.links == states {
             return;

@@ -10,7 +10,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iced::keyboard;
 use iced::mouse;
@@ -31,11 +31,19 @@ use obsession_core::vault::{Resolved, Vault};
 use crate::smooth::{self, Shapes};
 use crate::theme;
 
-pub const CARD_WIDTH: f32 = 260.0;
-const HEADER: f32 = 52.0;
-const ROW: f32 = 22.0;
-const FOOTER: f32 = 30.0;
+/// Card geometry, as in the Possess mockup: 264 wide, a 54 px header, 30 px
+/// task rows and a 28 px footer.
+pub const CARD_WIDTH: f32 = 264.0;
+const HEADER: f32 = 54.0;
+const ROW: f32 = 30.0;
+const FOOTER: f32 = 28.0;
+/// A task's status sits in a box this size at the start of its row.
+const CHIP: f32 = 22.0;
+/// Task rows a closed card shows; a longer one ends with "+N more", which
+/// opens it to every row ("Show less" closes it again).
 const MAX_ROWS: usize = 8;
+/// How long a dragged crew card rests on "+N more" before the card opens.
+const REST_MS: u64 = 350;
 const FUNCTION_WIDTH: f32 = 220.0;
 const PIN_ROW: f32 = 22.0;
 /// Below this zoom, cards are drawn as blocks with just a title.
@@ -162,6 +170,8 @@ pub enum Message {
     OpenCrew(usize),
     /// The view was panned or zoomed: where it is now, to remember.
     Viewed(SavedView),
+    /// "+N more" or "Show less" on a card: open it to every row, or close it.
+    Rows(usize),
 }
 
 /// One crew card in the hand.
@@ -240,6 +250,11 @@ pub struct Card {
     pub line: Option<usize>,
     /// A function node that would change something if it ran now.
     pub stale: Option<String>,
+    /// Opened to every task row ("+N more" clicked).
+    pub open: bool,
+    /// Wires drawn into and out of it (the footer's "in N · out M").
+    pub wires_in: usize,
+    pub wires_out: usize,
     accent: Color,
 }
 
@@ -251,15 +266,27 @@ impl Card {
         Point::new(x, pos.y + HEADER + k as f32 * PIN_ROW + PIN_ROW / 2.0)
     }
 
+    /// Task rows drawn: all of them when open, else the first `MAX_ROWS`.
+    pub fn shown(&self) -> usize {
+        if self.open { self.tasks.len() } else { self.tasks.len().min(MAX_ROWS) }
+    }
+
+    /// Whether it has the "+N more" / "Show less" row.
+    fn has_more(&self) -> bool {
+        self.tasks.len() > MAX_ROWS
+    }
+
     pub fn size(&self) -> Size {
         match self.kind {
             CardKind::Function => {
                 let rows = self.pins_in.len().max(self.pins_out.len());
                 Size::new(FUNCTION_WIDTH, HEADER + rows as f32 * PIN_ROW + 10.0)
             }
-            CardKind::Missing => Size::new(CARD_WIDTH, HEADER + FOOTER),
+            // Just the header (its line says how to create the note).
+            CardKind::Missing => Size::new(CARD_WIDTH, HEADER),
             _ => {
-                let rows = self.tasks.len().min(MAX_ROWS) + usize::from(self.tasks.len() > MAX_ROWS);
+                // "No tasks" takes a row of its own.
+                let rows = self.shown().max(1) + usize::from(self.has_more());
                 Size::new(CARD_WIDTH, HEADER + rows as f32 * ROW + FOOTER)
             }
         }
@@ -283,6 +310,10 @@ pub struct WireView {
     /// `[[a#Notes]]` end (only rows the card shows).
     pub from_row: Option<usize>,
     pub to_row: Option<usize>,
+    /// The task rows the ends point at, shown or not; `from_row` / `to_row`
+    /// are these while the card shows them (`place_rows`).
+    from_task: Option<usize>,
+    to_task: Option<usize>,
     pub state: WireState,
     /// When it turned solid (for the dashed-to-solid animation).
     pub solid_since: Option<Instant>,
@@ -381,6 +412,9 @@ pub struct State {
     size: Size,
     /// The crew card rising, and since when.
     rise: Option<(usize, Instant)>,
+    /// While a crew card is dragged: the closed card whose "+N more" it
+    /// rests on, and since when (`REST_MS` later the card opens).
+    resting: Option<(usize, Instant)>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -420,6 +454,8 @@ enum Hover {
     Button(usize),
     /// A crew card in the hand.
     Hand(usize),
+    /// A card's "+N more" / "Show less" row.
+    More(usize),
 }
 
 impl Graph {
@@ -491,6 +527,8 @@ impl Graph {
                 to_pin,
                 from_row,
                 to_row,
+                from_task: from_row,
+                to_task: to_row,
                 state,
                 solid_since: None,
                 stale: None,
@@ -564,6 +602,8 @@ impl Graph {
                         to_pin: None,
                         from_row,
                         to_row: None,
+                        from_task: from_row,
+                        to_task: None,
                         state: WireState::Plain,
                         solid_since: None,
                         stale: None,
@@ -601,8 +641,19 @@ impl Graph {
             }
         }
         auto_place(&mut cards, &placed, &wires);
+        // The footer's wire counts (link wires only when they're shown).
+        for w in wires.iter().filter(|w| show_links || !w.link) {
+            cards[w.from].wires_out += 1;
+            cards[w.to].wires_in += 1;
+        }
+        // Cards opened to every row stay open.
+        if let Some(previous) = previous {
+            for card in &mut cards {
+                card.open = previous.cards.iter().any(|p| p.open && p.key == card.key);
+            }
+        }
 
-        Self {
+        let mut built = Self {
             cards,
             wires,
             show_links,
@@ -619,6 +670,26 @@ impl Graph {
             card_faces: HashMap::new(),
             drawn: Cell::new(None),
             version: 0,
+        };
+        built.place_rows();
+        built
+    }
+
+    /// Opens a card to every task row, or closes it to the first `MAX_ROWS`.
+    pub fn toggle_rows(&mut self, card: usize) {
+        let Some(c) = self.cards.get_mut(card) else { return };
+        c.open = !c.open;
+        self.place_rows();
+        self.touch();
+    }
+
+    /// Wires end at a task row only while the card shows it; otherwise at
+    /// the card's edge.
+    fn place_rows(&mut self) {
+        let shown: Vec<usize> = self.cards.iter().map(Card::shown).collect();
+        for w in &mut self.wires {
+            w.from_row = w.from_task.filter(|&r| r < shown[w.from]);
+            w.to_row = w.to_task.filter(|&r| r < shown[w.to]);
         }
     }
 
@@ -738,8 +809,22 @@ impl Graph {
         let y = g.y - card.pos.y - HEADER;
         let row = (view.zoom >= DETAIL_ZOOM && y >= 0.0)
             .then(|| (y / ROW) as usize)
-            .filter(|&r| r < card.tasks.len().min(MAX_ROWS));
+            .filter(|&r| r < card.shown());
         Some((i, row))
+    }
+
+    /// The card whose "+N more" / "Show less" row is under `p`, if any.
+    fn more_at(&self, state: &State, view: View, p: Point) -> Option<usize> {
+        if view.zoom < DETAIL_ZOOM {
+            return None;
+        }
+        let g = view.graph(p);
+        (0..self.cards.len()).rev().find(|&i| {
+            let card = &self.cards[i];
+            let r = self.card_rect(i, state);
+            let top = r.y + HEADER + card.shown() as f32 * ROW;
+            card.kind != CardKind::Function && card.has_more() && r.contains(g) && g.y >= top && g.y < top + ROW
+        })
     }
 
     /// Whether a card mentions crew member `m` on any task.
@@ -897,6 +982,9 @@ impl Graph {
                 return Some(Hover::Handle(i));
             }
             if r.contains(g) {
+                if self.more_at(state, view, p) == Some(i) {
+                    return Some(Hover::More(i));
+                }
                 return Some(Hover::Card(i));
             }
         }
@@ -986,6 +1074,7 @@ impl canvas::Program<Message> for Graph {
                         return Some(canvas::Action::publish(Message::OpenCrew(m)).and_capture());
                     }
                     state.interaction = Interaction::Dealing { member: m, at: p };
+                    state.resting = None;
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
                 match hit {
@@ -1027,6 +1116,9 @@ impl canvas::Program<Message> for Graph {
                         };
                     }
                     Some(Hover::Wire(i)) => state.selected = Some(Selected::Wire(i)),
+                    Some(Hover::More(i)) => {
+                        return Some(canvas::Action::publish(Message::Rows(i)).and_capture());
+                    }
                     // Handled above.
                     Some(Hover::Hand(_)) => {}
                     None => {
@@ -1058,7 +1150,18 @@ impl canvas::Program<Message> for Graph {
                     }
                     Interaction::Dealing { at, .. } => {
                         *at = p;
-                        Some(canvas::Action::request_redraw())
+                        let closed = self.more_at(state, view, p).filter(|&i| !self.cards[i].open);
+                        match (closed, state.resting) {
+                            (Some(i), Some((r, _))) if r == i => Some(canvas::Action::request_redraw()),
+                            (Some(i), _) => {
+                                state.resting = Some((i, Instant::now()));
+                                Some(canvas::Action::request_redraw_at(Instant::now() + Duration::from_millis(REST_MS)))
+                            }
+                            (None, _) => {
+                                state.resting = None;
+                                Some(canvas::Action::request_redraw())
+                            }
+                        }
                     }
                     Interaction::Idle => {
                         let hover = point.and_then(|p| self.hit(state, view, p));
@@ -1103,7 +1206,7 @@ impl canvas::Program<Message> for Graph {
                     Interaction::Wiring { from, pin, .. } => {
                         let target = point.and_then(|p| match self.hit(state, view, p) {
                             Some(Hover::Pin(i, false, k)) if i != from => Some(PinRef { card: i, pin: Some(k) }),
-                            Some(Hover::Card(i) | Hover::Handle(i) | Hover::Pin(i, true, _)) if i != from => Some(PinRef {
+                            Some(Hover::Card(i) | Hover::More(i) | Hover::Handle(i) | Hover::Pin(i, true, _)) if i != from => Some(PinRef {
                                 card: i,
                                 pin: self.nearest_input(i, state, view.graph(p)),
                             }),
@@ -1152,6 +1255,13 @@ impl canvas::Program<Message> for Graph {
                 #[cfg(debug_assertions)]
                 if let Some(action) = pan_bench::step(state) {
                     return Some(action);
+                }
+                // A dragged crew card has rested on "+N more": open the card.
+                if let (Interaction::Dealing { .. }, Some((card, since))) = (state.interaction, state.resting)
+                    && since.elapsed() >= Duration::from_millis(REST_MS)
+                {
+                    state.resting = None;
+                    return Some(canvas::Action::publish(Message::Rows(card)));
                 }
                 // Marching ants on the hovered or selected wire only.
                 let rising = state.rise.is_some_and(|(_, at)| at.elapsed().as_secs_f32() * 1000.0 < RISE_MS);
@@ -1267,7 +1377,7 @@ impl canvas::Program<Message> for Graph {
         if let Some(Selected::Card(i)) = state.selected {
             outline(&mut frame, i, theme::ACCENT);
         }
-        if let Some(Hover::Card(i) | Hover::Handle(i)) = state.hover
+        if let Some(Hover::Card(i) | Hover::More(i) | Hover::Handle(i)) = state.hover
             && self.cards[i].kind != CardKind::Function
         {
             let lit = state.hover == Some(Hover::Handle(i));
@@ -1326,7 +1436,7 @@ impl canvas::Program<Message> for Graph {
         match state.hover {
             Some(Hover::Card(_) | Hover::Hand(_)) => mouse::Interaction::Grab,
             Some(Hover::Handle(_) | Hover::Pin(..)) => mouse::Interaction::Crosshair,
-            Some(Hover::Wire(_) | Hover::Button(_)) => mouse::Interaction::Pointer,
+            Some(Hover::Wire(_) | Hover::Button(_) | Hover::More(_)) => mouse::Interaction::Pointer,
             None => mouse::Interaction::None,
         }
     }
@@ -1365,13 +1475,17 @@ impl Graph {
                     Stroke::default().with_color(color).with_width(2.5),
                 );
                 if zoom >= DETAIL_ZOOM {
-                    for (k, t) in card.tasks.iter().take(MAX_ROWS).enumerate() {
-                        if t.people.contains(key) {
-                            let y = r.y + HEADER + k as f32 * ROW - 3.0;
+                    let shown = card.shown();
+                    // A closed card lights "+N more" when a hidden row is theirs.
+                    let hidden = card.tasks[shown..].iter().any(|t| t.people.contains(key));
+                    let rows = card.tasks.iter().take(shown).map(|t| t.people.contains(key)).chain(std::iter::once(hidden));
+                    for (k, theirs) in rows.enumerate() {
+                        if theirs {
+                            let y = r.y + HEADER + k as f32 * ROW + 2.0;
                             frame.fill(
                                 &Path::rounded_rectangle(
                                     view.screen(Point::new(r.x + 6.0, y)),
-                                    Size::new((r.width - 12.0) * zoom, ROW * zoom),
+                                    Size::new((r.width - 12.0) * zoom, (ROW - 4.0) * zoom),
                                     (4.0 * zoom).into(),
                                 ),
                                 Color { a: 0.18, ..color },
@@ -1389,7 +1503,7 @@ impl Graph {
             let color = self.hand[member].color;
             let r = self.card_rect(card, state);
             let (pos, sz) = match row {
-                Some(k) => (Point::new(r.x + 4.0, r.y + HEADER + k as f32 * ROW - 4.0), Size::new(r.width - 8.0, ROW + 2.0)),
+                Some(k) => (Point::new(r.x + 4.0, r.y + HEADER + k as f32 * ROW + 1.0), Size::new(r.width - 8.0, ROW - 2.0)),
                 None => (r.position(), r.size()),
             };
             frame.stroke(
@@ -1673,18 +1787,18 @@ fn restore(state: &mut State, v: SavedView, size: Size) {
 
 /// The middle of task row `r` on a card at `card` (graph coordinates).
 fn row_y(card: Rectangle, r: usize) -> f32 {
-    card.y + HEADER + r as f32 * ROW + 8.5
+    card.y + HEADER + r as f32 * ROW + ROW / 2.0
 }
 
-/// The row of `card` that a `#^block` or `#heading` link points at, if the
-/// card shows it.
+/// The row of `card` that a `#^block` or `#heading` link points at (shown
+/// or not: `Graph::place_rows` decides).
 fn row_in(store: &mut Store, card: &Card, sub: &str) -> Option<usize> {
     if card.kind == CardKind::Function || card.kind == CardKind::Missing {
         return None;
     }
     let text = store.get(card.rel.as_deref()?).ok()?;
     let lines: Vec<usize> = card.tasks.iter().map(|t| t.line).collect();
-    links::task_at(text, sub, &lines).filter(|&r| r < MAX_ROWS)
+    links::task_at(text, sub, &lines)
 }
 
 /// Out of the right side of a card (mid-header), where its handle is.
@@ -1814,6 +1928,9 @@ fn card(
         problem: None,
         line: Some(node.line),
         stale: None,
+        open: false,
+        wires_in: 0,
+        wires_out: 0,
         accent: accent(folder),
     };
     let target = match &node.kind {
@@ -1860,7 +1977,7 @@ fn card(
         card.done += usize::from(done);
         card.tasks.push(TaskRow {
             symbol: format.get(ch).map_or_else(|| "⚠".to_owned(), |s| s.symbol.to_string()),
-            text: after.to_owned(),
+            text: without_mentions(after),
             done,
             unknown: format.index_of(ch).is_none(),
             people: crew::mentions(raw).into_iter().map(|(_, n)| n).collect(),
@@ -1868,6 +1985,19 @@ fn card(
         });
     }
     card
+}
+
+/// A task's text without its `@names` (the card shows them apart, at the
+/// right of the row).
+fn without_mentions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, _) in crew::mentions(text) {
+        out.push_str(&text[at..range.start]);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A colour per top-level folder, so departments stand apart.
@@ -2219,7 +2349,7 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
     if !rect.intersects(&screen) {
         return;
     }
-    let radius = 8.0 * z;
+    let radius = 10.0 * z;
     let body = Path::rounded_rectangle(p, rect.size(), radius.into());
     let semibold = Font {
         weight: iced::font::Weight::Semibold,
@@ -2269,11 +2399,15 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
         return;
     }
 
-    frame.fill(&body, theme::RAISED);
-    let border = match card.kind {
-        CardKind::Ambiguous => theme::WARNING,
-        _ => theme::LINE,
-    };
+    // A soft shadow under the card, then the card.
+    let faded = |c: Color| if card.kind == CardKind::Missing { Color { a: c.a * 0.7, ..c } } else { c };
+    for (dy, a) in [(6.0, 0.18), (3.0, 0.22)] {
+        frame.fill(
+            &Path::rounded_rectangle(Point::new(p.x, p.y + dy * z), rect.size(), radius.into()),
+            Color { a, ..Color::BLACK },
+        );
+    }
+    frame.fill(&body, faded(theme::RAISED));
     if card.kind == CardKind::Missing {
         let segments = [5.0 * z, 4.0 * z];
         frame.stroke(
@@ -2284,33 +2418,42 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
             },
         );
     } else {
+        let border = if card.kind == CardKind::Ambiguous { theme::WARNING } else { theme::LINE };
         frame.stroke(&body, Stroke::default().with_color(border).with_width(1.0));
-        // The folder's colour along the top.
-        frame.fill(
-            &Path::rounded_rectangle(p, Size::new(rect.width, 4.0 * z), radius.into()),
-            card.accent,
-        );
     }
 
     let pad = 12.0 * z;
-    let inner = size.width - 24.0;
+    let semibold_size = 14.0;
+    // The department's colour, as a strip at the start of the header.
+    frame.fill(
+        &Path::rounded_rectangle(
+            Point::new(p.x + pad, p.y + (HEADER - 28.0) / 2.0 * z),
+            Size::new(5.0 * z, 28.0 * z),
+            (3.0 * z).into(),
+        ),
+        faded(card.accent),
+    );
+    let text_x = p.x + pad + 15.0 * z;
+    let unknown = card.tasks.iter().filter(|t| t.unknown).count();
+    // At the right of the header: a crew card's face, or ⚠ for unknown
+    // statuses.
+    let mut names_width = size.width - 12.0 - 15.0 - 12.0;
+    if let Some(portrait) = face {
+        let r = 13.0 * z;
+        draw_face(frame, portrait, Point::new(p.x + rect.width - pad - r, p.y + HEADER / 2.0 * z), r, false);
+        names_width -= 34.0;
+    } else if unknown > 0 && z >= DETAIL_ZOOM {
+        label(frame, "⚠".to_owned(), Point::new(p.x + rect.width - pad - 12.0 * z, p.y + 18.0 * z), 13.0 * z, theme::WARNING, theme::UI_FONT);
+        names_width -= 20.0;
+    }
     let title_color = if card.kind == CardKind::Missing { theme::LINK_MISSING } else { theme::HEADING };
-    // A crew card's note: their face at the top right, the title beside it.
-    let title_width = match face {
-        Some(portrait) => {
-            let r = 13.0 * z;
-            draw_face(frame, portrait, Point::new(p.x + rect.width - pad - r, p.y + 8.0 * z + r), r, false);
-            inner - 34.0
-        }
-        None => inner,
-    };
 
-    // Zoomed out: a block with the title.
+    // Zoomed out: the header's strip and title only.
     if z < DETAIL_ZOOM {
         label(
             frame,
-            fit(&card.title, title_width, 15.0),
-            Point::new(p.x + pad, p.y + 14.0 * z),
+            fit(&card.title, names_width, 15.0),
+            Point::new(text_x, p.y + 17.0 * z),
             15.0 * z,
             title_color,
             semibold,
@@ -2318,19 +2461,57 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
         return;
     }
 
-    label(frame, fit(&card.title, title_width, 15.0), Point::new(p.x + pad, p.y + 11.0 * z), 15.0 * z, title_color, semibold);
-    let subtitle = match card.kind {
-        CardKind::Missing => "No such note yet · double-click to create".to_owned(),
-        CardKind::Ambiguous => format!("⚠ several notes match · {}", card.folder),
-        _ => card.folder.clone(),
+    label(frame, fit(&card.title, names_width, semibold_size), Point::new(text_x, p.y + 10.0 * z), semibold_size * z, title_color, semibold);
+    let (path, path_color) = match card.kind {
+        CardKind::Missing => ("missing · double-click to create".to_owned(), theme::FAINT),
+        CardKind::Ambiguous => (format!("⚠ several notes match · {}", card.rel.as_deref().unwrap_or(&card.folder)), theme::WARNING),
+        _ => (card.rel.as_deref().unwrap_or(&card.folder).to_owned(), theme::MUTED),
     };
-    let subtitle_color = if card.kind == CardKind::Ambiguous { theme::WARNING } else { theme::FAINT };
-    label(frame, fit(&subtitle, title_width, 11.0), Point::new(p.x + pad, p.y + 31.0 * z), 11.0 * z, subtitle_color, theme::UI_FONT);
+    label(frame, fit(&path, names_width, 11.0), Point::new(text_x, p.y + 31.0 * z), 11.0 * z, path_color, theme::MONO_FONT);
+    // A faint line under the header (a missing note's card is just one).
+    if card.kind != CardKind::Missing {
+        frame.fill_rectangle(Point::new(p.x + 1.0, p.y + HEADER * z), Size::new(rect.width - 2.0, 1.0), Color { a: 0.06, ..Color::WHITE });
+    }
 
+    let row_text = 12.8;
     let mut y = HEADER;
-    for task in card.tasks.iter().take(MAX_ROWS) {
-        let row = Point::new(p.x + pad, p.y + y * z);
-        label(frame, task.symbol.clone(), row, 12.0 * z, theme::TEXT, theme::UI_FONT);
+    if card.tasks.is_empty() && card.kind != CardKind::Missing {
+        label(frame, "No tasks".to_owned(), Point::new(p.x + pad, p.y + (y + 8.0) * z), row_text * z, theme::MUTED, iced::Font { style: iced::font::Style::Italic, ..theme::UI_FONT });
+        y += ROW;
+    }
+    for task in card.tasks.iter().take(card.shown()) {
+        let top = p.y + y * z;
+        // The status, centred in its box.
+        let chip = Point::new(p.x + pad, top + (ROW - CHIP) / 2.0 * z);
+        frame.fill_text(Text {
+            content: task.symbol.clone(),
+            position: Point::new(chip.x + CHIP / 2.0 * z, chip.y + CHIP / 2.0 * z),
+            color: theme::TEXT,
+            size: Pixels(14.0 * z),
+            font: theme::UI_FONT,
+            align_x: iced::widget::text::Alignment::Center,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
+        // Its people at the right, in the mono font.
+        let text_left = 12.0 + CHIP + 8.0;
+        let mut text_width = size.width - text_left - 12.0;
+        if !task.people.is_empty() {
+            let people: String = task.people.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(" ");
+            let people = fit(&people, 90.0, 11.0);
+            let width = people.chars().count() as f32 * 11.0 * 0.6;
+            frame.fill_text(Text {
+                content: people,
+                position: Point::new(p.x + rect.width - pad, top + ROW / 2.0 * z),
+                color: theme::WARNING,
+                size: Pixels(11.0 * z),
+                font: theme::MONO_FONT,
+                align_x: iced::widget::text::Alignment::Right,
+                align_y: iced::alignment::Vertical::Center,
+                ..Text::default()
+            });
+            text_width -= width + 8.0;
+        }
         let color = if task.unknown {
             theme::WARNING
         } else if task.done {
@@ -2338,57 +2519,58 @@ fn draw_card(frame: &mut Frame, view: View, card: &Card, pos: Point, screen: Rec
         } else {
             theme::TEXT
         };
-        let text = fit(&task.text, inner - 24.0, 13.0);
-        let width = text.chars().count() as f32 * 13.0 * 0.46 * z;
-        label(frame, text, Point::new(row.x + 22.0 * z, row.y), 13.0 * z, color, theme::UI_FONT);
-        if task.done {
-            frame.fill_rectangle(
-                Point::new(row.x + 22.0 * z, row.y + 8.5 * z),
-                Size::new(width.min((inner - 24.0) * z), 1.0),
-                theme::MUTED,
-            );
-        }
+        frame.fill_text(Text {
+            content: fit(&task.text, text_width, row_text),
+            position: Point::new(p.x + text_left * z, top + ROW / 2.0 * z),
+            color,
+            size: Pixels(row_text * z),
+            font: theme::UI_FONT,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
         y += ROW;
     }
-    if card.tasks.len() > MAX_ROWS {
-        label(
-            frame,
-            format!("+{} more", card.tasks.len() - MAX_ROWS),
-            Point::new(p.x + pad + 22.0 * z, p.y + y * z),
-            12.0 * z,
-            theme::FAINT,
-            theme::UI_FONT,
-        );
+    if card.has_more() {
+        frame.fill_text(Text {
+            content: if card.open { "Show less".to_owned() } else { format!("+{} more", card.tasks.len() - MAX_ROWS) },
+            position: Point::new(p.x + (12.0 + CHIP + 8.0) * z, p.y + (y + ROW / 2.0) * z),
+            color: theme::FAINT,
+            size: Pixels(12.0 * z),
+            font: theme::UI_FONT,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
     }
 
     if card.kind != CardKind::Missing {
+        // The footer: wires on the left, open tasks on the right, and how
+        // much is done as a thin line along its top.
+        let foot = p.y + (size.height - FOOTER) * z;
+        frame.fill_rectangle(Point::new(p.x + 1.0, foot), Size::new(rect.width - 2.0, 1.0), Color { a: 0.06, ..Color::WHITE });
         let total = card.tasks.len();
-        let foot = p.y + (size.height - FOOTER + 8.0) * z;
-        let text = if total == 0 {
-            "No tasks".to_owned()
-        } else {
-            format!("{} / {total} done", card.done)
-        };
-        label(frame, text, Point::new(p.x + pad, foot), 11.0 * z, theme::MUTED, theme::UI_FONT);
-        if total > 0 {
-            let bar_x = p.x + 110.0 * z;
-            let bar_w = (size.width - 110.0 - 12.0) * z;
-            let bar_y = foot + 6.0 * z;
-            frame.fill(
-                &Path::rounded_rectangle(Point::new(bar_x, bar_y), Size::new(bar_w, 4.0 * z), (2.0 * z).into()),
-                theme::LINE,
-            );
+        if total > 0 && card.done > 0 {
             let share = card.done as f32 / total as f32;
-            if share > 0.0 {
-                frame.fill(
-                    &Path::rounded_rectangle(
-                        Point::new(bar_x, bar_y),
-                        Size::new(bar_w * share, 4.0 * z),
-                        (2.0 * z).into(),
-                    ),
-                    theme::SUCCESS,
-                );
-            }
+            frame.fill_rectangle(Point::new(p.x + 1.0, foot - 1.0), Size::new((rect.width - 2.0) * share, 2.0), theme::SUCCESS);
         }
+        let middle = foot + FOOTER / 2.0 * z;
+        frame.fill_text(Text {
+            content: format!("in {} · out {}", card.wires_in, card.wires_out),
+            position: Point::new(p.x + pad, middle),
+            color: theme::MUTED,
+            size: Pixels(10.5 * z),
+            font: theme::MONO_FONT,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
+        frame.fill_text(Text {
+            content: format!("{} open of {total}", total - card.done),
+            position: Point::new(p.x + rect.width - pad, middle),
+            color: theme::MUTED,
+            size: Pixels(10.5 * z),
+            font: theme::MONO_FONT,
+            align_x: iced::widget::text::Alignment::Right,
+            align_y: iced::alignment::Vertical::Center,
+            ..Text::default()
+        });
     }
 }
