@@ -134,10 +134,10 @@ pub fn links(text: &str) -> Vec<Link> {
     out
 }
 
-/// The lines of `text` where `name` (lowercased: a note's name) is written
-/// as whole words outside links, code, comments and frontmatter, with
-/// where it is in each. `lower` is `text` with ASCII lowercased (the same
-/// bytes). An `@name`, a `#tag` or a web address doesn't count.
+/// The lines of `text` where `name` (folded: a note's name) is written as
+/// whole words outside links, code, comments and frontmatter, with where
+/// it is in each. `lower` is `text` folded (`search::fold`: the same byte
+/// offsets). An `@name`, a `#tag` or a web address doesn't count.
 pub fn unlinked_mentions(text: &str, lower: &str, name: &str) -> Vec<(usize, Vec<Range<usize>>)> {
     let mut out = Vec::new();
     if name.trim().is_empty() {

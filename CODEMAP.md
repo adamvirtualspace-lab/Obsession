@@ -19,7 +19,7 @@ Line counts are approximate (November 2026).
 |---|---|---|
 | `obsession-core` | `core/` | Everything that isn't UI. No iced. Fully unit-tested (`cargo test -p obsession-core`). |
 | `obsession` | `app/` | The iced 0.14 app (wgpu, canvas). |
-| `obsession-bench` | `bench/` | Test vault generator and timings (`obsession-bench gen <dir> <count>`). `bench/scripts/`: `idle-threads.ps1` (each thread's CPU cycles over a window: idle should show none) and `ui-load.ps1` (the UI thread's load every 100 ms during a burst). |
+| `obsession-bench` | `bench/` | Test vault generator and timings (`obsession-bench gen <dir> <count>`; `graphs <dir> <wires>` adds function graphs; `runs` and `search` time the function index, the out-of-date check and search, with a counting allocator for search's memory). `bench/scripts/`: `idle-threads.ps1` (each thread's CPU cycles over a window: idle should show none) and `ui-load.ps1` (the UI thread's load every 100 ms during a burst). |
 
 Build and run: `cargo run --release`. Measure: `cargo build -p obsession
 --profile measure` (release speed, debug hooks kept). Cargo's home and target
@@ -31,7 +31,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 |---|---|---|
 | `lib.rs` | 30 | Module list. |
 | `vault.rs` | 628 | `Vault` (flat sorted `Vec<Entry>`; `scan`, `note(rel)`, `path(rel)`, `notes()`; attachments apart in `files` with their own lookups, `with_files`), Obsidian link resolution `resolve` / `resolve_from` (steps shared by notes and attachments in `find`) → `Resolved::{One, Ambiguous, NotFound, Attachment(Option<rel>)}` (`.entry()`), `attachment(target, from)`, `is_attachment`, `note_rel_from_input`, `folder_rel_from_input`, `create_note`. Moves: `moved(rel, from, to)` (where a path is after a note or folder moves), `folder`, `notes_in`, `files_in`, `count_files_named`. |
-| `store.rs` | 546 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `rename(old, new)` after a move keeps text and pins. `Stats` for the status bar. |
+| `store.rs` | 629 | `Store`: one RAM copy per file. `get(rel)` reads once, `pin`/`unpin`, `set(rel, text)` (only for files already loaded), `take_save(rel)` → `SaveJob` (`run()` off-thread) → `finish_save`. `check_outside(rel)` → `Outside::{Same, Changed, Conflict, Deleted, NotLoaded}` (own writes recognised by hash). `rename(old, new)` after a move keeps text and pins. Notes read on another thread: `load(root, rel)` → `Loaded` → `insert` (never over what it holds); `loaded()`, `unpin_all`. `Stats` for the status bar. |
 | `write.rs` | 75 | `atomic_write`: temp file, then swap; retries locked files. |
 | `doc.rs` | 150 | `Doc`: a note as lines, each with its own ending; byte-exact round trip. |
 | `history.rs` | 316 | `History`: undo/redo snapshots, grouped, capped at 8 MB. `Elsewhere` + `Step { files: Vec<Change>, open, what, joined }` + `fingerprint`: undo for changes made from the open note's view to other notes (one step can hold several files), taken only while the open note's text matches its fingerprint from then; capped at 500 steps and 8 MB (`Step::bytes`). A `joined` step goes with the open note's own edit in one press (`undo_joined` after its undo; redone just before its redo). |
@@ -41,7 +41,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `links.rs` | 1237 | `links(text)`, `outline(text)` (headings, `^ids`), `LinkIndex` (outgoing links and task `@mentions` per note; `build`, `build_cached` + `to_cache` + `save_cache` (`.obsessed/cache/links.txt`), `stamp`, `update`, `remove`, `targets`, `backlinks`, `mention_counts`), `linking_names`, `has_links`, `rename`), `link_states`, `rewrite_moved` (fixes links after a note or folder moves, checked against the vault before and after; `relative_path`), `unlinked_mentions(text, lower, name)`, `remove_links(text, pick)` + `link_words` (unlinking keeps the words), `task_at(text, sub, task_lines)` (which task a `#^block` / `#heading` link points at, for wires that end at a row). |
 | `preview.rs` | 430 | Obsidian → plain markdown (unused by the app now; kept for export). |
 | `fuzzy.rs` | 70 | `score(query, candidate)` for the quick switcher. |
-| `search.rs` | 312 | Vault search: `SearchIndex::build(root, notes)`, `update`, `remove`, `rename`, `query(words, limit)` → `Results { hits: Vec<Hit { rel, line, text, ranges }>, total, notes }`; `unlinked(rel, limit)` (a note's unlinked mentions). |
+| `search.rs` | 380 | Vault search: `SearchIndex::build(root, notes)`, `update`, `remove`, `rename`, `query(words, limit)` → `Results { hits: Vec<Hit { rel, line, text, ranges }>, total, notes }`; `unlinked(rel, limit)` (a note's unlinked mentions). Each note keeps a folded copy: `fold` (case beyond ASCII, same byte offsets). |
 | `nodes.rs` | 727 | Graph files (any `…_nodes.md`, `is_graph(rel)`): `parse(text)` → `Graph { nodes, wires, layout }`, `Node`/`NodeKind::{File, Function}`, `Wire { from, to, function, line }`, `End::{Note{target, sub}, Pin{function, pin}}`. Edits: `set_layout`, `add_item`, `remove_lines`, `add_block`, `set_wire_function`, `section_lines`, `rename_function(text, old, new)` (`- fn Old`, wire calls, `Old.pin` ends, the layout line; `pin_function`). |
 | `func/mod.rs` | 640 | Function text format: `parse`, `blocks(text)` / `local_blocks(graph)` → `Block { open, close, function }`, `Function { name, inputs, outputs, params, steps, errors }`, `Step { id, op, args, pos, line }`, `Value::{Ref, Lit}`, `Literal`, `parse_call`, `parse_value`, `write_step`. `Library { local, saved }` (`find`, `all`), `SAVED` = `_funct.md`, `SAVED_DEFAULT`. |
 | `func/types.rs` | 140 | `Type` (File, Section, Task, Text, Number, Bool, TextList, TaskList) and `Want` (what an argument accepts; `accepts`, `describe`). |
@@ -58,7 +58,7 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 
 | File | Lines | Holds |
 |---|---|---|
-| `main.rs` | 4468 | `App` (state), `Message`, `Workspace { vault, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
+| `main.rs` | 4602 | `App` (state), `Message`, `Workspace { vault: Arc<Vault>, store, tree, note, team, links, … }`. `update` → `handle`; `view`, `view_toolbar` (the same for notes and graphs), `view_graph_bar` (the graph's own tools, an `opaque` bar over the canvas), `view_status`; `subscription` (keys, window); `shortcut_from_event` → `Shortcut` (Escape always arrives, even from a focused text box; Tab only when no widget used it). `view` always returns a `stack!` (one layer when no popup is open) and the page is always a `stack!` too, so widgets keep their focus and scroll when a popup or the `@name` suggestions appear. See the flows below for which methods do what. |
 | `note.rs` | 1163 | `Note`: the open note in a `Mode` (Live, Source, Split, Reading), its format, history and autosave `Timer`s. `text()`, `apply_text(text)` (undoable replace; returns timers), `perform`, `jump_to`, `set_mode` (a new `Live` or Split mirror gets the note's link states, so unknown `@names` stay amber). `@` autocomplete: `mention_prefix`, `set_completing`, `complete_mention`; the Source editor sends `SourceEvent::{Action, Complete}`. Selecting in the Live view on screen (the note's or Split's mirror): `live_dragging` (the app then subscribes to the pointer), `selection_text` (Reading's Ctrl+C, `Shortcut::Copy`), `clear_selection` (Escape); `LiveOutcome::edge_step` asks for the next `live::Message::EdgeScroll`. |
 | `live.rs` | 1838 | Live Preview widget state: drawn blocks plus the active block's small editor; caret, selection by dragging, keys (`goal`: the column Up/Down aim for). Selecting: `press` → `drag_to` / `drag_head` → `release` (editable: `select` opens the covered blocks; read-only: `kept`, `selection_text`, `clear_selection`); at the page's edges `pointer` → `edge_scroll` (`EDGE`, `EDGE_STEP`). Heights: measured (`heights`) or estimated (`estimates`, `estimate` → `wrapped_rows` with `advance`, at `text_column`; table rows measured by their tallest cell), cleared on a width change in `scrolled`. Pictures: `picture_column` (a `PictureColumn` under the line, or alone for a line of only pictures), `picture_heights` in `line_height`, `pictures_near` (what `view` builds), `Message::PicturesShown`. |
 | `pictures.rs` | 575 | Pictures in notes: `Pictures` (decoded by `Key { rel, width }`, 64 MB `BUDGET`, `want` / `loaded` / `trim` / `forget`, the open note's targets, `decode_width`, scale factor), `decode` (off-thread, two at a time, EXIF, shrunk to the width drawn), `PictureColumn` widget. |
@@ -69,18 +69,18 @@ live in `C:\dev\cargo` and `C:\dev\target`.
 | `status_menu.rs` | 85 | Right-click status menu. |
 | `sidebar.rs` | 170 | File tree as a virtual list (`Tree`; `rename` keeps moved folders open). Right-click a note or folder: `Message::Rename`. |
 | `switcher.rs` | 135 | Quick switcher (Ctrl+P). |
-| `find.rs` | 150 | Vault search popup (Ctrl+Shift+F): `Find` (query, results, selection), `Message::{Query, Submit, Pick, Close}`. |
+| `find.rs` | 208 | Vault search popup (Ctrl+Shift+F): `Find` (query, results, selection), `Message::{Query, Submit, Pick, Close, Scrolled}`. Results are a virtual list (`ROW`, `PITCH`: only rows on screen); Up/Down scroll the selection into view. |
 | `new_note.rs` | 125 | New-note box (Ctrl+N), also the rename box for a note (F2) or a folder (`Purpose::{New, Rename, RenameFolder}`). |
 | `backlinks.rs` | 249 | Backlinks panel: `Panel` (`set_links` draws each snippet with `live::line`; unlinked mentions once `want_unlinked`, `unlinked_stale`), `Message::{Open, FindUnlinked}`. |
 | `graph.rs` | 2394 | Graph view (`canvas::Program`): `Graph::build(text, rel, vault, store, team, links, library, previous, show_links)` → `cards: Vec<Card>`, `wires: Vec<WireView>` with `WireState::{Plain, Solid, Broken(why)}`. `Message::{Moved, Open, Connect(PinRef, PinRef), Delete, Function(wire), Assign{member, card, task}, OpenCrew}`. The crew hand: `HandCard`, `set_crew(&[Member])`, `show_hand`. `draw_crew` lights the person's nodes in the overlay and leaves `hand_now` (`HandNow`: size, raised card and lift, the dragged token); `HandLayer`, a draw-only canvas stacked over the graph in `Graph::view` (its own layer, so graph text can't show through), draws it with `draw_hand` → `draw_hand_card` (whole) or `draw_hand_strip` (face, name and badge in the visible strip of a covered card; `hand_step`, `hand_visible`, `badge_short`). `takes_function(wire)`: no ƒ on wires to or from a function node's pin. `WireView::from_row` / `to_row` (via `row_in` → `links::task_at`): a `#^block` / `#heading` end meets that task row (`row_y`); `wire_ends` uses it. Hover is worked out again when a drag ends. Drawing: the cached layer is `cache` (grid, wire words), `wire_mesh` (the wires as smooth meshes) and `cards_cache`, rebuilt when `DrawKey` changes; the overlay's wires are smooth too. `draw_wire(frame, shapes, …)`. `pan_bench` (`OBSESSION_DEV_PAN`). Shared drawing helpers: `View`, `curve_screen`, `draw_grid`, `fit`, `pin_color`. |
 | `smooth.rs` | 376 | Smooth lines without MSAA: `Shapes` (`line`, `dashed`, `ring`, `fill` convex, `circle`, `circle_ring`) builds a mesh with a soft edge one screen pixel wide; `into_geometry(size)` → an `iced_wgpu::Geometry` for a canvas. `bezier` (points along a curve), `set_scale` / `scale` (the window's scale factor, from `Message::ScaleFactor`). |
 | `func_editor.rs` | 1573 | Function editor (`Editor`: canvas + panel; the title is a `text_input` on `name_draft`, `NameDraft`/`NameSubmit`), `Message` → `Outcome` (`Edit(closure)`, `Wire(call)`, `Back`, `Change`, `TakeOff`, `Duplicate`, `Status`, `Rename(new)`), `Context::{Wire{line}, Node}`. Also `Picker` (choose or create a function). Drawing: `cache` (grid, inputs node), `wire_mesh` (smooth wires, `draw_wires_into(shapes, …)`), `steps_cache`. |
 | `watch.rs` | 81 | The vault watcher (`notify` 9, every system): `watch(root)` subscription → `Vec<FsEvent>` (batches gathered for 50 ms, dot folders left out, a "rescan" event as the vault folder). |
-| `runs.rs` | 207 | `Runs` (per vault: `index`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `FsEvent`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
+| `runs.rs` | 251 | `Runs` (per vault: `index`, `indexing`/`index_again`/`touched`, `checking`/`check_again`, `pinned`, `pending`, `running`, `scheduled`, `last`, `out_of_date`, `log`, `show`), `IndexBuilt`, `Checked`, `ticket()`, `FsEvent`, `rel_of`, the Runs panel (`view`, `Message::{Undo, Close}`). |
 | `theme.rs` | 260 | Colours, fonts, widget styles. Compact layout: `set_compact`, `compact`, `row_height`, `tool_pad`, `tool_gap`, `bar_pad`. |
-| `timer.rs` | 20 | One-shot delay future. |
+| `timer.rs` | 34 | One-shot delay future (`after`), and `on_thread(work)`: blocking work on a thread of its own, so it doesn't hold up tasks batched with it. |
 | `settings.rs` | 60 | `%APPDATA%\Obsession`: the last vault, and `Prefs { compact }` (`prefs`, `save_prefs`). |
-| `dev.rs` | 391 | Debug-only hooks driven by `OBSESSION_DEV_*` variables (open a note, type, click, run graph/editor steps, screenshot; `OBSESSION_DEV_KEYS` logs key presses; `OBSESSION_DEV_PAN` / `OBSESSION_DEV_MSAA` measure panning). See its header for the list. |
+| `dev.rs` | 406 | Debug-only hooks driven by `OBSESSION_DEV_*` variables (open a note, type, click, run graph/editor steps, screenshot; `OBSESSION_DEV_KEYS` logs key presses; `OBSESSION_DEV_PAN` / `OBSESSION_DEV_MSAA` measure panning). See its header for the list. |
 
 ## Flows
 
@@ -171,9 +171,12 @@ a pause; 150 ms with nothing new ends the burst: `runs.record`, `note_changed`
 for each, `refresh_links`, `rebuild_graph`.
 
 **Runs.** `rebuild_index` (on scan, and when a graph, `_funct.md` or
-`_settings.md` changes) → `Index::build`, pins job files, `check_out_of_date`
-(`runner::pending` → `runs.out_of_date`, drawn by `rebuild_graph` as
-`WireView::stale` / `Card::stale`). A changed note → `note_changed` (from
+`_settings.md` changes) → `Index::build` and the job notes read on a thread
+(`timer::on_thread`) → `Message::IndexBuilt` → `index_built` (`Store::insert`,
+pins job files) → `check_out_of_date` (`runner::pending` on a thread →
+`Message::Checked` → `checked` → `runs.out_of_date`, drawn by `rebuild_graph`
+as `WireView::stale` / `Card::stale`). One of each at a time (`index_again`,
+`check_again`); `runs::ticket` drops late results. A changed note → `note_changed` (from
 `save_now`, or from the end of an outside burst) → `runs.pending` → `schedule_run` (timer, 1 s gap) →
 `Message::RunNow` (saves the open note, `index.affected`) → `start_run`
 (`runner::run` off-thread) → `Message::RunDone` → `run_done` (`runner::apply`
@@ -209,7 +212,7 @@ through `store.get` right after, so the watcher's events for them count as
 the app's own writes, not as "Changed in another app".
 
 **Search.** `Shortcut::FindInVault` → `open_find` (saves the open note;
-builds `SearchIndex` off-thread the first time → `Message::SearchBuilt`) →
+builds `SearchIndex` on a thread the first time → `Message::SearchBuilt`) →
 `find::Find`. Typing → `find_message` → `SearchIndex::query`. Enter or a click
 → `open_at(rel, Jump::Line)`. Every `ws.links.update` is followed by
 `ws.search.update`, so search stays current.

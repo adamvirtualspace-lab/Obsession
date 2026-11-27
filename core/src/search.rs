@@ -1,9 +1,12 @@
 //! Vault search: every note's text in RAM, searched line by line.
 //!
 //! Built the first time search is used (not at startup), on a background
-//! thread, then kept current as notes change. Matching ignores ASCII case:
-//! each note keeps a lower-cased copy whose byte offsets match the original,
-//! so a hit's position points straight into the real line.
+//! thread, then kept current as notes change. Matching ignores case
+//! (`fold`): each note keeps a folded copy whose byte offsets match the
+//! original, so a hit's position points straight into the real line. The
+//! copy doubles what search holds (3.5 MB of text is 7 MB, plus about
+//! 1 MB of paths for 10,000 notes) but keeps a query a few milliseconds:
+//! folding every note on each query took five times as long.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -15,6 +18,7 @@ const SNIPPET: usize = 180;
 struct Doc {
     rel: Box<str>,
     text: String,
+    /// `text` folded (`fold`), the same length.
     lower: String,
 }
 
@@ -51,9 +55,11 @@ impl SearchIndex {
         let mut index = Self::default();
         for rel in notes {
             if let Ok(text) = std::fs::read_to_string(root.join(rel)) {
-                index.update(rel, &text);
+                index.insert(rel, text);
             }
         }
+        index.docs.shrink_to_fit();
+        index.by_rel.shrink_to_fit();
         index
     }
 
@@ -65,21 +71,25 @@ impl SearchIndex {
         self.docs.is_empty()
     }
 
+    /// Bytes of note text held, folded copies included.
     pub fn bytes(&self) -> usize {
-        self.docs.iter().map(|d| d.text.len() * 2).sum()
+        self.docs.iter().map(|d| d.text.len() + d.lower.len()).sum()
     }
 
     pub fn update(&mut self, rel: &str, text: &str) {
-        let doc = Doc {
-            rel: rel.into(),
-            text: text.to_owned(),
-            lower: text.to_ascii_lowercase(),
-        };
+        self.insert(rel, text.to_owned());
+    }
+
+    fn insert(&mut self, rel: &str, text: String) {
+        let lower = fold(&text);
         match self.by_rel.get(rel) {
-            Some(&i) => self.docs[i] = doc,
+            Some(&i) => {
+                self.docs[i].text = text;
+                self.docs[i].lower = lower;
+            }
             None => {
                 self.by_rel.insert(rel.into(), self.docs.len());
-                self.docs.push(doc);
+                self.docs.push(Doc { rel: rel.into(), text, lower });
             }
         }
     }
@@ -99,11 +109,11 @@ impl SearchIndex {
         self.by_rel.insert(new.into(), i);
     }
 
-    /// Lines containing every word of `query` (ignoring case). Notes whose
-    /// name contains every word come first; then by path. At most `limit`
-    /// hits are returned, but all are counted.
+    /// Lines containing every word of `query` (ignoring case, `fold`).
+    /// Notes whose name contains every word come first; then by path. At
+    /// most `limit` hits are returned, but all are counted.
     pub fn query(&self, query: &str, limit: usize) -> Results {
-        let words: Vec<String> = query.split_whitespace().map(str::to_ascii_lowercase).collect();
+        let words: Vec<String> = query.split_whitespace().map(fold).collect();
         let mut out = Results::default();
         if words.is_empty() {
             return out;
@@ -112,7 +122,7 @@ impl SearchIndex {
             .docs
             .iter()
             .map(|d| {
-                let name = d.rel.rsplit('/').next().unwrap_or(&d.rel).to_ascii_lowercase();
+                let name = fold(d.rel.rsplit('/').next().unwrap_or(&d.rel));
                 (!words.iter().all(|w| name.contains(w.as_str())), d)
             })
             .collect();
@@ -144,12 +154,12 @@ impl SearchIndex {
 
 impl SearchIndex {
     /// The note `rel`'s unlinked mentions: lines in other notes that write
-    /// its name (no folder, no `.md`; ASCII case ignored) as whole words
+    /// its name (no folder, no `.md`; case ignored, `fold`) as whole words
     /// outside links and code (`links::unlinked_mentions`). By path; at
     /// most `limit` returned, all counted.
     pub fn unlinked(&self, rel: &str, limit: usize) -> Results {
         let name = rel.rsplit('/').next().unwrap_or(rel);
-        let name = name.strip_suffix(".md").unwrap_or(name).to_ascii_lowercase();
+        let name = fold(name.strip_suffix(".md").unwrap_or(name));
         let mut out = Results::default();
         if name.trim().is_empty() {
             return out;
@@ -170,6 +180,32 @@ impl SearchIndex {
             }
         }
         out
+    }
+}
+
+/// `text` with its letters lowercased, for matching that ignores case.
+/// Each character keeps its UTF-8 length, so a position in the result is
+/// the same position in `text`: `É` → `é`, `Σ` → `σ`, `Ж` → `ж`. The few
+/// whose lowercase is longer or shorter (`İ`, the Kelvin sign) stay as
+/// they are, and a final `ς` becomes `σ` so `ΟΔΟΣ` finds `οδος`.
+pub fn fold(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    text.chars().map(fold_char).collect()
+}
+
+fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    if c == 'ς' {
+        return 'σ';
+    }
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) if l.len_utf8() == c.len_utf8() => l,
+        _ => c,
     }
 }
 
@@ -251,6 +287,38 @@ fn hit(rel: &str, line: usize, text: &str, lower: &str, words: &[String]) -> Hit
 #[cfg(test)]
 mod unlinked_tests {
     use super::*;
+
+    #[test]
+    fn folds_case_beyond_ascii_keeping_offsets() {
+        assert_eq!(fold("ÉTÉ Été été"), "été été été");
+        assert_eq!(fold("ΟΔΟΣ οδος"), "οδοσ οδοσ");
+        assert_eq!(fold("Жук"), "жук");
+        // Lowercase of a different length: left as it is.
+        assert_eq!(fold("İ \u{212A} K"), "İ \u{212A} k");
+        for text in ["Straße ÀÉÎÕÜ ǅ ΣΑΣ İstanbul \u{212A}elvin 東京 🎬", "plain ASCII"] {
+            let folded = fold(text);
+            assert_eq!(folded.len(), text.len());
+            assert!(text.char_indices().all(|(i, _)| folded.is_char_boundary(i)));
+        }
+    }
+
+    #[test]
+    fn search_and_unlinked_mentions_ignore_case_beyond_ascii() {
+        let mut index = SearchIndex::default();
+        index.update("Équipe.md", "# Équipe");
+        index.update("notes.md", "Réunion avec l'ÉQUIPE demain\nnothing");
+        let r = index.query("équipe RÉUNION", 10);
+        assert_eq!((r.total, r.notes), (1, 1));
+        let hit = &r.hits[0];
+        assert_eq!(hit.text, "Réunion avec l'ÉQUIPE demain");
+        let marked: Vec<&str> = hit.ranges.iter().map(|range| &hit.text[range.clone()]).collect();
+        assert_eq!(marked, ["Réunion", "ÉQUIPE"]);
+        // The note named "Équipe" comes first.
+        assert_eq!(&*index.query("ÉQUIPE", 10).hits[0].rel, "Équipe.md");
+        let unlinked = index.unlinked("Équipe.md", 10);
+        assert_eq!(unlinked.total, 1);
+        assert_eq!(&unlinked.hits[0].text[unlinked.hits[0].ranges[0].clone()], "ÉQUIPE");
+    }
 
     #[test]
     fn lists_unlinked_mentions_of_a_note() {

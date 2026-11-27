@@ -138,6 +138,8 @@ enum Message {
     /// Time for the pending run.
     RunNow,
     RunDone(Arc<RunResult>),
+    IndexBuilt(Arc<runs::IndexBuilt>),
+    Checked(Arc<runs::Checked>),
     Runs(runs::Message),
     ToggleRuns,
     /// Complete the `@name` being typed (with this crew key, or the first
@@ -575,7 +577,7 @@ impl App {
             let path = ws.vault.path(&key.rel);
             let tag = key.clone();
             Task::perform(
-                async move {
+                timer::on_thread(move || {
                     let started = std::time::Instant::now();
                     let result = pictures::decode(path, key.width, scale, key.square);
                     if timing && let Ok(d) = &result {
@@ -589,7 +591,7 @@ impl App {
                         );
                     }
                     result
-                },
+                }),
                 move |result| Message::PictureLoaded(tag.clone(), generation, result),
             )
         }))
@@ -598,7 +600,7 @@ impl App {
     fn scan(&mut self, path: PathBuf) -> Task<Message> {
         self.scanning = true;
         Task::perform(
-            async move {
+            timer::on_thread(move || {
                 let started = std::time::Instant::now();
                 let vault = Vault::scan(path).map_err(|e| e.to_string());
                 if std::env::var_os("OBSESSION_DEV_TIMING").is_some()
@@ -612,7 +614,7 @@ impl App {
                     );
                 }
                 vault
-            },
+            }),
             Message::Scanned,
         )
     }
@@ -680,7 +682,7 @@ impl App {
                 // Notes unchanged since the last time come from the cache in
                 // `.obsessed/cache/`; only changed ones are read.
                 let index = Task::perform(
-                    async move {
+                    timer::on_thread(move || {
                         let started = std::time::Instant::now();
                         let cache = std::fs::read_to_string(root.join(links::CACHE)).ok();
                         let (index, stats) = LinkIndex::build_cached(&root, rels.iter().map(|r| &**r), cache.as_deref());
@@ -696,7 +698,7 @@ impl App {
                             );
                         }
                         (root, Arc::new(index))
-                    },
+                    }),
                     |(root, index)| Message::Indexed(root, index),
                 );
                 self.pictures.clear();
@@ -726,7 +728,8 @@ impl App {
                 }
                 ws.load_crew();
                 self.workspace = Some(ws);
-                self.rebuild_index();
+                let functions = self.rebuild_index();
+                let index = Task::batch([index, functions]);
                 self.menu = None;
                 self.switcher = None;
                 self.new_note = None;
@@ -1025,7 +1028,7 @@ impl App {
                 ws.load_crew();
                 let crew = started.elapsed();
                 self.pictures.forget_failed();
-                self.rebuild_index();
+                let functions = self.rebuild_index();
                 let index = started.elapsed();
                 self.refresh_links();
                 let links = started.elapsed();
@@ -1039,7 +1042,7 @@ impl App {
                         started.elapsed().as_millis()
                     );
                 }
-                again
+                Task::batch([again, functions])
             }
             Message::VaultRefreshed(Err(error)) => {
                 self.status = Some(format!("Couldn't re-read the folder: {error}"));
@@ -1050,6 +1053,10 @@ impl App {
                     return Task::none();
                 };
                 ws.runs.scheduled = false;
+                if ws.runs.indexing.is_some() {
+                    // `index_built` schedules it again.
+                    return Task::none();
+                }
                 ws.runs.running = true;
                 // Typing in the open note goes into this run.
                 let save = self.save_now();
@@ -1065,6 +1072,8 @@ impl App {
                 Task::batch([save, self.start_run(start)])
             }
             Message::RunDone(result) => self.run_done(&result),
+            Message::IndexBuilt(built) => self.index_built(built),
+            Message::Checked(checked) => self.checked(checked),
             Message::Runs(runs::Message::Undo(id)) => self.undo_run(id),
             Message::Runs(runs::Message::Close) | Message::ToggleRuns => {
                 if let Some(ws) = &mut self.workspace {
@@ -1303,13 +1312,15 @@ impl App {
             return Task::none();
         }
         if let Some(find) = &mut self.find {
-            match shortcut {
-                Shortcut::Up => find.move_selection(false),
-                Shortcut::Down => find.move_selection(true),
-                Shortcut::Escape | Shortcut::FindInVault => self.find = None,
-                _ => {}
-            }
-            return Task::none();
+            return match shortcut {
+                Shortcut::Up => find.move_selection(false).map(Message::Find),
+                Shortcut::Down => find.move_selection(true).map(Message::Find),
+                Shortcut::Escape | Shortcut::FindInVault => {
+                    self.find = None;
+                    Task::none()
+                }
+                _ => Task::none(),
+            };
         }
         if let Some(switcher) = &mut self.switcher {
             match shortcut {
@@ -1408,14 +1419,14 @@ impl App {
         let root = ws.vault.root.clone();
         let rels: Vec<Box<str>> = ws.vault.notes().map(|e| e.rel.clone()).collect();
         Task::perform(
-            async move {
+            timer::on_thread(move || {
                 let started = std::time::Instant::now();
                 let index = obsession_core::search::SearchIndex::build(&root, rels.iter().map(|r| &**r));
                 if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
                     eprintln!("TIMING search: {} notes in {} ms, {} KB", index.len(), started.elapsed().as_millis(), index.bytes() / 1024);
                 }
                 (root, Built(Arc::new(std::sync::Mutex::new(Some(index)))))
-            },
+            }),
             |(root, built)| Message::SearchBuilt(root, built),
         )
     }
@@ -1427,7 +1438,10 @@ impl App {
         let pick = match message {
             find::Message::Query(query) => {
                 let index = self.workspace.as_ref().and_then(|ws| ws.search.as_ref());
-                find.set_query(index, query);
+                return find.set_query(index, query).map(Message::Find);
+            }
+            find::Message::Scrolled(viewport) => {
+                find.scrolled(viewport);
                 return Task::none();
             }
             find::Message::Close => {
@@ -1538,7 +1552,7 @@ impl App {
                         let root = ws.vault.root.clone();
                         let rel: Box<str> = rel.into();
                         Task::perform(
-                            async move { Vault::scan(root).map_err(|e| e.to_string()) },
+                            timer::on_thread(move || Vault::scan(root).map_err(|e| e.to_string())),
                             move |result| Message::Rescanned(result, rel.clone()),
                         )
                     }
@@ -2731,7 +2745,7 @@ impl App {
             return Ok(Task::batch(tasks));
         };
         ws.load_crew();
-        self.rebuild_index();
+        tasks.push(self.rebuild_index());
         self.refresh_links();
         self.rebuild_graph();
         Ok(Task::batch(tasks))
@@ -2761,7 +2775,7 @@ impl App {
         }
         let _ = ws.store.get(SETTINGS_NOTE);
         let root = ws.vault.root.clone();
-        Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
+        Task::perform(timer::on_thread(move || Vault::scan(&root).map_err(|e| e.to_string())), Message::VaultRefreshed)
     }
 
     /// Hands unsaved edits to the store and starts a background write if the
@@ -2795,7 +2809,7 @@ impl App {
             return Task::none();
         };
         let save = match ws.store.take_save(&note.rel) {
-            Some(job) => Task::perform(async move { job.run() }, Message::Saved),
+            Some(job) => Task::perform(timer::on_thread(move || job.run()), Message::Saved),
             None => Task::none(),
         };
         match changed {
@@ -2823,17 +2837,19 @@ impl App {
             }
         }
         if nodes::is_graph(rel) || rel.eq_ignore_ascii_case(func::SAVED) || rel.eq_ignore_ascii_case(SETTINGS_NOTE) {
-            self.rebuild_index();
-            return Task::none();
+            return self.rebuild_index();
         }
         let Some(ws) = &mut self.workspace else {
             return Task::none();
         };
-        if !ws.runs.index.reads(rel) {
+        // While the index is built, the new one decides what runs (the
+        // pending run waits for it).
+        if ws.runs.indexing.is_none() && !ws.runs.index.reads(rel) {
             // Not an input, but maybe an output: what's out of date moves.
             if ws.runs.pinned.iter().any(|p| p == rel) && !ws.runs.running {
-                self.check_out_of_date();
+                let check = self.check_out_of_date();
                 self.rebuild_graph();
+                return check;
             }
             return Task::none();
         }
@@ -2841,50 +2857,161 @@ impl App {
         self.schedule_run()
     }
 
-    /// Re-reads every graph and `_funct.md` into the run index, keeps the
-    /// notes it touches in RAM, then checks what's out of date.
-    fn rebuild_index(&mut self) {
-        let Some(ws) = &mut self.workspace else { return };
-        let rels: Vec<String> = ws
+    /// Builds the function index again from every graph and `_funct.md`,
+    /// off the UI thread (`Message::IndexBuilt` → `index_built`). Texts the
+    /// store holds are used (they may be ahead of the disk); the rest are
+    /// read there, with every note a job touches that the store doesn't
+    /// hold yet. One build at a time: asked for meanwhile, it runs again
+    /// when this one lands.
+    fn rebuild_index(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        if ws.runs.indexing.is_some() {
+            ws.runs.index_again = true;
+            return Task::none();
+        }
+        let ticket = runs::ticket();
+        ws.runs.indexing = Some(ticket);
+        ws.runs.touched.clear();
+        fn held(store: &mut Store, rel: &str) -> Option<String> {
+            if store.is_loaded(rel) { store.get(rel).ok().map(str::to_owned) } else { None }
+        }
+        let graphs: Vec<(String, Option<String>)> = ws
             .vault
             .notes()
             .filter(|e| nodes::is_graph(&e.rel))
-            .map(|e| e.rel.to_string())
+            .map(|e| (e.rel.to_string(), held(&mut ws.store, &e.rel)))
             .collect();
-        let graphs: Vec<(String, String)> = rels
-            .into_iter()
-            .filter_map(|rel| {
-                let text = ws.store.get(&rel).ok()?.to_owned();
-                Some((rel, text))
-            })
-            .collect();
-        let saved = if ws.vault.note(func::SAVED).is_some() {
-            ws.store.get(func::SAVED).map(func::blocks).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let index = Index::build(&ws.vault, &graphs, &saved);
-        let files = index.files();
-        for rel in &files {
-            let _ = ws.store.pin(rel);
-        }
-        for rel in std::mem::replace(&mut ws.runs.pinned, files) {
-            ws.store.unpin(&rel);
-        }
-        ws.runs.index = Arc::new(index);
-        self.check_out_of_date();
+        let saved: Option<Option<String>> = ws.vault.note(func::SAVED).is_some().then(|| held(&mut ws.store, func::SAVED));
+        let have: std::collections::HashSet<String> = ws.store.loaded().map(str::to_owned).collect();
+        let vault = ws.vault.clone();
+        Task::perform(
+            timer::on_thread(move || {
+                let started = std::time::Instant::now();
+                let root = &vault.root;
+                let read = |rel: &str| std::fs::read_to_string(root.join(rel)).ok();
+                let graphs: Vec<(String, String)> = graphs
+                    .into_iter()
+                    .filter_map(|(rel, text)| {
+                        let text = text.or_else(|| read(&rel))?;
+                        Some((rel, text))
+                    })
+                    .collect();
+                let saved = saved
+                    .and_then(|text| text.or_else(|| read(func::SAVED)))
+                    .map(|text| func::blocks(&text))
+                    .unwrap_or_default();
+                let index = Index::build(&vault, &graphs, &saved);
+                let files = index.files();
+                let loaded = files
+                    .iter()
+                    .filter(|rel| !have.contains(*rel))
+                    .filter_map(|rel| obsession_core::store::load(root, rel).ok())
+                    .collect();
+                Arc::new(runs::IndexBuilt { ticket, index, files, loaded, took: started.elapsed() })
+            }),
+            Message::IndexBuilt,
+        )
     }
 
-    /// Which functions would change something if they ran now. Opening a
-    /// vault never changes files: those wires show "out of date" instead.
-    fn check_out_of_date(&mut self) {
-        let Some(ws) = &mut self.workspace else { return };
+    /// The function index arrived: the notes it read go into the store,
+    /// every note a job touches is pinned (the old pins released), then
+    /// what's out of date is checked and a run that waited for it starts.
+    fn index_built(&mut self, built: Arc<runs::IndexBuilt>) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        if ws.runs.indexing != Some(built.ticket) {
+            return Task::none();
+        }
+        ws.runs.indexing = None;
+        let started = std::time::Instant::now();
+        let built = Arc::unwrap_or_clone(built);
+        let touched = std::mem::take(&mut ws.runs.touched);
+        let mut taken = 0;
+        for loaded in built.loaded {
+            if !touched.contains(loaded.rel()) && ws.store.insert(loaded) {
+                taken += 1;
+            }
+        }
+        for rel in &built.files {
+            let _ = ws.store.pin(rel);
+        }
+        let old = std::mem::replace(&mut ws.runs.pinned, built.files);
+        ws.store.unpin_all(old.iter().map(String::as_str));
+        let jobs = built.index.jobs.len();
+        ws.runs.index = Arc::new(built.index);
+        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+            eprintln!(
+                "TIMING function index: {jobs} jobs, {} notes ({taken} read for the store) in {} ms off the UI thread, {} ms on it",
+                ws.runs.pinned.len(),
+                built.took.as_millis(),
+                started.elapsed().as_millis()
+            );
+        }
+        if std::mem::take(&mut ws.runs.index_again) {
+            // Graphs changed meanwhile: this one is already old.
+            return self.rebuild_index();
+        }
+        let check = self.check_out_of_date();
+        Task::batch([check, self.schedule_run()])
+    }
+
+    /// Which functions would change something if they ran now, worked out
+    /// off the UI thread (`Message::Checked` → `checked`). Opening a vault
+    /// never changes files: those wires show "out of date" instead. One
+    /// check at a time; asked for meanwhile, it runs again after.
+    fn check_out_of_date(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        if ws.runs.checking.is_some() {
+            ws.runs.check_again = true;
+            return Task::none();
+        }
+        let ticket = runs::ticket();
+        ws.runs.checking = Some(ticket);
         let files = run_files(ws);
         let index = ws.runs.index.clone();
-        ws.runs.out_of_date = runner::pending(&index, &files, ws.team.as_ref())
-            .into_iter()
-            .map(|(j, summary)| ((index.jobs[j].graph.clone(), index.jobs[j].line), summary))
-            .collect();
+        let team = ws.team.clone();
+        Task::perform(
+            timer::on_thread(move || {
+                let started = std::time::Instant::now();
+                let out_of_date = runner::pending(&index, &files, team.as_ref())
+                    .into_iter()
+                    .map(|(j, summary)| ((index.jobs[j].graph.clone(), index.jobs[j].line), summary))
+                    .collect();
+                Arc::new(runs::Checked { ticket, out_of_date, took: started.elapsed() })
+            }),
+            Message::Checked,
+        )
+    }
+
+    /// The out-of-date check arrived: the graph shows it.
+    fn checked(&mut self, checked: Arc<runs::Checked>) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        if ws.runs.checking != Some(checked.ticket) {
+            return Task::none();
+        }
+        ws.runs.checking = None;
+        let checked = Arc::unwrap_or_clone(checked);
+        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+            eprintln!(
+                "TIMING out of date: {} of {} in {} ms off the UI thread",
+                checked.out_of_date.len(),
+                ws.runs.index.jobs.len(),
+                checked.took.as_millis()
+            );
+        }
+        let again = std::mem::take(&mut ws.runs.check_again);
+        if ws.runs.out_of_date != checked.out_of_date {
+            ws.runs.out_of_date = checked.out_of_date;
+            self.rebuild_graph();
+        }
+        if again { self.check_out_of_date() } else { Task::none() }
     }
 
     /// Starts the pending run when its time comes (at most one a second).
@@ -2911,13 +3038,13 @@ impl App {
         let index = ws.runs.index.clone();
         let team = ws.team.clone();
         Task::perform(
-            async move {
+            timer::on_thread(move || {
                 let outcome = runner::run(&index, &files, &start, team.as_ref());
                 let summary = outcome.summary(&index);
                 let names = outcome.blocked.keys().map(|&j| (j, index.jobs[j].name().to_owned())).collect();
                 let ran = outcome.ran.iter().map(|&j| (index.jobs[j].graph.clone(), index.jobs[j].line)).collect();
                 Arc::new(RunResult { outcome, summary, names, ran })
-            },
+            }),
             Message::RunDone,
         )
     }
@@ -2942,7 +3069,7 @@ impl App {
         if let Some(search) = &mut ws.search { search.update(rel, text); }
         ws.store.set(rel, text.to_owned());
         let save = match ws.store.take_save(rel) {
-            Some(job) => Task::perform(async move { job.run() }, Message::Saved),
+            Some(job) => Task::perform(timer::on_thread(move || job.run()), Message::Saved),
             None => Task::none(),
         };
         Task::batch([timers, save])
@@ -3015,7 +3142,7 @@ impl App {
         if !notes.is_empty() {
             self.status = Some(notes.join(" · "));
         }
-        self.check_out_of_date();
+        tasks.push(self.check_out_of_date());
         self.rebuild_graph();
         tasks.push(self.schedule_run());
         Task::batch(tasks)
@@ -3064,7 +3191,7 @@ impl App {
                 if n == 1 { "" } else { "s" }
             ),
         });
-        self.check_out_of_date();
+        tasks.push(self.check_out_of_date());
         self.rebuild_graph();
         Task::batch(tasks)
     }
@@ -3087,6 +3214,11 @@ impl App {
                 if obsession_core::live::is_picture(&rel) {
                     self.pictures.forget(&rel);
                 }
+            }
+            if ws.runs.indexing.is_some()
+                && let Some(rel) = runs::rel_of(&root, &event.path)
+            {
+                ws.runs.touched.insert(rel);
             }
             if runs::rel_of(&root, &event.path).is_some() && ws.outside.queued.insert(event.path.clone()) {
                 ws.outside.queue.push_back(event.path);
@@ -3188,7 +3320,7 @@ impl App {
         if !to_read.is_empty() {
             // One after another, off the UI thread.
             tasks.push(Task::perform(
-                async move {
+                timer::on_thread(move || {
                     to_read
                         .into_iter()
                         .map(|(rel, path)| {
@@ -3196,7 +3328,7 @@ impl App {
                             (rel, text)
                         })
                         .collect()
-                },
+                }),
                 Message::OutsideRead,
             ));
             return Task::batch(tasks);
@@ -3303,7 +3435,7 @@ impl App {
         r.running = true;
         r.last = Some(std::time::Instant::now());
         let root = ws.vault.root.clone();
-        Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
+        Task::perform(timer::on_thread(move || Vault::scan(&root).map_err(|e| e.to_string())), Message::VaultRefreshed)
     }
 
     /// A rescan landed: one asked for meanwhile follows, after the gap.
@@ -3504,7 +3636,7 @@ impl App {
                         return Task::none();
                     }
                     let root = ws.vault.root.clone();
-                    Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
+                    Task::perform(timer::on_thread(move || Vault::scan(&root).map_err(|e| e.to_string())), Message::VaultRefreshed)
                 };
                 let Some(ws) = &mut self.workspace else {
                     return task;
@@ -3771,7 +3903,7 @@ impl App {
         Task::batch([
             save,
             Task::perform(
-                async move { Vault::scan(root).map_err(|e| e.to_string()) },
+                timer::on_thread(move || Vault::scan(root).map_err(|e| e.to_string())),
                 move |result| Message::Rescanned(result, rel.clone()),
             ),
         ])
@@ -3898,7 +4030,7 @@ impl App {
                         Task::batch([
                             save,
                             Task::perform(
-                                async move { Vault::scan(root).map_err(|e| e.to_string()) },
+                                timer::on_thread(move || Vault::scan(root).map_err(|e| e.to_string())),
                                 move |result| Message::Rescanned(result, rel.clone()),
                             ),
                         ])

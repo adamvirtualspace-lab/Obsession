@@ -95,7 +95,8 @@ refused. Every edit in the function editor undoes with Ctrl+Z, saved functions
 in `_funct.md` included, in turn with the graph's own edits.
 
 **Search:** Ctrl+Shift+F (or **Search** in the toolbar) finds every line that
-has all the words you type, in every note, ignoring case. Matches are
+has all the words you type, in every note, ignoring case (accented and
+non-Latin letters too: `équipe` finds `ÉQUIPE`). Matches are
 highlighted; Up and Down move through them, Enter or a click opens the note at
 that line, and Esc closes the search. The first search
 reads every note once (about a second for 10,000 notes); after that it's

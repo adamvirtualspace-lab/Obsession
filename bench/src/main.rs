@@ -275,6 +275,9 @@ fn runs(dir: &Path) -> Result<(), String> {
     let start = Instant::now();
     let pending = runner::pending(&index, &texts, None);
     println!("out of date: {} of {} in {:.0?}", pending.len(), index.jobs.len(), start.elapsed());
+    for (j, summary) in pending.iter().take(3) {
+        println!("  {} line {}: {summary}", index.jobs[*j].graph, index.jobs[*j].line);
+    }
     Ok(())
 }
 
@@ -295,8 +298,23 @@ fn search(dir: &Path) -> Result<(), String> {
         (held() - before) / 1024,
         peak / 1024
     );
+    let texts: Vec<String> = rels.iter().filter_map(|r| fs::read_to_string(dir.join(r)).ok()).collect();
     let start = Instant::now();
-    let r = index.query("task review", 300);
-    println!("query: {} lines in {} notes in {:.0?}", r.total, r.notes, start.elapsed());
+    let folded: usize = texts.iter().map(|t| obsession_core::search::fold(t).len()).sum();
+    println!("fold: {} KB in {:.0?}", folded / 1024, start.elapsed());
+    let start = Instant::now();
+    let lowered: usize = texts.iter().map(|t| t.to_ascii_lowercase().len()).sum();
+    println!("ASCII lowercase: {} KB in {:.0?}", lowered / 1024, start.elapsed());
+    for query in ["task", "review noor", "sh042", "Ünïcödé", "nothing like this"] {
+        let start = Instant::now();
+        let r = index.query(query, 300);
+        println!("  \"{query}\": {} lines in {} notes in {:.1?}", r.total, r.notes, start.elapsed());
+    }
+    let start = Instant::now();
+    let mut lines = 0;
+    for rel in rels.iter().take(100) {
+        lines += index.unlinked(rel, 200).total;
+    }
+    println!("unlinked mentions for 100 notes in {:.0?} ({lines} lines)", start.elapsed());
     Ok(())
 }

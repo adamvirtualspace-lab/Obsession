@@ -449,8 +449,9 @@ How it works:
 
 Known limits, for later:
 
-- The index and the out-of-date check run on the UI thread. Fine for dozens of
-  functions; a vault with hundreds should move them to the background.
+- ~~The index and the out-of-date check run on the UI thread. Fine for dozens
+  of functions; a vault with hundreds should move them to the background.~~
+  Done in milestone 11, item 3.
 - Only the newest run can be undone, from the Runs panel (not Ctrl+Z).
 - A note changed in another app while it has unsaved edits here keeps the
   edits here (with a warning), and they are saved over the other change.
@@ -539,9 +540,11 @@ What changed:
 
 Known limits, for later:
 
-- Search ignores case for ASCII letters only (`É` doesn't match `é`).
-- Memory with search built grows by more than the 7 MB of text (138 MB vs
-  115 MB with the results list open); not looked into yet.
+- ~~Search ignores case for ASCII letters only (`É` doesn't match `é`).~~
+  Done in milestone 11, item 3.
+- ~~Memory with search built grows by more than the 7 MB of text (138 MB vs
+  115 MB with the results list open); not looked into yet.~~ Found and cut
+  in milestone 11, item 3.
 - Compact layout doesn't change the editor's line spacing or the graph cards.
 - Crew portraits are still initials. → Milestone 10.
 
@@ -1249,6 +1252,70 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
 3. **Scale and search.** The function index and the out-of-date check move
    off the UI thread; search ignores case beyond ASCII (`É` matches `é`);
    find out why memory with search built grows by more than its text.
+
+   ✅ **Done (November 2026).** Measured on a 10,000-note vault with 1,000
+   function wires in 100 graphs (`obsession-bench gen`, then `graphs <dir>
+   1000`; `runs` and `search` time the parts):
+
+   | What | Before | After |
+   |---|---|---|
+   | Function index (vault open, a graph edited) | ~340 ms on the UI thread (2,000 notes read and pinned) | **1–6 ms** on it; 60–680 ms in the background |
+   | Out-of-date check (after a run, an output changed) | 29 ms on the UI thread | **0 ms** on it; 25 ms in the background |
+   | Function index at startup, link index read cold | waited for the link index (3–29 s) | lands in under a second |
+   | Search: a query / unlinked mentions of a note | 1–5.6 ms / 0.5 ms, ASCII case only | the same, case beyond ASCII ignored |
+   | Memory: search built / 300 hits shown | +10.4 MB / +8.6 MB | +9.1 MB / **+0.4 MB** |
+
+   - **The function index in the background** (`App::rebuild_index` →
+     `Message::IndexBuilt` → `index_built`). Graph texts the store holds go
+     along (they may be ahead of the disk); everything else, the notes the
+     jobs touch included, is read on that thread (`store::load`) and handed
+     to the store as if it had read them (`Store::insert`, which never
+     replaces what it holds), so pinning them reads nothing on the UI
+     thread. Notes changed on disk meanwhile (`Runs::touched`) are read by
+     the store itself. One build at a time; a graph changed meanwhile
+     builds again when it lands. A run that comes due while the index is
+     built waits for it, and the new index decides what it runs.
+   - **The out-of-date check in the background** (`check_out_of_date` →
+     `Message::Checked` → `checked`): one at a time, asked for again
+     meanwhile it runs once more after; the graph is redrawn only if what's
+     out of date changed. Each piece of work has a `runs::ticket`, so a
+     result for an older request or another vault is dropped.
+   - **Blocking work on threads of its own** (`timer::on_thread`). iced polls
+     every task one `update` returns as one future, so a long job blocked
+     the others batched with it: at startup the function index waited for
+     the whole link index, and opening search held up the save batched with
+     it. The vault scan and rescans, the link index, search, function runs,
+     outside reads, saves and picture decoding now each run on their own
+     thread. The vault is shared with them as an `Arc<Vault>`.
+   - **Case beyond ASCII** (`search::fold`): every letter whose lowercase
+     has the same UTF-8 length is lowered (`É` → `é`, `Σ` → `σ`, `Ж` → `ж`,
+     a final `ς` → `σ`), so offsets still match the real line; the few
+     others (`İ`, the Kelvin sign) match only as written. Used by search and
+     unlinked mentions.
+   - **Where search's memory went.** The "7 MB of text" was already two
+     copies: 3.5 MB of notes and a lowercased copy with the same offsets,
+     plus 1.8 MB of paths and lookups (8.8 MB, counted with a counting
+     allocator in `obsession-bench search`). The copy stays: folding every
+     note on each query instead saved 4 MB but made a query 6–10 ms and
+     unlinked mentions 10× slower. The lists are shrunk after building
+     (8.45 MB). The rest of the growth was the results list: all 300 rows
+     were laid out, about 28 KB of text layout each. It's a virtual list
+     now (only the rows on screen), every row one line high; Up and Down
+     scroll the selected row into view, which they didn't before.
+
+   Checked in a scratch instance (`--profile measure`, scratch `APPDATA`):
+   the 1,000-wire vault opens with the function index landing first; an
+   edit made in another app while the link index was still reading ran its
+   wire and set the target task; the graph shows "Run 1 out of date" from
+   the background check; search's results scroll with Down past the first
+   screen without gaps; idle is 0 again once startup work is done.
+   `OBSESSION_DEV_VSEARCH=ms;query[;downs]` drives search for memory checks.
+
+   Known limits, for later: background work runs at normal priority (the
+   "below normal" in CPU above isn't done yet); a search result's line is
+   cut at the popup's edge instead of wrapping; reading 10,000 notes the
+   first time after they were written can take tens of seconds on Windows
+   (the virus scanner), which delays the link index and search, not the UI.
 4. **The graph and crew, finished.** Cards matched to the Possess mockup;
    the inputs node's place saved; an `id` renamed from the editor;
    highlighting and drop targets past a card's first 8 rows; status formats
