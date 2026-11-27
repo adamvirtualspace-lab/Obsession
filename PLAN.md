@@ -1336,6 +1336,16 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
   same function after a `git pull` produce the same file.
 - **Link resolution differences with Obsidian.** Test against a real Obsidian
   vault with duplicate file names.
+- **A crash when a tool moves and resizes the window across monitors with
+  different scaling in one step** (found November 2026, left as is). Windows
+  then briefly reports a negative inner height (the window smaller than its
+  own frame); winit 0.30.13 reads it as unsigned (−40 becomes 65,496),
+  iced_winit passes it on (it only skips 0), and wgpu panics on a surface
+  over 8,192. Dragging the window or Win+Shift+arrow between a 100% and a
+  225% monitor is safe (tried five times); window-layout tools that set
+  position and size together (e.g. FancyZones) can hit it. The fix, if it
+  matters: a patched copy of iced_winit that treats a size of 0x8000 or more
+  as 0, so the frame is skipped like a minimised window's.
 
 ## Decisions so far
 
