@@ -1357,4 +1357,8 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
 - Links use Obsidian's shortest unique name.
 - Crew badges compare `@` mentions on unfinished tasks with the median of the
   rest of the crew.
+- Clicking a task's last status keeps it there only in a format of the note's
+  or the team's own. With the default `[ ]` / `[x]` a click toggles, as a
+  checkbox in Obsidian does (`Format::click`; November 2026, after a checked
+  task in a plain note couldn't be unchecked by clicking).
 - Windows first.

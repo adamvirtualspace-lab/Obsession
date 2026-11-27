@@ -879,9 +879,10 @@ impl Note {
 
     // ---- Tasks ----
 
-    /// Moves `task` to the next status in the format.
+    /// Moves `task` to the next status in the format (`Format::click`: in
+    /// the built-in format, done goes back to to do).
     pub fn advance(&mut self, task: Task) -> Performed {
-        match self.format.next(task.ch) {
+        match self.format.click(task.ch, self.source) {
             Next::To(next) => Performed {
                 timers: self.set_status(task, next),
                 message: None,

@@ -1,7 +1,9 @@
 //! One drawn line of Live Preview: styled spans, like iced's rich text, but a
 //! press reports *where* in the text it landed (a byte offset into the drawn
 //! text), so the app can put the caret on the matching raw character.
-//! Spans with a link (status chips, links) show a pointer.
+//! Spans with a link (status chips, links) show a pointer. A hovered link
+//! is underlined; a hovered status chip (`quiet`) grows instead (`POP`),
+//! drawn over the line so nothing around it moves.
 
 use std::cell::Cell;
 
@@ -15,6 +17,9 @@ use iced::widget::text::{Alignment, LineHeight, Shaping, Wrapping};
 use iced::{Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Vector};
 
 type P = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+/// How much a hovered status chip grows.
+const POP: f32 = 1.3;
 
 /// What a press on the line hit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +47,12 @@ pub struct LiveText<'a, Message> {
     /// under the cursor as it moves over this line.
     on_drag: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_press: Box<dyn Fn(Press) -> Message + 'a>,
+    /// Links (by their value) that grow when hovered instead of getting an
+    /// underline: status boxes, where a line would cross the symbol.
+    quiet: Vec<usize>,
+    /// What's behind the line, so a growing chip can cover its own symbol.
+    /// Without it, a quiet link just shows the pointer.
+    ground: Option<Color>,
 }
 
 impl<'a, Message> LiveText<'a, Message> {
@@ -60,7 +71,53 @@ impl<'a, Message> LiveText<'a, Message> {
             wrapping: Wrapping::WordOrGlyph,
             on_drag: None,
             on_press: Box::new(on_press),
+            quiet: Vec::new(),
+            ground: None,
         }
+    }
+
+    /// Links (by their value) that grow when hovered instead of getting an
+    /// underline, drawn on `ground`.
+    pub fn quiet(mut self, links: Vec<usize>, ground: Color) -> Self {
+        self.quiet = links;
+        self.ground = Some(ground);
+        self
+    }
+
+    /// The hovered span `index` drawn `POP` times bigger, if it's a quiet link.
+    fn pop(&self, index: usize) -> Option<(usize, P)> {
+        self.ground?;
+        let span = self.spans.get(index)?;
+        if !span.link.is_some_and(|link| self.quiet.contains(&link)) {
+            return None;
+        }
+        let size = Pixels(span.size.unwrap_or(self.size).0 * POP);
+        // Laid out the way the line is, only bigger: the line's own line
+        // height, and a space in the line's font after the symbol. A line
+        // puts its baseline from every font on it (the text's and the
+        // symbol's), so without the space the symbol alone would sit at
+        // another height in its box. `draw` then centres the symbol's own
+        // box on the small one, so it grows from its middle.
+        let line_height = match span.line_height.unwrap_or(self.line_height) {
+            LineHeight::Relative(r) => LineHeight::Relative(r),
+            LineHeight::Absolute(p) => LineHeight::Absolute(Pixels(p.0 * POP)),
+        };
+        let spans: [Span<'_, usize, Font>; 2] = [
+            Span::new(&*span.text).size(size).font(span.font.unwrap_or(self.font)),
+            Span::new(" ").size(size).font(self.font),
+        ];
+        let paragraph = P::with_spans(iced::advanced::Text {
+            content: spans.as_slice(),
+            bounds: Size::INFINITE,
+            size,
+            line_height,
+            font: self.font,
+            align_x: Alignment::Default,
+            align_y: alignment::Vertical::Top,
+            shaping: Shaping::Advanced,
+            wrapping: Wrapping::None,
+        });
+        Some((index, paragraph))
     }
 
     /// Writes the laid-out height here, so the page can skip drawing lines
@@ -117,6 +174,8 @@ struct State {
     spans: Vec<Span<'static, usize, Font>>,
     paragraph: P,
     hovered_link: Option<usize>,
+    /// The hovered status chip, drawn bigger: (span index, its paragraph).
+    pop: Option<(usize, P)>,
     /// The last offset reported while dragging, so moves within one
     /// character don't repeat it.
     dragged: Option<usize>,
@@ -132,6 +191,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
             spans: Vec::new(),
             paragraph: P::default(),
             hovered_link: None,
+            pop: None,
             dragged: None,
         })
     }
@@ -165,8 +225,19 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         if state.spans != self.spans {
             state.paragraph = P::with_spans(text);
             state.spans = self.spans.iter().cloned().map(Span::to_static).collect();
+            // A click changed the chip under the pointer: grow the new one.
+            state.pop = state.pop.take().and_then(|(index, _)| self.pop(index));
         } else if state.paragraph.bounds() != bounds {
             state.paragraph.resize(bounds);
+        }
+        // `OBSESSION_DEV_POP=1`: every line's first status chip drawn as if
+        // hovered, so a screenshot shows how they grow.
+        #[cfg(debug_assertions)]
+        if state.pop.is_none()
+            && std::env::var_os("OBSESSION_DEV_POP").is_some()
+            && let Some(index) = (0..self.spans.len()).find(|&i| self.pop(i).is_some())
+        {
+            state.pop = self.pop(index);
         }
         // An empty line still takes one line of height.
         let line = self.line_height.to_absolute(self.size).0;
@@ -224,7 +295,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
                 .to_absolute(size);
             let color = span.color.unwrap_or(self.color);
             let baseline = translation + Vector::new(0.0, size.0 + (line_height.0 - size.0) / 2.0);
-            if span.underline || (hovered && span.link.is_some()) {
+            let hover_line = hovered && span.link.is_some_and(|link| !self.quiet.contains(&link));
+            if span.underline || hover_line {
                 for region in &regions {
                     renderer.fill_quad(
                         renderer::Quad {
@@ -255,6 +327,32 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         }
 
         renderer.fill_paragraph(&state.paragraph, bounds.position(), self.color, *viewport);
+
+        // The hovered status chip, bigger, over its own symbol: the symbol is
+        // covered with what's behind it (its highlight, or the ground), and
+        // the big one is centred on it.
+        if let (Some((index, big)), Some(ground)) = (&state.pop, self.ground)
+            && let Some(span) = self.spans.get(*index)
+            && let Some(region) = state.paragraph.span_bounds(*index).first().copied()
+        {
+            let behind = match span.highlight.map(|h| h.background) {
+                Some(iced::Background::Color(color)) => color,
+                _ => ground,
+            };
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: region + translation,
+                    ..Default::default()
+                },
+                behind,
+            );
+            // The big symbol's own box (span 0), centred on the small one's.
+            let big_box = big.span_bounds(0).first().copied().unwrap_or(Rectangle::new(Point::ORIGIN, big.min_bounds()));
+            // Glyphs land on whole pixels; half a pixel down evens out the
+            // rounding (measured: otherwise the big one sits ~1 px high).
+            let at = region.center() + translation - (big_box.center() - Point::ORIGIN) + Vector::new(0.0, 0.5);
+            renderer.fill_paragraph(big, at, span.color.unwrap_or(self.color), *viewport);
+        }
     }
 
     fn update(
@@ -278,6 +376,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for LiveText<'_, Mess
         });
         if hovered != state.hovered_link {
             state.hovered_link = hovered;
+            state.pop = hovered.and_then(|index| self.pop(index));
             shell.request_redraw();
         }
 

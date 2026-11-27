@@ -1105,6 +1105,7 @@ impl Live {
                             cell: Some(c),
                             offset,
                         })
+                        .quiet(chips(drawn), if header { theme::RAISED } else { theme::BG })
                         .measure_tallest(&self.heights[line])
                         .size(TEXT_SIZE - 1.0)
                         .line_height(LINE_HEIGHT)
@@ -1143,6 +1144,7 @@ impl Live {
                     cell: None,
                     offset,
                 })
+                .quiet(chips(drawn), theme::BG)
                 .measure(&self.heights[line])
                 .size(if mono { CODE_SIZE } else { size })
                 .line_height(if mono { CODE_LINE_HEIGHT } else { LINE_HEIGHT })
@@ -1775,6 +1777,12 @@ fn styled<'a>(
     } else {
         span
     }
+}
+
+/// The status boxes in a drawn line (their seg indices): hovering one
+/// grows it instead of drawing an underline through the symbol.
+fn chips(drawn: &Drawn) -> Vec<usize> {
+    drawn.segs.iter().enumerate().filter(|(_, s)| s.style.has(Style::CHIP)).map(|(i, _)| i).collect()
 }
 
 #[cfg(test)]

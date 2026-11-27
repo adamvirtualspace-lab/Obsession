@@ -55,6 +55,9 @@ Rules:
 
 - **Click** moves a task to the next status in its file's format. The last
   status stays where it is, so a finished shot can't be un-finished by accident.
+  A note without a format of its own (no `statuses:` in it or in
+  `_settings.md`) uses the default `[ ]` / `[x]`, and there a click is a
+  checkbox: `[x]` goes back to `[ ]`.
 - **Right-click** opens a menu of every status in the format, each with its
   symbol, label and character, the current one highlighted. Pick any of them.
 - This works wherever a status shows: the editor, the preview and the graph.

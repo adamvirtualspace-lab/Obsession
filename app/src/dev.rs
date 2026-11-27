@@ -27,6 +27,7 @@
 //! - `OBSESSION_DEV_EXIT=1`  quit after the screenshot
 //! - `OBSESSION_DEV_SIZE=w,h`  start with this window size (read at startup)
 //! - `OBSESSION_DEV_TIMING=1`  print how long the link index and search took (stderr)
+//! - `OBSESSION_DEV_POP=1`  draw every line's first status chip as if hovered (bigger)
 //! - `OBSESSION_DEV_PULSE_MS=8000`  slow down the run glow to look at it
 //! - `OBSESSION_DEV_PAN=600`  pan the open graph by itself for 600 frames,
 //!   then print frame intervals and cached-layer build times (stderr); with

@@ -96,6 +96,17 @@ impl Format {
         }
     }
 
+    /// What a click on a task does. With a format of the file's or the
+    /// team's own, `next`: the last status stays put, so a finished shot
+    /// isn't un-finished by accident. With the built-in one (a plain note's
+    /// `[ ]` / `[x]`) it's a checkbox: the last goes back to the first.
+    pub fn click(&self, ch: char, source: Source) -> Next {
+        match self.next(ch) {
+            Next::Finished if source == Source::Default => Next::To(self.statuses[0].ch),
+            next => next,
+        }
+    }
+
     /// The finished status: the last one.
     pub fn finished(&self) -> char {
         self.statuses.last().map_or('x', |s| s.ch)
@@ -384,6 +395,16 @@ mod tests {
         assert_eq!(format.next('X'), Next::Finished);
         assert_eq!(format.next('k'), Next::Unknown);
         assert!(format.is_finished('x'));
+        // A format of its own keeps finished tasks finished on a click.
+        assert_eq!(format.click('x', Source::Note), Next::Finished);
+        assert_eq!(format.click('x', Source::Settings), Next::Finished);
+        assert_eq!(format.click('-', Source::Note), Next::To(' '));
+        // The built-in one is a checkbox: done goes back to to do.
+        let plain = Format::builtin();
+        assert_eq!(plain.click(' ', Source::Default), Next::To('x'));
+        assert_eq!(plain.click('x', Source::Default), Next::To(' '));
+        assert_eq!(plain.click('X', Source::Default), Next::To(' '));
+        assert_eq!(plain.click('?', Source::Default), Next::Unknown);
     }
 
     #[test]
