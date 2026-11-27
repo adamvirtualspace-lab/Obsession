@@ -175,7 +175,9 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
         tasks.push(later(800, Message::Dev(Step::Follow(uri))));
     }
     // Graph actions, `;`-separated: `move,card,x,y` `connect,a,b`
-    // `delcard,card` `delwire,wire` `open,card` `add,name`.
+    // `delcard,card` `delwire,wire` `open,card` `add,name`; also, graph or
+    // not, `sidebar` (hide/show the file tree) and `sbdrag,x` (drag its
+    // edge to `x`).
     if let Some(script) = var("OBSESSION_DEV_GRAPH") {
         use crate::graph::{Message as G, Selected};
         let mut delay = 900;
@@ -214,6 +216,14 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
                 Some("settings") => Message::Settings(crate::SettingsMessage::Open),
                 Some("crew") => Message::Settings(crate::SettingsMessage::Crew(parts[1..].join(","))),
                 Some("save") => Message::Settings(crate::SettingsMessage::Save),
+                Some("sidebar") => Message::ToggleSidebar,
+                // Drag the file tree's edge to `x`: `sbdrag,x`.
+                Some("sbdrag") => {
+                    tasks.push(later(delay, Message::SidebarGrab));
+                    tasks.push(later(delay + 30, Message::SidebarDrag(n(1))));
+                    delay += 60;
+                    Message::SidebarRelease
+                }
                 // Status rows: `stadd`, `stset,row,c|s|l,value`, `stup,row`, `strm,row`.
                 Some("stadd") => Message::Settings(crate::SettingsMessage::StatusAdd),
                 Some("stset") => {

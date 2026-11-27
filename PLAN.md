@@ -1374,6 +1374,20 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
    dragged by mouse saved `@130,781`; Settings saved three statuses and the
    open note took them; idle stayed at 0.
 
+### After milestone 11
+
+- **The file tree resizes and hides** (November 2026). Its right edge is a
+  handle: it lights up under the pointer with "Drag to resize", and dragging
+  sets the width (180 to 600 px, leaving the page at least 400). The panel
+  button at the toolbar's left end hides and shows it. Width and visibility
+  are this computer's preferences (`prefs.txt`: `sidebar_width`, `sidebar`),
+  saved when a drag ends or the button is pressed. Hidden, the tree and its
+  edge stay in the layout at zero width, so the page keeps its scroll and
+  focus; wrapping them in a zero-width container instead sent the page back
+  to the top (found with `OBSESSION_DEV_TIMING`, which now logs the Live
+  view's offset, and the dev hook's `sidebar` / `sbdrag,x`). Checked by mouse
+  in a scratch instance: drag, hide, show, the tooltip, and the place kept.
+
 ## Risks
 
 - **iced's editor is not Obsidian's.** Fine for notes and tasks. If it gets in

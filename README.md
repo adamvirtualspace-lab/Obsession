@@ -97,6 +97,10 @@ function), and one Ctrl+Z puts it all back. A name that's already taken is
 refused. Every edit in the function editor undoes with Ctrl+Z, saved functions
 in `_funct.md` included, in turn with the graph's own edits.
 
+**File tree:** drag its right edge to make it wider or narrower, and the panel
+button at the toolbar's left end hides or shows it. Both are remembered on this
+computer.
+
 **Search:** Ctrl+Shift+F (or **Search** in the toolbar) finds every line that
 has all the words you type, in every note, ignoring case (accented and
 non-Latin letters too: `équipe` finds `ÉQUIPE`). Matches are

@@ -101,7 +101,7 @@ impl Tree {
         self.height = viewport.bounds().height;
     }
 
-    pub fn view<'a>(&'a self, vault: &'a Vault, open: Option<&str>) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, vault: &'a Vault, open: Option<&str>, width: f32) -> Element<'a, Message> {
         let total = self.visible.len();
         let first = ((self.offset / theme::row_height()).floor() as usize).min(total);
         // One extra row above and below so scrolling never shows a gap.
@@ -163,7 +163,7 @@ impl Tree {
                 .padding([10, 16]),
             body,
         ]
-        .width(Length::Fixed(260.0))
+        .width(Length::Fixed(width))
         .height(Fill)
         .into()
     }

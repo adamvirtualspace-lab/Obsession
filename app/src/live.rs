@@ -291,9 +291,11 @@ impl Live {
             let tables: f32 = (0..self.doc.len()).filter(|&i| matches!(self.rendered[i], Rendered::Cells(_))).map(|i| self.line_height(i)).sum();
             let rules = (0..self.doc.len()).filter(|&i| matches!(&self.rendered[i], Rendered::Line(d) if d.rule)).count();
             eprintln!(
-                "TIMING live heights: {count} of {} lines drawn, estimates off by {off:.0} px ({net:+.0} net), content {:.0} px, ours {ours:.0} px, table rows {tables:.0} px, rules {rules}",
+                "TIMING live heights: {count} of {} lines drawn, estimates off by {off:.0} px ({net:+.0} net), content {:.0} px, ours {ours:.0} px, table rows {tables:.0} px, rules {rules}, at y {:.0} of width {:.0}",
                 self.doc.len(),
-                self.content_height
+                self.content_height,
+                self.scroll.0,
+                self.bounds.width
             );
         }
     }

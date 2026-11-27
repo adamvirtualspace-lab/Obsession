@@ -112,6 +112,15 @@ enum Message {
     NewNote(new_note::Message),
     StartNewNote,
     Sidebar(sidebar::Message),
+    /// The toolbar's panel button: hide or show the file tree.
+    ToggleSidebar,
+    /// The pointer went onto (`true`) or off the file tree's edge.
+    SidebarEdgeHover(bool),
+    /// Pressed on the file tree's edge: dragging it sets the width.
+    SidebarGrab,
+    /// While resizing: the pointer's x in the window.
+    SidebarDrag(f32),
+    SidebarRelease,
     Edit(text_editor::Action),
     Timer(u64, Timer),
     Saved(SaveResult),
@@ -347,6 +356,38 @@ fn mention_states(text: &str, crew: &[Member]) -> Vec<(String, links::LinkState)
     out
 }
 
+/// The toolbar's panel button: a little window with its left pane filled
+/// while the file tree shows. Drawn from boxes, so it doesn't need an icon
+/// font.
+fn sidebar_button<'a>(shown: bool) -> Element<'a, Message> {
+    let color = if shown { theme::TEXT } else { theme::MUTED };
+    let pane = container(Space::new().width(5).height(Fill)).style(move |_: &iced::Theme| container::Style {
+        background: shown.then_some(iced::Background::Color(color)),
+        border: iced::Border { color, width: 0.0, radius: 1.0.into() },
+        ..container::Style::default()
+    });
+    let icon = container(row![pane, rule::vertical(1)].height(Fill))
+        .padding(2)
+        .width(iced::Length::Fixed(17.0))
+        .height(iced::Length::Fixed(14.0))
+        .style(move |_: &iced::Theme| container::Style {
+            border: iced::Border { color, width: 1.5, radius: 3.0.into() },
+            ..container::Style::default()
+        });
+    iced::widget::tooltip(
+        button(container(icon).center_y(iced::Length::Fixed(17.0)))
+            .on_press(Message::ToggleSidebar)
+            .padding(theme::tool_pad())
+            .style(theme::tool(false)),
+        container(text(if shown { "Hide the file tree" } else { "Show the file tree" }).size(theme::SMALL).color(theme::TEXT))
+            .padding([4, 8])
+            .style(theme::popup),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(4)
+    .into()
+}
+
 /// The vault-root settings note.
 const SETTINGS_NOTE: &str = "_settings.md";
 
@@ -388,6 +429,13 @@ struct App {
     /// The open `_nodes.md`, as a graph.
     graph: Option<graph::Graph>,
     show_graph: bool,
+    /// The file tree's width (logical pixels) and whether it shows; this
+    /// computer's preferences.
+    sidebar_width: f32,
+    show_sidebar: bool,
+    /// The pointer is on the tree's edge, or dragging it.
+    sidebar_edge: bool,
+    resizing_sidebar: bool,
     show_link_wires: bool,
     /// The quick switcher is picking a note for the graph, not opening one.
     adding_node: bool,
@@ -544,10 +592,33 @@ fn end_kind(end: &End) -> func::PortKind {
     }
 }
 
+/// How narrow and how wide the file tree may be dragged.
+const SIDEBAR_MIN: f32 = 180.0;
+const SIDEBAR_MAX: f32 = 600.0;
+
 impl App {
+    /// Writes the tree's width and visibility to this computer's prefs, if
+    /// they changed.
+    fn save_sidebar_prefs(&self) {
+        let old = settings::prefs();
+        let new = settings::Prefs {
+            sidebar_width: self.sidebar_width.round() as u32,
+            sidebar_hidden: !self.show_sidebar,
+            ..old
+        };
+        if new != old {
+            settings::save_prefs(new);
+        }
+    }
+
     fn boot() -> (Self, Task<Message>) {
-        theme::set_compact(settings::prefs().compact);
+        let prefs = settings::prefs();
+        theme::set_compact(prefs.compact);
         let app = Self {
+            sidebar_width: prefs.sidebar_width as f32,
+            show_sidebar: !prefs.sidebar_hidden,
+            sidebar_edge: false,
+            resizing_sidebar: false,
             workspace: None,
             mode: Mode::default(),
             switcher: None,
@@ -1054,6 +1125,34 @@ impl App {
             }
             Message::Resized(size) => {
                 self.window = size;
+                Task::none()
+            }
+            Message::ToggleSidebar => {
+                self.show_sidebar = !self.show_sidebar;
+                self.sidebar_edge = false;
+                self.save_sidebar_prefs();
+                Task::none()
+            }
+            Message::SidebarEdgeHover(on) => {
+                self.sidebar_edge = on;
+                Task::none()
+            }
+            Message::SidebarGrab => {
+                self.resizing_sidebar = true;
+                Task::none()
+            }
+            Message::SidebarDrag(x) => {
+                if self.resizing_sidebar {
+                    // The page keeps at least 400 px.
+                    let most = (self.window.width - 400.0).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                    self.sidebar_width = x.round().clamp(SIDEBAR_MIN, most);
+                }
+                Task::none()
+            }
+            Message::SidebarRelease => {
+                if std::mem::take(&mut self.resizing_sidebar) {
+                    self.save_sidebar_prefs();
+                }
                 Task::none()
             }
             Message::Timer(id, timer) => {
@@ -3739,7 +3838,7 @@ impl App {
                 let folder = form.crew.replace('\\', "/").trim().trim_matches('/').to_owned();
                 let folder = if folder.is_empty() { crew::FOLDER.to_owned() } else { folder };
                 // This computer's preferences.
-                let prefs = settings::Prefs { compact: form.compact };
+                let prefs = settings::Prefs { compact: form.compact, ..settings::prefs() };
                 if prefs != settings::prefs() {
                     settings::save_prefs(prefs);
                 }
@@ -4271,9 +4370,20 @@ impl App {
         } else {
             Subscription::none()
         };
+        // Only while the file tree's edge is dragged: the pointer anywhere.
+        let resizing = if self.resizing_sidebar {
+            event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::SidebarDrag(position.x)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::SidebarRelease),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
             watch,
             pointer,
+            resizing,
             event::listen_with(shortcut_from_event).map(Message::Shortcut),
             window::close_requests().map(Message::CloseRequested),
             event::listen_with(|event, _, _| match event {
@@ -4296,11 +4406,42 @@ impl App {
             Some(ws) => {
                 let sidebar = container(
                     ws.tree
-                        .view(&ws.vault, ws.note.as_ref().map(|n| &*n.rel))
+                        .view(&ws.vault, ws.note.as_ref().map(|n| &*n.rel), if self.show_sidebar { self.sidebar_width } else { 0.0 })
                         .map(Message::Sidebar),
                 )
                 .style(theme::panel)
                 .height(Fill);
+                // Its right edge: a line that lights up under the pointer,
+                // dragged to resize the tree.
+                let lit = self.sidebar_edge || self.resizing_sidebar;
+                let edge = iced::widget::mouse_area(
+                    container(
+                        container(Space::new().width(if !self.show_sidebar { 0 } else if lit { 2 } else { 1 }).height(Fill))
+                            .style(move |_: &iced::Theme| container::Style {
+                                background: Some(iced::Background::Color(if lit { theme::ACCENT } else { theme::LINE })),
+                                ..container::Style::default()
+                            }),
+                    )
+                    .center_x(iced::Length::Fixed(if self.show_sidebar { 7.0 } else { 0.0 }))
+                    .height(Fill),
+                )
+                .on_press(Message::SidebarGrab)
+                .on_enter(Message::SidebarEdgeHover(true))
+                .on_exit(Message::SidebarEdgeHover(false))
+                .interaction(iced::mouse::Interaction::ResizingHorizontally);
+                let edge: Element<'_, Message> = if self.resizing_sidebar {
+                    edge.into()
+                } else {
+                    iced::widget::tooltip(
+                        edge,
+                        container(text("Drag to resize").size(theme::SMALL).color(theme::TEXT))
+                            .padding([4, 8])
+                            .style(theme::popup),
+                        iced::widget::tooltip::Position::FollowCursor,
+                    )
+                    .gap(4)
+                    .into()
+                };
 
                 let body: Element<'_, Message> = match &ws.note {
                     None => container(
@@ -4393,7 +4534,14 @@ impl App {
                     // widget tree (and its focus) when suggestions appear.
                     _ => stack![page].into(),
                 };
-                let mut middle = row![sidebar, page].height(Fill);
+                // Hidden, the tree and its edge stay in the layout at no
+                // width (their own widths are 0): the same widgets in the
+                // same places, so the page keeps its scroll and focus. (A
+                // zero-width container around them instead sent the page
+                // back to the top.)
+                let sidebar = container(sidebar).clip(true);
+                let edge = container(edge).clip(true);
+                let mut middle = row![sidebar, edge, page].height(Fill);
                 if ws.runs.show {
                     middle = middle.push(rule::vertical(1)).push(ws.runs.view().map(Message::Runs));
                 } else if self.show_backlinks && ws.note.is_some() && !(self.editor.is_some() && self.show_graph) {
@@ -4544,6 +4692,7 @@ impl App {
 
         container(
             row![
+                sidebar_button(self.show_sidebar),
                 button(text("Open folder").size(theme::SMALL))
                     .on_press(Message::PickFolder)
                     .padding(theme::tool_pad())
