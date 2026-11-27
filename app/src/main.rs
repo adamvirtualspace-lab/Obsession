@@ -37,7 +37,7 @@ use iced::{Element, Fill, Point, Size, Subscription, Task, event, window};
 
 use obsession_core::status::{self, Format, Source};
 use obsession_core::store::{SaveResult, Store};
-use obsession_core::links::{self, Backlink, LinkIndex};
+use obsession_core::links::{self, LinkIndex};
 use obsession_core::crew::{self, Member};
 use obsession_core::func::{self, Library, Origin};
 use obsession_core::func::eval::Bind;
@@ -170,7 +170,9 @@ enum Shortcut {
 }
 
 struct Workspace {
-    vault: Vault,
+    /// Shared with background work (the function index), never changed in
+    /// place: a rescan puts a new one here.
+    vault: Arc<Vault>,
     store: Store,
     tree: Tree,
     note: Option<Note>,
@@ -180,7 +182,7 @@ struct Workspace {
     links: LinkIndex,
     indexed: bool,
     /// Links to the open note.
-    backlinks: Vec<Backlink>,
+    backlinks: backlinks::Panel,
     /// Functions: what runs when, and the run log.
     runs: runs::Runs,
     /// The link index changed since its cache was written.
@@ -699,14 +701,14 @@ impl App {
                 );
                 self.pictures.clear();
                 let mut ws = Workspace {
-                    vault,
+                    vault: Arc::new(vault),
                     store,
                     tree,
                     note: None,
                     team: None,
                     links: LinkIndex::default(),
                     indexed: false,
-                    backlinks: Vec::new(),
+                    backlinks: backlinks::Panel::default(),
                     runs,
                     links_dirty: false,
                     search: None,
@@ -754,6 +756,16 @@ impl App {
             Message::Backlinks(backlinks::Message::Open(rel, line)) => {
                 self.open_at(rel, Some(Jump::Line(line)))
             }
+            Message::Backlinks(backlinks::Message::FindUnlinked) => {
+                let Some(ws) = &mut self.workspace else {
+                    return Task::none();
+                };
+                ws.backlinks.want_unlinked = true;
+                let save = self.save_now();
+                let build = self.build_search();
+                self.refresh_unlinked();
+                Task::batch([save, build])
+            }
             Message::Settle => Task::none(),
             Message::Graph(message) => self.graph_message(message),
             Message::ToggleGraph => {
@@ -784,6 +796,7 @@ impl App {
                 if let Some(find) = &mut self.find {
                     find.refresh(ws.search.as_ref());
                 }
+                self.refresh_unlinked();
                 Task::none()
             }
             Message::ToggleHand => {
@@ -843,7 +856,7 @@ impl App {
                 };
                 match result {
                     Ok(vault) if vault.root == ws.vault.root => {
-                        ws.vault = vault;
+                        ws.vault = Arc::new(vault);
                         ws.tree.refresh(&ws.vault);
                         ws.load_crew();
                         // A new note: empty, so nothing to read for its links.
@@ -889,7 +902,11 @@ impl App {
                             let rel = entry.rel.clone();
                             self.start_rename(&rel)
                         }
-                        _ => Task::none(),
+                        Some(entry) => {
+                            let form = NewNote::rename_folder(&entry.rel);
+                            self.start_form(form)
+                        }
+                        None => Task::none(),
                     },
                 }
             }
@@ -1003,7 +1020,7 @@ impl App {
                     return again;
                 }
                 let started = std::time::Instant::now();
-                ws.vault = vault;
+                ws.vault = Arc::new(vault);
                 ws.tree.refresh(&ws.vault);
                 ws.load_crew();
                 let crew = started.elapsed();
@@ -1375,13 +1392,22 @@ impl App {
         find.refresh(ws.search.as_ref());
         self.find = Some(find);
         let focus = operation::focus(find::input_id());
+        Task::batch([save, focus, self.build_search()])
+    }
+
+    /// Builds vault search off the UI thread, unless it's built or being
+    /// built (`Message::SearchBuilt`).
+    fn build_search(&mut self) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
         if ws.search.is_some() || ws.search_building {
-            return Task::batch([save, focus]);
+            return Task::none();
         }
         ws.search_building = true;
         let root = ws.vault.root.clone();
         let rels: Vec<Box<str>> = ws.vault.notes().map(|e| e.rel.clone()).collect();
-        let build = Task::perform(
+        Task::perform(
             async move {
                 let started = std::time::Instant::now();
                 let index = obsession_core::search::SearchIndex::build(&root, rels.iter().map(|r| &**r));
@@ -1391,8 +1417,7 @@ impl App {
                 (root, Built(Arc::new(std::sync::Mutex::new(Some(index)))))
             },
             |(root, built)| Message::SearchBuilt(root, built),
-        );
-        Task::batch([save, focus, build])
+        )
     }
 
     fn find_message(&mut self, message: find::Message) -> Task<Message> {
@@ -1448,9 +1473,14 @@ impl App {
     }
 
     fn start_rename(&mut self, rel: &str) -> Task<Message> {
+        self.start_form(NewNote::rename(rel))
+    }
+
+    /// Shows the new-note box for renaming, its text ready to edit.
+    fn start_form(&mut self, form: NewNote) -> Task<Message> {
         self.switcher = None;
         self.menu = None;
-        self.new_note = Some(NewNote::rename(rel));
+        self.new_note = Some(form);
         Task::batch([
             operation::focus(new_note::input_id()),
             operation::move_cursor_to_end(new_note::input_id()),
@@ -1459,10 +1489,12 @@ impl App {
 
     fn new_note_message(&mut self, message: new_note::Message) -> Task<Message> {
         if let (new_note::Message::Submit, Some(form)) = (&message, &self.new_note)
-            && let new_note::Purpose::Rename(old) = &form.purpose
+            && let new_note::Purpose::Rename(old) | new_note::Purpose::RenameFolder(old) = &form.purpose
         {
+            let folder = matches!(form.purpose, new_note::Purpose::RenameFolder(_));
             let (old, input) = (old.clone(), form.input.clone());
-            return match self.rename(&old, &input) {
+            let renamed = if folder { self.rename_folder(&old, &input) } else { self.rename(&old, &input) };
+            return match renamed {
                 Ok(task) => {
                     self.new_note = None;
                     task
@@ -2020,7 +2052,7 @@ impl App {
         }
         let _ = ws.store.get(func::SAVED);
         if let Ok(vault) = Vault::scan(&ws.vault.root) {
-            ws.vault = vault;
+            ws.vault = Arc::new(vault);
             ws.tree.refresh(&ws.vault);
         }
         self.status = Some("Created _funct.md with Wait For Done and Copy Status".into());
@@ -2502,22 +2534,84 @@ impl App {
         if ws.indexed {
             ws.mentions = ws.links.mention_counts(ws.team.as_ref(), None);
         }
-        ws.backlinks = if ws.indexed {
-            ws.links.backlinks(&note.rel, &ws.vault)
-        } else {
-            Vec::new()
+        let found = if ws.indexed { ws.links.backlinks(&note.rel, &ws.vault) } else { Vec::new() };
+        let builtin;
+        let format = match &ws.team {
+            Some(format) => format,
+            None => {
+                builtin = Format::builtin();
+                &builtin
+            }
         };
+        ws.backlinks.set_links(found, format);
+        self.refresh_unlinked();
+    }
+
+    /// Looks for the open note's unlinked mentions, once they're wanted and
+    /// search is built, if the ones shown are for another note.
+    fn refresh_unlinked(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        let (Some(note), Some(search)) = (&ws.note, &ws.search) else { return };
+        if !ws.backlinks.unlinked_stale(&note.rel) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let found = search.unlinked(&note.rel, backlinks::UNLINKED_LIMIT);
+        if std::env::var_os("OBSESSION_DEV_TIMING").is_some() {
+            eprintln!(
+                "TIMING unlinked mentions: {} lines in {} notes, {} µs",
+                found.total,
+                found.notes,
+                started.elapsed().as_micros()
+            );
+        }
+        ws.backlinks.unlinked = Some((note.rel.clone(), found));
     }
 
     /// Renames (or moves) a note and rewrites every link to it, the way
-    /// Obsidian does. Runs on this thread: the open note is saved first,
-    /// then the file is moved, then each linking note is rewritten and
-    /// saved (each write is atomic).
+    /// Obsidian does (see `move_path`).
     fn rename(&mut self, old: &str, input: &str) -> Result<Task<Message>, String> {
         let new_rel = vault::note_rel_from_input(input).map_err(str::to_owned)?;
         if new_rel == old {
             return Ok(Task::none());
         }
+        let Some(ws) = &self.workspace else {
+            return Ok(Task::none());
+        };
+        if ws.vault.note(&new_rel).is_some() && !new_rel.eq_ignore_ascii_case(old) {
+            return Err("A note with that name is already there".into());
+        }
+        self.move_path(old, &new_rel, false)
+    }
+
+    /// Renames (or moves) a folder with everything in it, and rewrites
+    /// every link into it that no longer leads there (see `move_path`).
+    fn rename_folder(&mut self, old: &str, input: &str) -> Result<Task<Message>, String> {
+        let new_rel = vault::folder_rel_from_input(input).map_err(str::to_owned)?;
+        if new_rel == old {
+            return Ok(Task::none());
+        }
+        let Some(ws) = &self.workspace else {
+            return Ok(Task::none());
+        };
+        if new_rel.to_lowercase().starts_with(&format!("{}/", old.to_lowercase())) {
+            return Err("A folder can't go inside itself".into());
+        }
+        if !new_rel.eq_ignore_ascii_case(old) && ws.vault.path(&new_rel).exists() {
+            return Err("Something with that name is already there".into());
+        }
+        self.move_path(old, &new_rel, true)
+    }
+
+    /// Moves the note or folder `from` to `to` and fixes the links that no
+    /// longer lead where they did: in notes linking to anything moved, and
+    /// in the moved notes themselves (their relative links). Runs on this
+    /// thread: the open note is saved first, then the file or folder is
+    /// moved, then each note whose links changed is rewritten and saved
+    /// (each write is atomic). Everything held under the old paths (the
+    /// store, the indexes, views, open folders, the crew folder setting)
+    /// follows.
+    fn move_path(&mut self, from: &str, to: &str, folder: bool) -> Result<Task<Message>, String> {
         self.save_blocking();
         let Some(ws) = &mut self.workspace else {
             return Ok(Task::none());
@@ -2525,88 +2619,149 @@ impl App {
         if !ws.indexed {
             return Err("Still reading the vault's links; try again in a moment".into());
         }
-        if ws.vault.note(&new_rel).is_some() && !new_rel.eq_ignore_ascii_case(old) {
-            return Err("A note with that name is already there".into());
-        }
-        let sources = ws.links.linking_notes(old, &ws.vault);
-        let from = ws.vault.path(old);
-        let to = ws.vault.path(&new_rel);
-        if let Some(parent) = to.parent() {
+        // What moves, and every note that may link to it.
+        let notes: Vec<Box<str>> = if folder {
+            ws.vault.notes_in(from).map(|e| e.rel.clone()).collect()
+        } else {
+            vec![from.into()]
+        };
+        let files: Vec<Box<str>> = if folder { ws.vault.files_in(from).map(Into::into).collect() } else { Vec::new() };
+        let names: std::collections::HashSet<String> = notes.iter().chain(&files).map(|r| links::link_name(r)).collect();
+        let mut sources = ws.links.linking_names(&names);
+        sources.extend(notes.iter().filter(|r| ws.links.has_links(r)).cloned());
+        sources.sort();
+        sources.dedup();
+
+        let source_path = ws.vault.path(from);
+        let target = ws.vault.path(to);
+        if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Couldn't make the folder: {e}"))?;
         }
-        std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename it: {e}"))?;
+        std::fs::rename(&source_path, &target).map_err(|e| format!("Couldn't rename it: {e}"))?;
+        let after = Vault::scan(&ws.vault.root).map_err(|e| format!("Renamed, but couldn't re-read the folder: {e}"))?;
+        let before = std::mem::replace(&mut ws.vault, Arc::new(after));
 
-        // The store and the open note follow the file.
-        let was_open = ws.note.as_ref().is_some_and(|n| &*n.rel == old);
-        ws.store.forget(old);
-        if was_open && let Some(note) = &mut ws.note {
-            note.rel = new_rel.clone().into();
-            let _ = ws.store.pin(&new_rel);
+        // Everything held under the old paths follows.
+        for old in &notes {
+            let Some(new) = vault::moved(old, from, to) else { continue };
+            ws.store.rename(old, &new);
+            ws.links.rename(old, &new);
+            if let Some(search) = &mut ws.search {
+                search.rename(old, &new);
+            }
+            ws.views.rename(old, &new);
         }
-        ws.links.remove(old);
-        ws.views.rename(old, &new_rel);
+        for pinned in &mut ws.runs.pinned {
+            if let Some(new) = vault::moved(pinned, from, to) {
+                *pinned = new;
+            }
+        }
+        for file in &files {
+            self.pictures.forget(file);
+        }
+        if let Some(note) = &mut ws.note
+            && let Some(new) = vault::moved(&note.rel, from, to)
+        {
+            note.rel = new.into();
+        }
+        ws.tree.rename(from, to);
+        let crew_to = vault::moved(&ws.crew_folder, from, to).filter(|_| folder);
 
-        let mut notes = 0;
+        let mut notes_changed = 0;
         let mut count = 0;
         let mut failed = Vec::new();
         for source in &sources {
-            // The renamed note may link to itself.
-            let now: &str = if &**source == old { &new_rel } else { source };
-            let Ok(text) = ws.store.get(now).map(str::to_owned) else {
-                failed.push(now.to_owned());
+            let now = vault::moved(source, from, to).unwrap_or_else(|| source.to_string());
+            let Ok(text) = ws.store.get(&now).map(str::to_owned) else {
+                failed.push(now);
                 continue;
             };
-            let Some((new_text, n)) = links::rewrite_links(&text, source, &ws.vault, old, &new_rel) else {
+            let Some((new_text, n)) = links::rewrite_moved(&text, source, &now, &before, &ws.vault, from, to) else {
                 continue;
             };
-            ws.store.set(now, new_text.clone());
-            if let Some(job) = ws.store.take_save(now) {
+            ws.store.set(&now, new_text.clone());
+            if let Some(job) = ws.store.take_save(&now) {
                 let result = job.run();
                 ws.store.finish_save(&result);
                 if result.error().is_some() {
-                    failed.push(now.to_owned());
+                    failed.push(now);
                     continue;
                 }
             }
-            ws.links.update(now, &new_text);
-            if let Some(search) = &mut ws.search { search.update(now, &new_text); }
+            ws.links.update(&now, &new_text);
+            if let Some(search) = &mut ws.search {
+                search.update(&now, &new_text);
+            }
             if let Some(note) = &mut ws.note
-                && &*note.rel == now
+                && *note.rel == *now
             {
                 note.replace_text(&new_text);
             }
-            notes += 1;
+            notes_changed += 1;
             count += n;
         }
-        if ws.links.outline(&new_rel).is_none()
-            && let Ok(text) = ws.store.get(&new_rel).map(str::to_owned)
-        {
-            ws.links.update(&new_rel, &text);
-            if let Some(search) = &mut ws.search { search.update(&new_rel, &text); }
-        }
+        ws.tree.refresh(&ws.vault);
+        ws.tree.reveal(&ws.vault, to);
 
-        match Vault::scan(&ws.vault.root) {
-            Ok(vault) => {
-                ws.vault = vault;
-                ws.tree.refresh(&ws.vault);
-                ws.tree.reveal(&ws.vault, &new_rel);
-            }
-            Err(error) => self.status = Some(format!("Couldn't re-read the folder: {error}")),
-        }
-        let name = new_rel.trim_end_matches(".md");
+        let name = if folder { to } else { to.trim_end_matches(".md") };
+        let moved = if folder {
+            let n = notes.len();
+            format!(" ({n} note{})", if n == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
         self.status = Some(if !failed.is_empty() {
             format!("⚠ Renamed to {name}, but couldn't update links in: {}", failed.join(", "))
         } else if count == 0 {
-            format!("Renamed to {name}")
+            format!("Renamed to {name}{moved}")
         } else {
             format!(
-                "Renamed to {name} · updated {count} link{} in {notes} note{}",
+                "Renamed to {name}{moved} · updated {count} link{} in {notes_changed} note{}",
                 if count == 1 { "" } else { "s" },
-                if notes == 1 { "" } else { "s" }
+                if notes_changed == 1 { "" } else { "s" }
             )
         });
+
+        // The crew folder moved: so does the setting.
+        let mut tasks = Vec::new();
+        if let Some(crew_to) = crew_to {
+            tasks.push(self.move_crew_folder(&crew_to));
+        }
+        let Some(ws) = &mut self.workspace else {
+            return Ok(Task::batch(tasks));
+        };
+        ws.load_crew();
+        self.rebuild_index();
         self.refresh_links();
-        Ok(Task::none())
+        self.rebuild_graph();
+        Ok(Task::batch(tasks))
+    }
+
+    /// Points `crew:` in `_settings.md` at `folder` (after the crew folder
+    /// was renamed), creating `_settings.md` if there isn't one.
+    fn move_crew_folder(&mut self, folder: &str) -> Task<Message> {
+        let Some(ws) = &mut self.workspace else {
+            return Task::none();
+        };
+        ws.crew_folder = folder.to_owned();
+        if ws.vault.note(SETTINGS_NOTE).is_some() {
+            let Some(text) = self.current_text(SETTINGS_NOTE) else {
+                self.status = Some("⚠ Couldn't read _settings.md to point it at the renamed crew folder".into());
+                return Task::none();
+            };
+            let new = crew::set_frontmatter(&text, crew::SETTING, folder);
+            let save = self.put_text(SETTINGS_NOTE, &new);
+            return Task::batch([save, self.note_changed(SETTINGS_NOTE)]);
+        }
+        let path = ws.vault.path(SETTINGS_NOTE);
+        let text = crew::set_frontmatter("", crew::SETTING, folder);
+        if let Err(error) = obsession_core::write::atomic_write(&path, text.as_bytes()) {
+            self.status = Some(format!("⚠ Couldn't create _settings.md for the renamed crew folder: {error}"));
+            return Task::none();
+        }
+        let _ = ws.store.get(SETTINGS_NOTE);
+        let root = ws.vault.root.clone();
+        Task::perform(async move { Vault::scan(&root).map_err(|e| e.to_string()) }, Message::VaultRefreshed)
     }
 
     /// Hands unsaved edits to the store and starts a background write if the
@@ -3906,7 +4061,9 @@ impl App {
                     middle = middle.push(rule::vertical(1)).push(ws.runs.view().map(Message::Runs));
                 } else if self.show_backlinks && ws.note.is_some() && !(self.editor.is_some() && self.show_graph) {
                     middle = middle.push(rule::vertical(1)).push(
-                        backlinks::view(&ws.backlinks, ws.indexed).map(Message::Backlinks),
+                        ws.backlinks
+                            .view(ws.indexed, ws.search_building && ws.backlinks.want_unlinked)
+                            .map(Message::Backlinks),
                     );
                 }
                 column![self.view_toolbar(ws), middle, self.view_status(ws)].into()

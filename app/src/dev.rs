@@ -5,6 +5,8 @@
 //! - `OBSESSION_DEV_OPEN=anim/sh040.md`  open a note
 //! - `OBSESSION_DEV_MODE=live|source|split|reading`
 //! - `OBSESSION_DEV_FIND=query`  open the quick switcher with a query
+//! - `OBSESSION_DEV_VSEARCH=ms;query`  open vault search after `ms`, type `query`
+//!   after another `ms`, close it after a third (to watch memory)
 //! - `OBSESSION_DEV_NEW=name`  open the new-note box and type `name` after the folder
 //! - `OBSESSION_DEV_NEW_SUBMIT=1`  then press Enter in it
 //! - `OBSESSION_DEV_CLICK=x,y`  left-click the editor text area at this point
@@ -80,6 +82,14 @@ pub fn after_scan(app: &mut App) -> Task<Message> {
     if let Some(query) = var("OBSESSION_DEV_FIND") {
         tasks.push(app.shortcut(crate::Shortcut::QuickSwitch));
         tasks.push(app.switcher_message(crate::switcher::Message::Query(query)));
+    }
+    if let Some(spec) = var("OBSESSION_DEV_VSEARCH")
+        && let Some((ms, query)) = spec.split_once(';')
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tasks.push(later(ms, Message::Shortcut(crate::Shortcut::FindInVault)));
+        tasks.push(later(2 * ms, Message::Find(crate::find::Message::Query(query.to_owned()))));
+        tasks.push(later(3 * ms, Message::Find(crate::find::Message::Close)));
     }
     if let Some(name) = var("OBSESSION_DEV_NEW") {
         tasks.push(app.shortcut(crate::Shortcut::NewNote));

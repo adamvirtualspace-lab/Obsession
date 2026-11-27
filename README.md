@@ -27,7 +27,7 @@ The app remembers the last vault in `%APPDATA%\Obsession\last_vault.txt`.
 | Ctrl+E | Cycle Live / Source / Split / Reading |
 | Ctrl+S | Save now (autosave runs 1 s after you stop typing) |
 | Ctrl+Z / Ctrl+Y | Undo / redo (Ctrl+Shift+Z also redoes) |
-| F2 | Rename or move the open note (links to it are updated); right-click a note in the tree does the same |
+| F2 | Rename or move the open note (links to it are updated); right-click a note in the tree does the same, and right-click a folder renames or moves the folder |
 
 **Views:** **Live** (the default) shows the note formatted and turns the line
 you click into raw markdown, like Obsidian's Live Preview. Arrow keys move
@@ -142,9 +142,12 @@ when the note doesn't exist yet (clicking creates it, at the vault root or the
 path the link names), and amber when it's ambiguous (several notes share the
 name; the click opens the one Obsidian would and says so) or its `#heading` or
 `^block` isn't there. The **Backlinks** panel on the right lists every line
-that links to the open note; click one to go there. Renaming a note rewrites
-every `[[link]]` and markdown link to it, keeping headings, aliases and `!`
-embeds, using the shortest form that stays unique. Links to pictures and other
+that links to the open note, drawn formatted; click one to go there. Under
+them, **Find unlinked mentions** lists lines that name the note without
+linking to it. Renaming a note or a folder rewrites every `[[link]]` and
+markdown link that no longer leads where it did, keeping headings, aliases
+and `!` embeds, using the shortest form that stays unique; relative links
+inside moved notes stay relative. Links to pictures and other
 files (`![[shot.png]]`, `[[ref.pdf]]`) are found the same way, from any folder;
 clicking one opens it in the app Windows uses for that file, and one that isn't
 in the vault shows dim.

@@ -129,6 +129,29 @@ impl Vault {
         self.names.get(&name.to_lowercase()).map_or(0, Vec::len)
     }
 
+    /// How many attachments have this file name (with its extension).
+    pub fn count_files_named(&self, name: &str) -> usize {
+        self.file_names.get(&name.to_lowercase()).map_or(0, Vec::len)
+    }
+
+    /// The folder at exactly this path (any case), as the tree has it.
+    pub fn folder(&self, rel: &str) -> Option<&Entry> {
+        let rel = rel.trim_matches('/');
+        self.entries
+            .iter()
+            .find(|e| e.kind == Kind::Folder && e.rel.eq_ignore_ascii_case(rel))
+    }
+
+    /// The notes inside folder `rel`, at any depth.
+    pub fn notes_in<'a>(&'a self, rel: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.notes().filter(move |e| moved(&e.rel, rel, rel).is_some())
+    }
+
+    /// The attachments inside folder `rel`, at any depth.
+    pub fn files_in<'a>(&'a self, rel: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.files.iter().map(|f| &**f).filter(move |f| moved(f, rel, rel).is_some())
+    }
+
     pub fn notes(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.kind == Kind::Note)
     }
@@ -296,6 +319,34 @@ pub fn note_rel_from_input(input: &str) -> Result<String, &'static str> {
     if input.trim().is_empty() || input.ends_with('/') {
         return Err("Type a name for the note");
     }
+    Ok(format!("{}.md", checked_path(input)?))
+}
+
+/// Turns what someone typed in the rename box for a folder into its path
+/// from the vault root (`shots/anim/` → `shots/anim`), with the same rules
+/// for names as notes.
+pub fn folder_rel_from_input(input: &str) -> Result<String, &'static str> {
+    let input = input.trim().replace('\\', "/");
+    let input = input.trim_matches('/');
+    if input.trim().is_empty() {
+        return Err("Type a name for the folder");
+    }
+    checked_path(input)
+}
+
+/// Where `rel` (a note, attachment or folder path) is after `from` moves to
+/// `to`: `from` itself, or anything inside it when it's a folder. `None`
+/// when the move doesn't touch it.
+pub fn moved(rel: &str, from: &str, to: &str) -> Option<String> {
+    if rel == from {
+        return Some(to.to_owned());
+    }
+    let rest = rel.strip_prefix(from)?.strip_prefix('/')?;
+    Some(format!("{to}/{rest}"))
+}
+
+/// `input`'s `/` parts trimmed and checked (see `note_rel_from_input`).
+fn checked_path(input: &str) -> Result<String, &'static str> {
     let mut parts = Vec::new();
     for part in input.split('/') {
         let part = part.trim();
@@ -323,7 +374,7 @@ pub fn note_rel_from_input(input: &str) -> Result<String, &'static str> {
         }
         parts.push(part);
     }
-    Ok(format!("{}.md", parts.join("/")))
+    Ok(parts.join("/"))
 }
 
 /// Creates an empty note (and any missing folders). Never overwrites: if
@@ -462,6 +513,25 @@ pub(crate) mod tests {
         assert_eq!(rel(v.resolve_from("x", Some("z/note.md"))), Some("a/x.md"));
         // A partial path narrows it down.
         assert_eq!(rel(v.resolve_from("c/x", None)), Some("b/c/x.md"));
+    }
+
+    #[test]
+    fn folder_names_and_moves() {
+        assert_eq!(folder_rel_from_input(" shots/anim/ ").as_deref(), Ok("shots/anim"));
+        assert_eq!(folder_rel_from_input("a\\b").as_deref(), Ok("a/b"));
+        assert!(folder_rel_from_input("/").is_err());
+        assert!(folder_rel_from_input("a/.hidden").is_err());
+        assert!(folder_rel_from_input("a:b").is_err());
+        assert_eq!(moved("anim/sh040.md", "anim", "work/anim").as_deref(), Some("work/anim/sh040.md"));
+        assert_eq!(moved("anim", "anim", "work/anim").as_deref(), Some("work/anim"));
+        assert_eq!(moved("animation/x.md", "anim", "work"), None);
+        assert_eq!(moved("a.md", "a.md", "b.md").as_deref(), Some("b.md"));
+        let v = vault(&["anim/a.md", "anim/deep/b.md", "animation/c.md", "d.md"])
+            .with_files(vec!["anim/p.png".into(), "q.png".into()]);
+        let inside: Vec<&str> = v.notes_in("anim").map(|e| &*e.rel).collect();
+        assert_eq!(inside, ["anim/a.md", "anim/deep/b.md"]);
+        assert_eq!(v.files_in("anim").collect::<Vec<_>>(), ["anim/p.png"]);
+        assert_eq!(v.count_files_named("P.PNG"), 1);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::theme;
 pub enum Message {
     Toggle(u32),
     Open(u32),
-    /// Right-click on a note: rename it.
+    /// Right-click on a note or folder: rename it.
     Rename(u32),
     Scrolled(Viewport),
 }
@@ -65,6 +65,22 @@ impl Tree {
             self.expanded.insert(entry.rel.clone());
         }
         self.refresh(vault);
+    }
+
+    /// A folder or note moved from `from` to `to`: open folders stay open.
+    pub fn rename(&mut self, from: &str, to: &str) {
+        let moved: Vec<Box<str>> = self
+            .expanded
+            .iter()
+            .filter(|rel| obsession_core::vault::moved(rel, from, to).is_some())
+            .cloned()
+            .collect();
+        for rel in moved {
+            self.expanded.remove(&rel);
+            if let Some(new) = obsession_core::vault::moved(&rel, from, to) {
+                self.expanded.insert(new.into());
+            }
+        }
     }
 
     /// Opens every folder above `rel`, so the note shows in the tree.
@@ -120,13 +136,8 @@ impl Tree {
                 .height(theme::row_height())
                 .width(Fill)
                 .style(theme::row(selected));
-            match entry.kind {
-                // Right-click a note to rename it.
-                Kind::Note => iced::widget::mouse_area(row)
-                    .on_right_press(Message::Rename(index))
-                    .into(),
-                Kind::Folder => row.into(),
-            }
+            // Right-click a note or folder to rename it.
+            iced::widget::mouse_area(row).on_right_press(Message::Rename(index)).into()
         });
 
         let above = first as f32 * theme::row_height();

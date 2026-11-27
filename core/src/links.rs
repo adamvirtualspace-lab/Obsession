@@ -134,6 +134,66 @@ pub fn links(text: &str) -> Vec<Link> {
     out
 }
 
+/// The lines of `text` where `name` (lowercased: a note's name) is written
+/// as whole words outside links, code, comments and frontmatter, with
+/// where it is in each. `lower` is `text` with ASCII lowercased (the same
+/// bytes). An `@name`, a `#tag` or a web address doesn't count.
+pub fn unlinked_mentions(text: &str, lower: &str, name: &str) -> Vec<(usize, Vec<Range<usize>>)> {
+    let mut out = Vec::new();
+    if name.trim().is_empty() {
+        return out;
+    }
+    let mut state = LineState::Start;
+    let mut start = 0;
+    for (index, raw) in text.split('\n').enumerate() {
+        let line_lower = &lower[start..start + raw.len()];
+        start += raw.len() + 1;
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let line_lower = &line_lower[..line.len()];
+        let (spans, next) = scan_line(state, line);
+        let skip_line = matches!(state, LineState::Frontmatter | LineState::Fence { .. })
+            || (state == LineState::Start && next == LineState::Frontmatter)
+            || matches!(next, LineState::Fence { .. }) && !matches!(state, LineState::Fence { .. });
+        state = next;
+        if skip_line || !line_lower.contains(name) {
+            continue;
+        }
+        let mut skip: Vec<Range<usize>> = spans
+            .into_iter()
+            .filter(|(_, kind)| matches!(kind, Kind::Code | Kind::Comment))
+            .map(|(range, _)| range)
+            .collect();
+        let mut found = Vec::new();
+        line_links(index, line, &skip, &mut found);
+        skip.extend(found.into_iter().map(|l| l.range));
+        let mut ranges = Vec::new();
+        let mut at = 0;
+        while let Some(i) = line_lower[at..].find(name) {
+            let (s, e) = (at + i, at + i + name.len());
+            at = s + name.len().max(1);
+            let before = line[..s].chars().next_back();
+            let after = line[e..].chars().next();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if word(before) || word(after) || matches!(before, Some('#' | '@' | '/' | '\\')) {
+                continue;
+            }
+            if skip.iter().any(|r| r.start < e && s < r.end) {
+                continue;
+            }
+            // Inside a web address.
+            let word_start = line[..s].rfind(char::is_whitespace).map_or(0, |w| w + 1);
+            if line[word_start..s].contains("://") {
+                continue;
+            }
+            ranges.push(s..e);
+        }
+        if !ranges.is_empty() {
+            out.push((index, ranges));
+        }
+    }
+    out
+}
+
 fn line_links(index: usize, line: &str, skip: &[Range<usize>], out: &mut Vec<Link>) {
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -810,50 +870,141 @@ impl LinkIndex {
         notes.dedup();
         notes
     }
+
+    /// The notes with a link whose target has one of these names (lowercased,
+    /// no folder, no `.md`; an attachment's keeps its extension): every note
+    /// that might link to them, to check with `vault`.
+    pub fn linking_names(&self, names: &std::collections::HashSet<String>) -> Vec<Box<str>> {
+        let mut notes: Vec<Box<str>> = names.iter().filter_map(|n| self.by_name.get(n)).flatten().cloned().collect();
+        notes.sort();
+        notes.dedup();
+        notes
+    }
+
+    /// Whether `rel` has any links at all.
+    pub fn has_links(&self, rel: &str) -> bool {
+        self.notes.get(rel).is_some_and(|n| !n.links.is_empty())
+    }
+
+    /// A note moved from `old` to `new` with its text unchanged: what's
+    /// indexed for it (and its stamp: a move keeps the modified time) moves
+    /// too.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if let Some(indexed) = self.notes.get(old).cloned() {
+            self.remove(old);
+            self.insert(new, indexed);
+        }
+    }
 }
 
-/// Rewrites every link in `text` (the note at `source`) that leads to
-/// `old_rel` so it leads to `new_rel` instead, keeping `#sections`, aliases,
-/// labels and `!` embeds. Wiki links get the shortest form that's still
-/// unique (the name alone unless another note shares it), as Obsidian does;
-/// markdown links get the same, with `.md` and spaces as `%20`.
+/// The name a link target would be indexed by (see `LinkIndex::linking_names`).
+pub fn link_name(rel: &str) -> String {
+    name_key(rel)
+}
+
+/// What a link `target` leads to from the note `from`: a note's or an
+/// attachment's path from the vault root.
+fn leads_to<'a>(vault: &'a Vault, target: &str, from: Option<&str>) -> Option<&'a str> {
+    match vault.resolve_from(target, from) {
+        Resolved::One(e) | Resolved::Ambiguous { picked: e, .. } => Some(&e.rel),
+        Resolved::Attachment(rel) => rel,
+        Resolved::NotFound => None,
+    }
+}
+
+/// `to` (a path from the vault root) written relative to the folder `from`
+/// (`""` for the root), e.g. `../refs/a.md`.
+fn relative_path(from: &str, to: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|p| !p.is_empty()).collect();
+    let to: Vec<&str> = to.split('/').collect();
+    let same = from
+        .iter()
+        .zip(&to)
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .count()
+        .min(to.len() - 1);
+    let mut out = "../".repeat(from.len() - same);
+    out.push_str(&to[same..].join("/"));
+    out
+}
+
+/// Fixes the links in `text` after a note or folder moved from `from` to
+/// `to` (paths from the vault root; a folder moves everything in it). The
+/// note itself was at `source` and is now at `now` (the same unless it
+/// moved too). `before` and `after` are the vault before and after.
 ///
-/// `vault` is the vault before the rename. Returns the new text and how many
-/// links changed, or `None` if nothing did.
-pub fn rewrite_links(
+/// A link is left alone when it still leads to the same note or attachment
+/// (where that went). Otherwise it's rewritten, keeping `#sections`,
+/// aliases, labels and `!` embeds: a relative link (`../x`, or a path from
+/// the note's folder) stays relative from where the note is now; others get
+/// the shortest form that's still unique (the name alone unless another
+/// note or attachment shares it, else the path from the vault root), as
+/// Obsidian does. Markdown links keep `.md`, with spaces as `%20`.
+///
+/// Returns the new text and how many links changed, or `None` if none did.
+pub fn rewrite_moved(
     text: &str,
     source: &str,
-    vault: &Vault,
-    old_rel: &str,
-    new_rel: &str,
+    now: &str,
+    before: &Vault,
+    after: &Vault,
+    from: &str,
+    to: &str,
 ) -> Option<(String, usize)> {
-    let new_stem = new_rel.strip_suffix(".md").unwrap_or(new_rel);
-    let new_name = new_stem.rsplit('/').next().unwrap_or(new_stem);
-    // Unique once the old note is gone (it may have had the same name).
-    let others = vault.count_named(new_name)
-        - usize::from(name_key(old_rel) == new_name.to_lowercase() && vault.note(old_rel).is_some());
-    let shortest = if others == 0 { new_name } else { new_stem };
-
+    let new_folder = now.rsplit_once('/').map_or("", |(dir, _)| dir);
     let mut edits: Vec<(usize, Range<usize>, String)> = Vec::new();
     for link in links(text) {
         if link.target.is_empty() {
             continue;
         }
-        let leads_there = vault
-            .resolve_from(&link.target, Some(source))
-            .entry()
-            .is_some_and(|e| *e.rel == *old_rel);
-        if !leads_there {
+        let Some(old) = leads_to(before, &link.target, Some(source)) else {
+            continue;
+        };
+        let want = crate::vault::moved(old, from, to).unwrap_or_else(|| old.to_owned());
+        if leads_to(after, &link.target, Some(now)).is_some_and(|r| r.eq_ignore_ascii_case(&want)) {
             continue;
         }
+        let note = want.len() > 3 && want[want.len() - 3..].eq_ignore_ascii_case(".md");
+        // As written: a note's path without `.md` in a wiki link.
+        let written = |path: &str| -> String {
+            if note && link.wiki { path[..path.len() - 3].to_owned() } else { path.to_owned() }
+        };
+        let target = link.target.replace('\\', "/");
+        // `../x`, or a path that only works from the note's folder.
+        let was_relative = target.starts_with("./")
+            || target.starts_with("../")
+            || (target.contains('/') && leads_to(before, &target, None) != Some(old));
+        let name = want.rsplit('/').next().unwrap_or(&want);
+        let unique = if note { after.count_named(&name[..name.len() - 3]) == 1 } else { after.count_files_named(name) == 1 };
+        let mut candidates = Vec::new();
+        if was_relative {
+            let rel = relative_path(new_folder, &want);
+            if target.starts_with("./") && !rel.starts_with("../") {
+                candidates.push(written(&format!("./{rel}")));
+            }
+            candidates.push(written(&rel));
+            if !rel.starts_with("../") {
+                candidates.push(written(&format!("./{rel}")));
+            }
+        }
+        if unique {
+            candidates.push(written(name));
+        }
+        candidates.push(written(&want));
+        let Some(dest) = candidates
+            .into_iter()
+            .find(|c| leads_to(after, c, Some(now)).is_some_and(|r| r.eq_ignore_ascii_case(&want)))
+        else {
+            continue;
+        };
         let bang = if link.embed { "!" } else { "" };
         let sub = link.sub.as_deref().map(|s| format!("#{s}")).unwrap_or_default();
         let new = if link.wiki {
             let alias = link.label.as_deref().map(|a| format!("|{a}")).unwrap_or_default();
-            format!("{bang}[[{shortest}{sub}{alias}]]")
+            format!("{bang}[[{dest}{sub}{alias}]]")
         } else {
             let label = link.label.as_deref().unwrap_or("");
-            format!("{bang}[{label}]({}.md{})", percent_encode(shortest), percent_encode(&sub))
+            format!("{bang}[{label}]({}{})", percent_encode(&dest), percent_encode(&sub))
         };
         edits.push((link.line, link.range, new));
     }
@@ -1013,14 +1164,74 @@ mod tests {
 
     #[test]
     fn rewrite_on_rename() {
-        let v = vault(&["anim/sh040.md", "notes/sh041.md", "other/sh041.md", "brief.md"]);
+        let before = vault(&["anim/sh040.md", "notes/sh041.md", "other/sh041.md", "brief.md"]);
+        let after = vault(&["anim/Shot 40.md", "notes/sh041.md", "other/sh041.md", "brief.md"]);
         let text = "[[sh040]] [[anim/sh040#Notes|Shot]] ![[sh040]] [s](anim/sh040.md) [[brief]]";
-        let (new, count) = rewrite_links(text, "brief.md", &v, "anim/sh040.md", "anim/Shot 40.md").unwrap();
+        let (new, count) =
+            rewrite_moved(text, "brief.md", "brief.md", &before, &after, "anim/sh040.md", "anim/Shot 40.md").unwrap();
         assert_eq!(count, 4);
         assert_eq!(new, "[[Shot 40]] [[Shot 40#Notes|Shot]] ![[Shot 40]] [s](Shot%2040.md) [[brief]]");
         // A name another note has: keep the path.
-        let (new, _) = rewrite_links("[[sh040]]", "brief.md", &v, "anim/sh040.md", "anim/sh041.md").unwrap();
+        let after = vault(&["anim/sh041.md", "notes/sh041.md", "other/sh041.md", "brief.md"]);
+        let (new, _) =
+            rewrite_moved("[[sh040]]", "brief.md", "brief.md", &before, &after, "anim/sh040.md", "anim/sh041.md").unwrap();
         assert_eq!(new, "[[anim/sh041]]");
-        assert_eq!(rewrite_links("[[brief]]", "x.md", &v, "anim/sh040.md", "a.md"), None);
+        assert_eq!(rewrite_moved("[[brief]]", "x.md", "x.md", &before, &after, "anim/sh040.md", "anim/sh041.md"), None);
+    }
+
+    #[test]
+    fn a_moved_note_keeps_its_relative_links() {
+        let before = vault(&["anim/sh040.md", "refs/a.md", "brief.md"]);
+        let after = vault(&["anim/shots/sh040.md", "refs/a.md", "brief.md"]);
+        let text = "[a](../refs/a.md) [[../brief]] [[a]] [b](./../brief.md#Top) [[sh040#Me]]";
+        let (new, count) =
+            rewrite_moved(text, "anim/sh040.md", "anim/shots/sh040.md", &before, &after, "anim/sh040.md", "anim/shots/sh040.md")
+                .unwrap();
+        assert_eq!(new, "[a](../../refs/a.md) [[../../brief]] [[a]] [b](../../brief.md#Top) [[sh040#Me]]");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn rewrite_after_a_folder_moves() {
+        let notes = ["anim/sh040.md", "anim/shots/sh041.md", "brief.md", "refs/a.md"];
+        let before = vault(&notes).with_files(vec!["anim/board.png".into(), "refs/pic.png".into()]);
+        // Renamed in place: paths through it break; names still work.
+        let after = vault(&["animation/sh040.md", "animation/shots/sh041.md", "brief.md", "refs/a.md"])
+            .with_files(vec!["animation/board.png".into(), "refs/pic.png".into()]);
+        let text = "[[anim/sh040]] [[sh040]] ![](anim/board.png) [x](./anim/sh040.md) ![[board.png|300]] [p](refs/pic.png)";
+        let (new, count) = rewrite_moved(text, "brief.md", "brief.md", &before, &after, "anim", "animation").unwrap();
+        assert_eq!(
+            new,
+            "[[sh040]] [[sh040]] ![](board.png) [x](./animation/sh040.md) ![[board.png|300]] [p](refs/pic.png)"
+        );
+        assert_eq!(count, 3);
+        // Notes inside it: links between them move with them; links out
+        // are fixed from the new depth.
+        let after = vault(&["work/anim/sh040.md", "work/anim/shots/sh041.md", "brief.md", "refs/a.md"])
+            .with_files(vec!["work/anim/board.png".into(), "refs/pic.png".into()]);
+        let text = "[s](shots/sh041.md) [a](../refs/a.md) ![](board.png) [[../brief]]";
+        let (new, count) =
+            rewrite_moved(text, "anim/sh040.md", "work/anim/sh040.md", &before, &after, "anim", "work/anim").unwrap();
+        assert_eq!(new, "[s](shots/sh041.md) [a](../../refs/a.md) ![](board.png) [[../../brief]]");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn finds_unlinked_mentions() {
+        let text = "---\nup: Shot 40\n---\nThe shot 40 lighting\r\n[[Shot 40]] and shot 40.\n`shot 40` #shot 40x\n\
+                    ```\nshot 40\n```\nsee https://x.com/shot 40 %% shot 40 %% (Shot 40)";
+        let lower = text.to_ascii_lowercase();
+        let found = unlinked_mentions(text, &lower, "shot 40");
+        assert_eq!(found, [(3, vec![4..11]), (4, vec![16..23]), (9, vec![41..48])]);
+        assert_eq!(unlinked_mentions(text, &lower, " "), []);
+    }
+
+    #[test]
+    fn relative_paths_between_folders() {
+        assert_eq!(relative_path("", "a/b.md"), "a/b.md");
+        assert_eq!(relative_path("a", "a/b.md"), "b.md");
+        assert_eq!(relative_path("a/c", "a/b.md"), "../b.md");
+        assert_eq!(relative_path("x/y", "a/b.md"), "../../a/b.md");
+        assert_eq!(relative_path("A", "a/b.md"), "b.md");
     }
 }

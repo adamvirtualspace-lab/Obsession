@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::write::atomic_write;
@@ -39,7 +39,7 @@ struct DiskState {
     hash: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Doc {
     text: String,
     hash: u64,
@@ -79,6 +79,27 @@ pub enum Outside {
     Deleted,
     /// The store doesn't hold it, so it can't tell.
     NotLoaded,
+}
+
+/// A note read on another thread ([`load`]), for [`Store::insert`].
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    rel: Box<str>,
+    doc: Doc,
+}
+
+impl Loaded {
+    pub fn rel(&self) -> &str {
+        &self.rel
+    }
+}
+
+/// Reads a note the way the store would, on any thread.
+pub fn load(root: &Path, rel: &str) -> Result<Loaded, Error> {
+    Ok(Loaded {
+        rel: rel.into(),
+        doc: read_doc(&root.join(rel))?,
+    })
 }
 
 /// A write prepared by [`Store::take_save`]. Run it on any thread.
@@ -147,6 +168,27 @@ impl Store {
         self.docs.contains_key(rel)
     }
 
+    /// The notes held now.
+    pub fn loaded(&self) -> impl Iterator<Item = &str> {
+        self.docs.keys().map(|k| &**k)
+    }
+
+    /// Takes a note read elsewhere ([`load`]) as if the store had read it,
+    /// unless it already holds one (what it holds may be newer). Nothing is
+    /// dropped to make room: pin it next. Returns whether it was taken.
+    pub fn insert(&mut self, loaded: Loaded) -> bool {
+        if self.docs.contains_key(&loaded.rel) {
+            return false;
+        }
+        self.clock += 1;
+        self.stats.reads += 1;
+        self.stats.bytes_read += loaded.doc.text.len() as u64;
+        let mut doc = loaded.doc;
+        doc.last_used = self.clock;
+        self.docs.insert(loaded.rel, doc);
+        true
+    }
+
     /// The note's text. Read from disk only the first time.
     pub fn get(&mut self, rel: &str) -> Result<&str, Error> {
         self.clock += 1;
@@ -172,8 +214,15 @@ impl Store {
     }
 
     pub fn unpin(&mut self, rel: &str) {
-        if let Some(doc) = self.docs.get_mut(rel) {
-            doc.pins = doc.pins.saturating_sub(1);
+        self.unpin_all([rel]);
+    }
+
+    /// Releases a pin on each, then makes room once.
+    pub fn unpin_all<'a>(&mut self, rels: impl IntoIterator<Item = &'a str>) {
+        for rel in rels {
+            if let Some(doc) = self.docs.get_mut(rel) {
+                doc.pins = doc.pins.saturating_sub(1);
+            }
         }
         self.evict();
     }
@@ -305,27 +354,20 @@ impl Store {
         self.docs.remove(rel);
     }
 
-    fn read(&mut self, rel: &str) -> Result<Doc, Error> {
-        let path = self.root.join(rel);
-        let bytes = fs::read(&path)?;
-        let meta = fs::metadata(&path)?;
-        self.stats.reads += 1;
-        self.stats.bytes_read += bytes.len() as u64;
+    /// A note moved on disk from `old` to `new` (its file unchanged): what's
+    /// held for it, pins included, moves with it.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if let Some(doc) = self.docs.remove(old) {
+            self.docs.insert(new.into(), doc);
+        }
+    }
 
-        let text = String::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
-        let hash = hash(&text);
-        Ok(Doc {
-            disk: DiskState {
-                modified: meta.modified().ok(),
-                len: text.len() as u64,
-                hash,
-            },
-            text,
-            hash,
-            saving: None,
-            pins: 0,
-            last_used: self.clock,
-        })
+    fn read(&mut self, rel: &str) -> Result<Doc, Error> {
+        let mut doc = read_doc(&self.root.join(rel))?;
+        self.stats.reads += 1;
+        self.stats.bytes_read += doc.text.len() as u64;
+        doc.last_used = self.clock;
+        Ok(doc)
     }
 
     /// Drops unpinned, saved notes, least recently used first, until the
@@ -366,6 +408,25 @@ impl Store {
     fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
     }
+}
+
+fn read_doc(path: &Path) -> Result<Doc, Error> {
+    let bytes = fs::read(path)?;
+    let meta = fs::metadata(path)?;
+    let text = String::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
+    let hash = hash(&text);
+    Ok(Doc {
+        disk: DiskState {
+            modified: meta.modified().ok(),
+            len: text.len() as u64,
+            hash,
+        },
+        text,
+        hash,
+        saving: None,
+        pins: 0,
+        last_used: 0,
+    })
 }
 
 fn hash(text: &str) -> u64 {
@@ -492,6 +553,36 @@ mod tests {
         store.finish_save(&job.run());
 
         assert!(store.is_dirty("a.md"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn takes_notes_read_elsewhere() {
+        let dir = temp_vault("load");
+        fs::write(dir.join("a.md"), "one").unwrap();
+        fs::write(dir.join("b.md"), "bee").unwrap();
+        let mut store = Store::new(&dir);
+        store.get("b.md").unwrap();
+        store.set("b.md", "newer here".into());
+
+        let a = load(&dir, "a.md").unwrap();
+        let b = load(&dir, "b.md").unwrap();
+        assert!(load(&dir, "missing.md").is_err());
+        assert!(store.insert(a));
+        // What the store holds wins.
+        assert!(!store.insert(b));
+        assert_eq!(store.get("b.md").unwrap(), "newer here");
+        // Taken as read: no read now, own writes and outside edits told apart.
+        let reads = store.stats().reads;
+        store.pin("a.md").unwrap();
+        assert_eq!(store.get("a.md").unwrap(), "one");
+        assert_eq!(store.stats().reads, reads);
+        assert_eq!(store.check_outside("a.md"), Outside::Same);
+        assert!(!store.is_dirty("a.md"));
+        let mut loaded: Vec<&str> = store.loaded().collect();
+        loaded.sort();
+        assert_eq!(loaded, ["a.md", "b.md"]);
+        store.unpin_all(["a.md"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

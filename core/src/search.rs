@@ -92,6 +92,13 @@ impl SearchIndex {
         }
     }
 
+    /// A note moved from `old` to `new` with its text unchanged.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        let Some(i) = self.by_rel.remove(old) else { return };
+        self.docs[i].rel = new.into();
+        self.by_rel.insert(new.into(), i);
+    }
+
     /// Lines containing every word of `query` (ignoring case). Notes whose
     /// name contains every word come first; then by path. At most `limit`
     /// hits are returned, but all are counted.
@@ -132,6 +139,66 @@ impl SearchIndex {
             out.notes += usize::from(found);
         }
         out
+    }
+}
+
+impl SearchIndex {
+    /// The note `rel`'s unlinked mentions: lines in other notes that write
+    /// its name (no folder, no `.md`; ASCII case ignored) as whole words
+    /// outside links and code (`links::unlinked_mentions`). By path; at
+    /// most `limit` returned, all counted.
+    pub fn unlinked(&self, rel: &str, limit: usize) -> Results {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let name = name.strip_suffix(".md").unwrap_or(name).to_ascii_lowercase();
+        let mut out = Results::default();
+        if name.trim().is_empty() {
+            return out;
+        }
+        let mut docs: Vec<&Doc> = self.docs.iter().filter(|d| *d.rel != *rel && d.lower.contains(&name)).collect();
+        docs.sort_by(|a, b| a.rel.cmp(&b.rel));
+        for doc in docs {
+            let found = crate::links::unlinked_mentions(&doc.text, &doc.lower, &name);
+            if found.is_empty() {
+                continue;
+            }
+            out.notes += 1;
+            for (line, ranges) in found {
+                out.total += 1;
+                if out.hits.len() < limit {
+                    out.hits.push(hit_at(&doc.rel, line, &doc.text, &ranges));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A hit on `line` of `text`, at `ranges` (bytes in the line).
+fn hit_at(rel: &str, line: usize, text: &str, ranges: &[Range<usize>]) -> Hit {
+    let raw = text.split('\n').nth(line).unwrap_or("");
+    let raw = raw.strip_suffix('\r').unwrap_or(raw);
+    let lead = raw.len() - raw.trim_start().len();
+    let first = ranges.first().map_or(lead, |r| r.start);
+    let mut from = lead.max(first.saturating_sub(40));
+    while !raw.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = raw.trim_end().len().max(from);
+    if to - from > SNIPPET {
+        to = from + SNIPPET;
+        while !raw.is_char_boundary(to) {
+            to -= 1;
+        }
+    }
+    Hit {
+        rel: rel.into(),
+        line,
+        text: raw[from..to].to_owned(),
+        ranges: ranges
+            .iter()
+            .filter(|r| r.start >= from && r.end <= to)
+            .map(|r| r.start - from..r.end - from)
+            .collect(),
     }
 }
 
@@ -178,6 +245,24 @@ fn hit(rel: &str, line: usize, text: &str, lower: &str, words: &[String]) -> Hit
         line,
         text: format!("{prefix}{}{suffix}", &text[from..to]),
         ranges: merged.into_iter().map(|r| r.start + shift..r.end + shift).collect(),
+    }
+}
+
+#[cfg(test)]
+mod unlinked_tests {
+    use super::*;
+
+    #[test]
+    fn lists_unlinked_mentions_of_a_note() {
+        let mut index = SearchIndex::default();
+        index.update("anim/Shot 40.md", "Shot 40 is me");
+        index.update("b.md", "Linked: [[Shot 40]]\nNot linked: shot 40 here");
+        index.update("a.md", "nothing");
+        let r = index.unlinked("anim/Shot 40.md", 10);
+        assert_eq!((r.total, r.notes), (1, 1));
+        let hit = &r.hits[0];
+        assert_eq!((&*hit.rel, hit.line, hit.text.as_str()), ("b.md", 1, "Not linked: shot 40 here"));
+        assert_eq!(hit.ranges, [12..19]);
     }
 }
 

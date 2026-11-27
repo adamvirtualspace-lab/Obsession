@@ -315,12 +315,14 @@ How it works:
 
 Known limits, for later:
 
-- Folders can't be renamed yet, only notes (moving a note into another folder
-  works).
-- Relative markdown links *inside* a moved note aren't adjusted.
+- ~~Folders can't be renamed yet, only notes (moving a note into another folder
+  works).~~ Done in milestone 11, item 2.
+- ~~Relative markdown links *inside* a moved note aren't adjusted.~~ Done in
+  milestone 11, item 2.
 - ~~Attachments open from the vault root only (they aren't scanned yet).~~
   Done in milestone 10, item 1.
-- Backlink snippets show the raw line, and unlinked mentions aren't listed.
+- ~~Backlink snippets show the raw line, and unlinked mentions aren't
+  listed.~~ Done in milestone 11, item 2.
 - ~~Edits made by other apps reach the index when the file watcher arrives
   (milestone 6).~~ Done in milestone 6.
 
@@ -1193,7 +1195,57 @@ The rest of the earlier milestones' "Known limits, for later", in this order:
 
 2. **Links.** Folders can be renamed; relative links inside a moved note are
    adjusted; backlink snippets are drawn formatted; unlinked mentions are
-   listed. Core: `links.rs`, `vault.rs`, with tests; app: `backlinks.rs`.
+   listed.
+
+   ✅ **Done (November 2026).**
+
+   - **Renaming a folder.** Right-click a folder in the file tree: the same
+     box as renaming a note, its path ready to edit (`/` moves it, e.g.
+     `anim` → `work/animation`). It refuses a folder inside itself or a name
+     already taken. The folder moves on disk in one step, with everything in
+     it, then the links are fixed and the vault re-read.
+   - **One way to fix links after any move** (`links::rewrite_moved`, used by
+     note and folder renames alike). Every note that might link to anything
+     moved (by name, from the index) and every moved note with links is
+     checked against the vault before and after the move: a link that still
+     leads to the same note or attachment (where it went) is left alone;
+     one that doesn't is rewritten, keeping `#sections`, aliases, labels and
+     `!` embeds. A relative link (`../x`, or a path from the note's own
+     folder) stays relative from where the note is now; others get the
+     shortest unique form, as Obsidian does. So a note's own
+     `[refs](../refs/a.md)` becomes `../../refs/a.md` when it moves a level
+     down, links between notes that moved together stay as they are, and
+     pictures in a moved folder are found again.
+   - **What follows a move:** the store keeps the moved notes' text and pins
+     (`Store::rename`), the link and search indexes move their entries
+     without re-reading (`LinkIndex::rename`, `SearchIndex::rename`), graph
+     views, open folders in the tree, the runs' pinned files, and the crew
+     folder setting: renaming the crew folder rewrites `crew:` in
+     `_settings.md` (creating it if needed). The watcher's events for the
+     moved files count as the app's own, so nothing shows as "Changed in
+     another app".
+   - **Backlink snippets drawn formatted:** each linking line is drawn as Live
+     Preview would (bold, italics, code, links, tags, `@names`, status
+     symbols), worked out once when the panel refreshes.
+   - **Unlinked mentions:** under the linked ones, lines in other notes that
+     write the note's name as whole words (ASCII case ignored) outside
+     links, code, comments, frontmatter, `#tags`, `@names` and web
+     addresses, the name highlighted; a click opens the line. They need
+     every note's text, which only search keeps in memory, so the panel
+     offers "Find unlinked mentions" (building search if it isn't yet), and
+     from then on looks for them on each note opened: 0.8 ms a note on a
+     10,000-note vault (`obsession-bench links`). At most 200 lines shown.
+
+   Checked by hand in a scratch vault: `anim` (3 notes, a picture, a
+   subfolder) renamed to `work/animation` updated 4 links in 2 notes, all
+   leading where they did; renaming the crew folder pointed `crew:` at it
+   and `@names` stayed known; nothing was logged as an outside change; idle
+   stayed at 0.
+
+   Known limits, for later: renaming isn't undoable (as before for notes);
+   unlinked mentions don't refresh while the same note stays open (open it
+   again), have no "link it" button yet, and match names beyond ASCII only
+   in the same case (item 3).
 3. **Scale and search.** The function index and the out-of-date check move
    off the UI thread; search ignores case beyond ASCII (`É` matches `é`);
    find out why memory with search built grows by more than its text.

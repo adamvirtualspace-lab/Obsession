@@ -9,7 +9,7 @@
 //! then applies the result to the store (and the open note) and saves each
 //! changed note once.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ use iced::{Element, Fill};
 
 use obsession_core::log::{self, Kind, Record};
 use obsession_core::runner::Index;
+use obsession_core::store::Loaded;
 
 use crate::theme;
 
@@ -42,8 +43,46 @@ pub struct FsEvent {
     pub structural: bool,
 }
 
+/// A new number for each piece of background work, so a result that
+/// arrives late (another one was asked for since, or another vault opened)
+/// is told apart.
+pub fn ticket() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The function index, built off the UI thread (`App::rebuild_index`).
+#[derive(Debug, Clone)]
+pub struct IndexBuilt {
+    pub ticket: u64,
+    pub index: Index,
+    /// Every note a job touches.
+    pub files: Vec<String>,
+    /// Those the store didn't hold, read for it.
+    pub loaded: Vec<Loaded>,
+    pub took: Duration,
+}
+
+/// What's out of date, worked out off the UI thread
+/// (`App::check_out_of_date`).
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub ticket: u64,
+    pub out_of_date: HashMap<(String, usize), String>,
+    pub took: Duration,
+}
+
 pub struct Runs {
     pub index: Arc<Index>,
+    /// The index being built (its ticket); graphs changed again meanwhile.
+    pub indexing: Option<u64>,
+    pub index_again: bool,
+    /// Notes changed on disk while the index was built: what it read of
+    /// them may be old, so the store reads them itself.
+    pub touched: HashSet<String>,
+    /// The out-of-date check running (its ticket); asked for again meanwhile.
+    pub checking: Option<u64>,
+    pub check_again: bool,
     /// Notes the index reads or writes, kept pinned in the store.
     pub pinned: Vec<String>,
     /// Notes changed since the last run.
@@ -67,6 +106,11 @@ impl Runs {
         let (log, next_id) = log::load(root, SHOWN);
         Self {
             index: Arc::new(Index::default()),
+            indexing: None,
+            index_again: false,
+            touched: HashSet::new(),
+            checking: None,
+            check_again: false,
             pinned: Vec::new(),
             pending: BTreeSet::new(),
             running: false,

@@ -1,6 +1,7 @@
 //! The "new note" box (Ctrl+N): starts with the open note's folder filled
 //! in, so typing a name and pressing Enter creates the note next to it.
-//! The same box renames a note (F2, or right-click in the file tree).
+//! The same box renames a note (F2, or right-click in the file tree) or a
+//! folder (right-click).
 
 use iced::widget::{Id, column, container, opaque, text, text_input};
 use iced::{Element, Fill, Length};
@@ -23,6 +24,8 @@ pub enum Purpose {
     New,
     /// Rename the note at this path.
     Rename(Box<str>),
+    /// Rename the folder at this path.
+    RenameFolder(Box<str>),
 }
 
 #[derive(Debug)]
@@ -56,8 +59,21 @@ impl NewNote {
         }
     }
 
+    /// Starts with the folder's current path to edit.
+    pub fn rename_folder(rel: &str) -> Self {
+        Self {
+            input: rel.to_owned(),
+            error: None,
+            purpose: Purpose::RenameFolder(rel.into()),
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
-        let input = text_input("Note name, or folder/name", &self.input)
+        let placeholder = match self.purpose {
+            Purpose::RenameFolder(_) => "Folder name, or parent/name",
+            _ => "Note name, or folder/name",
+        };
+        let input = text_input(placeholder, &self.input)
             .id(input_id())
             .on_input(Message::Input)
             .on_submit(Message::Submit)
@@ -65,13 +81,14 @@ impl NewNote {
             .size(15)
             .style(theme::search);
 
-        let renaming = matches!(self.purpose, Purpose::Rename(_));
         let hint = match &self.error {
             Some(error) => text(error.as_str()).size(theme::SMALL).color(theme::WARNING),
-            None => text(if renaming {
-                "Enter to rename (links to it are updated) · Esc to cancel · / moves it"
-            } else {
-                "Enter to create · Esc to cancel · / makes folders"
+            None => text(match self.purpose {
+                Purpose::Rename(_) => "Enter to rename (links to it are updated) · Esc to cancel · / moves it",
+                Purpose::RenameFolder(_) => {
+                    "Enter to rename (links into it are updated) · Esc to cancel · / moves it"
+                }
+                Purpose::New => "Enter to create · Esc to cancel · / makes folders",
             })
             .size(theme::SMALL)
             .color(theme::MUTED),
@@ -79,6 +96,7 @@ impl NewNote {
         let title = match &self.purpose {
             Purpose::New => "New note".to_owned(),
             Purpose::Rename(rel) => format!("Rename {rel}"),
+            Purpose::RenameFolder(rel) => format!("Rename the folder {rel}"),
         };
 
         let panel = container(
