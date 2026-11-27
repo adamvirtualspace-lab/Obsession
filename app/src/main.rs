@@ -18,6 +18,7 @@ mod right_click;
 mod runs;
 mod settings;
 mod sidebar;
+mod smooth;
 mod status_menu;
 mod switcher;
 mod theme;
@@ -64,7 +65,7 @@ pub fn main() -> iced::Result {
         .theme(|_: &App| theme::theme())
         .subscription(App::subscription)
         .default_font(theme::UI_FONT)
-        .antialiasing(false)
+        .antialiasing(dev_msaa())
         .window_size(window_size())
         .exit_on_close_request(false)
         .run()
@@ -632,6 +633,7 @@ impl App {
         match message {
             Message::ScaleFactor(scale) => {
                 self.pictures.set_scale(scale);
+                smooth::set_scale(scale);
                 Task::none()
             }
             Message::PictureLoaded(key, generation, result) => {
@@ -4191,6 +4193,11 @@ fn window_size() -> (f32, f32) {
 /// the Vulkan and the DirectX 12 driver, which costs about 100 MB. Pick DX12
 /// alone, on the low-power GPU. Setting `WGPU_BACKEND` or `WGPU_POWER_PREF`
 /// yourself still overrides this.
+/// Dev: `OBSESSION_DEV_MSAA=1` starts with 4× MSAA (to measure it).
+fn dev_msaa() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("OBSESSION_DEV_MSAA").is_some()
+}
+
 fn graphics_defaults() {
     let defaults: &[(&str, &str)] = if cfg!(windows) {
         &[("WGPU_BACKEND", "dx12"), ("WGPU_POWER_PREF", "low")]

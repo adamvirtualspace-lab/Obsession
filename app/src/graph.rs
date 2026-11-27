@@ -8,12 +8,13 @@
 //! selection go in a small overlay drawn every frame. Only what's on screen
 //! is drawn, and zoomed out, cards are drawn as blocks without their tasks.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::Instant;
 
 use iced::keyboard;
 use iced::mouse;
+use iced::advanced::graphics::cache::{Cached, Group};
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, LineDash, Path, Stroke, Text};
 use iced::widget::image::Handle;
 use iced::{Color, Element, Fill, Font, Pixels, Point, Radians, Rectangle, Renderer, Size, Theme, Vector};
@@ -27,6 +28,7 @@ use obsession_core::status::{self, Format};
 use obsession_core::store::Store;
 use obsession_core::vault::{Resolved, Vault};
 
+use crate::smooth::{self, Shapes};
 use crate::theme;
 
 pub const CARD_WIDTH: f32 = 260.0;
@@ -59,6 +61,80 @@ fn pulse_ms() -> f32 {
     }
     PULSE_MS
 }
+/// Dev: `OBSESSION_DEV_PAN=frames` pans the graph by itself, a few pixels a
+/// frame, starting 2 s after it opens, then prints the frame intervals and
+/// how long the cached layer took to build (stderr).
+#[cfg(debug_assertions)]
+mod pan_bench {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    use super::State;
+
+    #[derive(Default)]
+    struct Run {
+        last: Option<Instant>,
+        intervals: Vec<f32>,
+        builds: Vec<f32>,
+        done: bool,
+    }
+
+    thread_local! {
+        static RUN: RefCell<Run> = RefCell::new(Run::default());
+    }
+
+    fn frames() -> Option<usize> {
+        static FRAMES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *FRAMES.get_or_init(|| std::env::var("OBSESSION_DEV_PAN").ok().and_then(|v| v.parse().ok()))
+    }
+
+    pub fn step(state: &mut State) -> Option<iced::widget::canvas::Action<super::Message>> {
+        let frames = frames()?;
+        if state.started?.elapsed() < Duration::from_secs(2) {
+            return Some(iced::widget::canvas::Action::request_redraw_at(Instant::now() + Duration::from_millis(100)));
+        }
+        RUN.with_borrow_mut(|run| {
+            if run.done {
+                return None;
+            }
+            let now = Instant::now();
+            if let Some(last) = run.last {
+                run.intervals.push((now - last).as_secs_f32() * 1000.0);
+            }
+            run.last = Some(now);
+            let n = run.intervals.len();
+            if n >= frames {
+                run.done = true;
+                let stats = |v: &mut Vec<f32>| {
+                    v.sort_by(f32::total_cmp);
+                    let mean = v.iter().sum::<f32>() / v.len().max(1) as f32;
+                    let at = |q: f32| v.get(((v.len() as f32 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+                    format!("mean {mean:.2}, p50 {:.2}, p95 {:.2}, max {:.2}", at(0.5), at(0.95), at(1.0))
+                };
+                eprintln!("TIMING pan frames ({n}): {} ms", stats(&mut run.intervals));
+                eprintln!("TIMING pan builds ({}): {} ms", run.builds.len(), stats(&mut run.builds));
+                return None;
+            }
+            // Back and forth, so the graph stays in view.
+            let dir = if (n / 150) % 2 == 0 { 1.0 } else { -1.0 };
+            state.pan.x += 4.0 * dir;
+            state.pan.y += 1.5 * dir;
+            Some(iced::widget::canvas::Action::request_redraw())
+        })
+    }
+
+    pub fn drawn(took: Duration) {
+        if frames().is_none() || took < Duration::from_micros(50) {
+            return;
+        }
+        RUN.with_borrow_mut(|run| {
+            if run.last.is_some() && !run.done {
+                run.builds.push(took.as_secs_f32() * 1000.0);
+            }
+        });
+    }
+}
+
 /// How long a wire takes to go from dashed to solid.
 const SOLID_MS: f32 = 450.0;
 
@@ -238,7 +314,11 @@ pub struct Graph {
     pub fit: u64,
     /// Where this graph was last looked at: used instead of fitting it.
     pub saved_view: Option<SavedView>,
+    /// The cached layer: the grid and the wires' words, the wires (smooth
+    /// meshes, `wire_mesh`), then the cards.
     cache: Cache,
+    wire_mesh: RefCell<Option<WireMesh>>,
+    cards_cache: Cache,
     /// The hand as the graph canvas last drew it, for `HandLayer`.
     hand_now: Cell<Option<HandNow>>,
     /// Decoded crew portraits, by file (the app keeps them up to date).
@@ -251,10 +331,15 @@ pub struct Graph {
     version: u64,
 }
 
+/// The wires' mesh as last built, kept like a canvas cache.
+type WireMesh = <iced_wgpu::Geometry as Cached>::Cache;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DrawKey {
     pan: Vector,
     zoom: f32,
+    /// The screen's scale factor (the soft edges are a screen pixel wide).
+    scale: f32,
     size: Size,
     version: u64,
     lifted: Option<usize>,
@@ -527,6 +612,8 @@ impl Graph {
             saved_view: None,
             fit: 0,
             cache: Cache::new(),
+            wire_mesh: RefCell::new(None),
+            cards_cache: Cache::new(),
             hand_now: Cell::new(None),
             faces: HashMap::new(),
             card_faces: HashMap::new(),
@@ -1062,6 +1149,10 @@ impl canvas::Program<Message> for Graph {
                 }
             }
             Event::Window(iced::window::Event::RedrawRequested(_)) => {
+                #[cfg(debug_assertions)]
+                if let Some(action) = pan_bench::step(state) {
+                    return Some(action);
+                }
                 // Marching ants on the hovered or selected wire only.
                 let rising = state.rise.is_some_and(|(_, at)| at.elapsed().as_secs_f32() * 1000.0 < RISE_MS);
                 let animated = matches!(state.hover, Some(Hover::Wire(_) | Hover::Button(_)))
@@ -1093,6 +1184,7 @@ impl canvas::Program<Message> for Graph {
         let key = DrawKey {
             pan: state.pan,
             zoom,
+            scale: smooth::scale(),
             size: bounds.size(),
             version: self.version,
             lifted,
@@ -1101,19 +1193,34 @@ impl canvas::Program<Message> for Graph {
         };
         if self.drawn.get() != Some(key) {
             self.cache.clear();
+            self.cards_cache.clear();
             self.drawn.set(Some(key));
         }
         let screen = Rectangle::new(Point::ORIGIN, bounds.size());
 
+        #[cfg(debug_assertions)]
+        let built = std::time::Instant::now();
+        let mut fresh = None;
         let still = self.cache.draw(renderer, bounds.size(), |frame| {
             draw_grid(frame, view);
+            let mut shapes = Shapes::new();
             for (_, wire) in self.visible_wires() {
                 if lifted.is_some_and(|c| wire.from == c || wire.to == c) || progress(wire) < 1.0 {
                     continue;
                 }
                 let (a, b) = self.wire_ends(wire, state);
-                draw_wire(frame, view, a, b, wire, Look::default(), screen);
+                draw_wire(frame, &mut shapes, view, a, b, wire, Look::default(), screen);
             }
+            fresh = Some(shapes);
+        });
+        let wires = {
+            let mut kept = self.wire_mesh.borrow_mut();
+            if let Some(shapes) = fresh {
+                *kept = Some(shapes.into_geometry(bounds.size()).cache(Group::unique(), kept.take()));
+            }
+            kept.as_ref().map_or_else(|| Shapes::new().into_geometry(bounds.size()), iced_wgpu::Geometry::load)
+        };
+        let cards = self.cards_cache.draw(renderer, bounds.size(), |frame| {
             for (i, card) in self.cards.iter().enumerate() {
                 if Some(i) != lifted {
                     draw_card(frame, view, card, card.pos, screen, self.card_face(card));
@@ -1121,7 +1228,11 @@ impl canvas::Program<Message> for Graph {
             }
         });
 
-        // The overlay: what moves or reacts.
+        #[cfg(debug_assertions)]
+        pan_bench::drawn(built.elapsed());
+        // The overlay: what moves or reacts. Its wires go under the card
+        // being dragged.
+        let mut over = Shapes::new();
         let mut frame = Frame::new(renderer, bounds.size());
         let ants = state
             .started
@@ -1138,7 +1249,7 @@ impl canvas::Program<Message> for Graph {
                     button: lit && self.takes_function(wire),
                     pressed: state.hover == Some(Hover::Button(i)),
                 };
-                draw_wire(&mut frame, view, a, b, wire, look, screen);
+                draw_wire(&mut frame, &mut over, view, a, b, wire, look, screen);
             }
         }
         if let Some(i) = lifted {
@@ -1175,26 +1286,14 @@ impl canvas::Program<Message> for Graph {
                 Some(k) => self.cards[from].pin_at(r.position(), true, k),
                 None => handle(r),
             };
-            let segments = [6.0 * zoom, 5.0 * zoom];
-            frame.stroke(
-                &curve(view, a, to),
-                Stroke {
-                    line_dash: LineDash { segments: &segments, offset: 0 },
-                    ..Stroke::default().with_color(theme::ACCENT).with_width(1.5)
-                },
-            );
+            over.dashed(&curve_screen(view, a, to), 1.5, theme::ACCENT, 6.0 * zoom, 5.0 * zoom, 0.0);
         }
         // Wires whose function just ran glow, then fade.
         for (_, wire) in self.visible_wires() {
             if let Some(t) = self.pulse(wire.line) {
                 let (a, b) = self.wire_ends(wire, state);
                 let fade = 1.0 - t;
-                frame.stroke(
-                    &curve(view, a, b),
-                    Stroke::default()
-                        .with_color(Color { a: 0.55 * fade, ..theme::SUCCESS })
-                        .with_width(2.0 + 6.0 * fade),
-                );
+                over.line(&curve_screen(view, a, b), 2.0 + 6.0 * fade, Color { a: 0.55 * fade, ..theme::SUCCESS });
             }
         }
         for (i, card) in self.cards.iter().enumerate() {
@@ -1211,7 +1310,7 @@ impl canvas::Program<Message> for Graph {
             }
         }
         self.draw_crew(&mut frame, state, view, bounds.size());
-        vec![still, frame.into_geometry()]
+        vec![still, wires, cards, over.into_geometry(bounds.size()), frame.into_geometry()]
     }
 
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
@@ -1898,16 +1997,15 @@ fn curve_points(a: Point, b: Point) -> Vec<Point> {
         .collect()
 }
 
-pub fn curve(view: View, a: Point, b: Point) -> Path {
+/// A wire's curve on screen, as points close enough to look smooth.
+pub fn curve_screen(view: View, a: Point, b: Point) -> Vec<Point> {
     let dx = ((b.x - a.x).abs() / 2.0).max(60.0);
-    Path::new(|p| {
-        p.move_to(view.screen(a));
-        p.bezier_curve_to(
-            view.screen(Point::new(a.x + dx, a.y)),
-            view.screen(Point::new(b.x - dx, b.y)),
-            view.screen(b),
-        );
-    })
+    smooth::bezier(
+        view.screen(a),
+        view.screen(Point::new(a.x + dx, a.y)),
+        view.screen(Point::new(b.x - dx, b.y)),
+        view.screen(b),
+    )
 }
 
 fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
@@ -1930,7 +2028,19 @@ struct Look {
     pressed: bool,
 }
 
-fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView, look: Look, screen: Rectangle) {
+/// A wire: its line, end dot, arrowhead and ƒ dot go in `shapes` (smooth),
+/// its words in `frame`.
+#[allow(clippy::too_many_arguments)]
+fn draw_wire(
+    frame: &mut Frame,
+    shapes: &mut Shapes,
+    view: View,
+    a: Point,
+    b: Point,
+    wire: &WireView,
+    look: Look,
+    screen: Rectangle,
+) {
     // Skip wires entirely off screen.
     let (sa, sb) = (view.screen(a), view.screen(b));
     let reach = ((sb.x - sa.x).abs() / 2.0).max(60.0 * view.zoom);
@@ -1956,40 +2066,28 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
     let grown = progress(wire);
     // A wire turning solid closes its gaps.
     let gap = if solid { 5.0 * z * (1.0 - grown) } else { 5.0 * z };
-    let segments = [6.0 * z, gap.max(0.01)];
-    let dash = if solid && grown >= 1.0 && !lit {
-        LineDash::default()
+    let width = if lit {
+        2.2
+    } else if solid {
+        1.8
     } else {
-        LineDash { segments: &segments, offset: look.ants }
+        1.5
     };
-    frame.stroke(
-        &curve(view, a, b),
-        Stroke {
-            line_dash: dash,
-            ..Stroke::default().with_color(color).with_width(if lit {
-                2.2
-            } else if solid {
-                1.8
-            } else {
-                1.5
-            })
-        },
-    );
+    let points = curve_screen(view, a, b);
+    if solid && grown >= 1.0 && !lit {
+        shapes.line(&points, width, color);
+    } else {
+        // The marching ants: `ants` counts down through 11 steps a dash.
+        let (dash, gap) = (6.0 * z, gap.max(0.01));
+        shapes.dashed(&points, width, color, dash, gap, look.ants as f32 / 11.0 * (dash + gap));
+    }
     // A dot where it leaves a task row, so the row reads as its start.
     if wire.from_row.is_some() {
-        frame.fill(&Path::circle(sa, 3.0 * z), color);
+        shapes.circle(sa, 3.0 * z, color);
     }
     // Arrowhead.
     let s = 7.0 * z;
-    frame.fill(
-        &Path::new(|p| {
-            p.move_to(sb);
-            p.line_to(Point::new(sb.x - s, sb.y - s * 0.6));
-            p.line_to(Point::new(sb.x - s, sb.y + s * 0.6));
-            p.close();
-        }),
-        color,
-    );
+    shapes.fill(&[sb, Point::new(sb.x - s, sb.y - s * 0.6), Point::new(sb.x - s, sb.y + s * 0.6)], color);
     let mid = view.screen(curve_points(a, b)[12]);
     let broken = match &wire.state {
         WireState::Broken(why) => Some(why.as_str()),
@@ -2006,9 +2104,8 @@ fn draw_wire(frame: &mut Frame, view: View, a: Point, b: Point, wire: &WireView,
         } else {
             color
         };
-        let circle = Path::circle(mid, 8.0 * k);
-        frame.fill(&circle, if look.pressed { theme::ACCENT } else { theme::RAISED });
-        frame.stroke(&circle, Stroke::default().with_color(ring).with_width(1.2));
+        shapes.circle(mid, 8.0 * k, if look.pressed { theme::ACCENT } else { theme::RAISED });
+        shapes.circle_ring(mid, 8.0 * k, 1.2, ring);
         frame.fill_text(Text {
             content: "ƒ".into(),
             position: Point::new(mid.x, mid.y - 7.0 * k),

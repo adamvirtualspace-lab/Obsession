@@ -8,11 +8,12 @@
 //! against the files it's wired to, which gives the live values shown when
 //! hovering a pin.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use iced::keyboard;
 use iced::mouse;
+use iced::advanced::graphics::cache::{Cached, Group};
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, Path, Stroke, Text};
 use iced::widget::{Space, button, column, container, opaque, row, rule, scrollable, text, text_input};
 use iced::{Color, Element, Fill, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
@@ -24,7 +25,8 @@ use obsession_core::func::types::{Type, Want};
 use obsession_core::func::{Arg, Block, Literal, Origin, PortKind, Value};
 use obsession_core::views::View as SavedView;
 
-use crate::graph::{View, curve, draw_grid, fit, pin_color};
+use crate::graph::{View, curve_screen, draw_grid, fit, pin_color};
+use crate::smooth::{self, Shapes};
 use crate::theme;
 
 const NODE_W: f32 = 220.0;
@@ -131,7 +133,11 @@ pub struct Editor {
     pub fit: u64,
     /// Where this function was last looked at: used instead of fitting it.
     pub saved_view: Option<SavedView>,
+    /// The cached layer: the grid and the inputs node, the wires (smooth
+    /// meshes, `wire_mesh`), then the steps.
     cache: Cache,
+    wire_mesh: RefCell<Option<<iced_wgpu::Geometry as Cached>::Cache>>,
+    steps_cache: Cache,
     drawn: Cell<Option<DrawKey>>,
     version: u64,
     /// Node positions (graph coordinates): the entry node, then each step.
@@ -148,6 +154,8 @@ struct Palette {
 struct DrawKey {
     pan: Vector,
     zoom: f32,
+    /// The screen's scale factor (the wires' soft edges are a screen pixel).
+    scale: f32,
     size: Size,
     version: u64,
     lifted: Option<usize>,
@@ -174,6 +182,8 @@ impl Editor {
             fit: 0,
             saved_view: None,
             cache: Cache::new(),
+            wire_mesh: RefCell::new(None),
+            steps_cache: Cache::new(),
             drawn: Cell::new(None),
             version: 0,
             entry_pos: Point::ORIGIN,
@@ -1130,12 +1140,14 @@ impl canvas::Program<Message> for Editor {
         let key = DrawKey {
             pan: state.pan,
             zoom,
+            scale: smooth::scale(),
             size: bounds.size(),
             version: self.version,
             lifted,
         };
         if self.drawn.get() != Some(key) {
             self.cache.clear();
+            self.steps_cache.clear();
             self.drawn.set(Some(key));
         }
         let Some(block) = &self.block else {
@@ -1156,14 +1168,26 @@ impl canvas::Program<Message> for Editor {
                 })
         };
 
+        let mut fresh = None;
         let still = self.cache.draw(renderer, bounds.size(), |frame| {
             draw_grid(frame, view);
             self.draw_entry(frame, view);
+            let mut shapes = Shapes::new();
             for i in 0..f.steps.len() {
                 if !touches(i) {
-                    self.draw_wires_into(frame, view, state, i);
+                    self.draw_wires_into(&mut shapes, view, state, i);
                 }
             }
+            fresh = Some(shapes);
+        });
+        let wires = {
+            let mut kept = self.wire_mesh.borrow_mut();
+            if let Some(shapes) = fresh {
+                *kept = Some(shapes.into_geometry(bounds.size()).cache(Group::unique(), kept.take()));
+            }
+            kept.as_ref().map_or_else(|| Shapes::new().into_geometry(bounds.size()), iced_wgpu::Geometry::load)
+        };
+        let steps = self.steps_cache.draw(renderer, bounds.size(), |frame| {
             for i in 0..f.steps.len() {
                 if Some(i) != lifted {
                     self.draw_step(frame, view, state, i);
@@ -1171,10 +1195,12 @@ impl canvas::Program<Message> for Editor {
             }
         });
 
+        // The overlay. Its wires go under the step being dragged.
+        let mut over = Shapes::new();
         let mut frame = Frame::new(renderer, bounds.size());
         for i in 0..f.steps.len() {
             if touches(i) {
-                self.draw_wires_into(&mut frame, view, state, i);
+                self.draw_wires_into(&mut over, view, state, i);
             }
         }
         if let Some(i) = lifted {
@@ -1198,7 +1224,7 @@ impl canvas::Program<Message> for Editor {
         }
         if let Interaction::Wiring { from, to, source, .. } = &state.interaction {
             let color = self.source_type(source).map_or(theme::ACCENT, type_color);
-            frame.stroke(&curve(view, *from, *to), Stroke::default().with_color(color).with_width(2.0));
+            over.line(&curve_screen(view, *from, *to), 2.0, color);
         }
         // The hovered pin's live value.
         let tip = match &state.hover {
@@ -1247,7 +1273,7 @@ impl canvas::Program<Message> for Editor {
                 });
             }
         }
-        vec![still, frame.into_geometry()]
+        vec![still, wires, steps, over.into_geometry(bounds.size()), frame.into_geometry()]
     }
 
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
@@ -1336,7 +1362,7 @@ impl Editor {
         }
     }
 
-    fn draw_wires_into(&self, frame: &mut Frame, view: View, state: &State, i: usize) {
+    fn draw_wires_into(&self, shapes: &mut Shapes, view: View, state: &State, i: usize) {
         let Some(bound) = self.checked.bound.get(i) else { return };
         for (k, v) in bound.iter().enumerate() {
             let Some(Value::Ref(source)) = v else { continue };
@@ -1347,10 +1373,7 @@ impl Editor {
                 continue;
             }
             let color = self.source_type(source).map_or(theme::MUTED, type_color);
-            frame.stroke(
-                &curve(view, from, self.in_pin(i, k, state)),
-                Stroke::default().with_color(Color { a: 0.85, ..color }).with_width(1.8),
-            );
+            shapes.line(&curve_screen(view, from, self.in_pin(i, k, state)), 1.8, Color { a: 0.85, ..color });
         }
     }
 

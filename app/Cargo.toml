@@ -9,6 +9,9 @@ obsession-core.workspace = true
 iced = { workspace = true, features = ["wgpu", "thread-pool", "advanced", "canvas", "crisp", "web-colors", "image-without-codecs"] }
 # Pictures in notes: only the common formats.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# Its canvas geometry type, to hand the canvas our own smooth meshes
+# (`smooth.rs`); the same version iced uses.
+iced_wgpu = { version = "0.14.0", default-features = false, features = ["geometry"] }
 rfd.workspace = true
 anyhow.workspace = true
 # The vault watcher, on every system. 9.0 or later: before, its Windows

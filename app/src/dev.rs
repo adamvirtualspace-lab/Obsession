@@ -24,6 +24,10 @@
 //! - `OBSESSION_DEV_SIZE=w,h`  start with this window size (read at startup)
 //! - `OBSESSION_DEV_TIMING=1`  print how long the link index and search took (stderr)
 //! - `OBSESSION_DEV_PULSE_MS=8000`  slow down the run glow to look at it
+//! - `OBSESSION_DEV_PAN=600`  pan the open graph by itself for 600 frames,
+//!   then print frame intervals and cached-layer build times (stderr); with
+//!   `ICED_PRESENT_MODE=immediate` the frames aren't held to the display
+//! - `OBSESSION_DEV_MSAA=1`  start with iced's 4× MSAA (read at startup)
 //! - `OBSESSION_DEV_KEYS=1`  print each key press, whether a widget used it,
 //!   and what the Live and Source editors' key bindings saw (stderr)
 

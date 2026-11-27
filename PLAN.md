@@ -623,11 +623,11 @@ Still not right, for later:
 
 - **Power preference: low power.** Uses the integrated GPU on laptops: less
   memory, less battery, plenty for 2D at 120 Hz.
-- **Anti-aliasing is measured, not assumed.** 4× MSAA smooths wires, but at
-  1440p it needs about 60 MB of extra framebuffer, which is shared RAM on
-  integrated GPUs. Milestone 4 compares MSAA on, off, and drawing wires as
-  slightly feathered geometry. The default is the lightest option that still
-  looks clean, with MSAA as a setting.
+- **Anti-aliasing: smooth wires, no MSAA.** Wires are meshes with a soft
+  edge one screen pixel wide (`app/src/smooth.rs`), the "feathered geometry"
+  option. Measured against iced's 4× MSAA (see "Smooth wires" below): the same
+  frame rate, but MSAA took ~120 MB more GPU memory at 2560 × 1600 and can
+  only be chosen at startup. MSAA stays off.
 - **Present mode follows vsync**, so frames line up with the monitor and the app
   never draws faster than the display shows. On displays faster than 120 Hz,
   redraw requests are spaced so the app stays at 120 fps.
@@ -764,7 +764,9 @@ measurably lowers memory or frame times.
   (100, 1,000 and 10,000 files, a 500-node graph, long files with 5,000 tasks)
   and times indexing, parsing and function runs.
 - **Frame times** come from iced's debug tools and from Tracy with the `profile`
-  feature.
+  feature. Panning a graph: `OBSESSION_DEV_PAN=600` pans the open graph by
+  itself and prints frame intervals and how long the cached layer took to
+  build; `ICED_PRESENT_MODE=immediate` lifts the display's frame cap.
 - **Memory** is read from the Windows working set and peak working set after a
   scripted session: open vault, open graph, pan, zoom, drag, run functions.
 - **CPU and disk** come from the process's CPU time and Windows I/O counters
@@ -1112,6 +1114,32 @@ idle CPU see item 2.
   rescan's refresh. The startup link index already read notes one at a time
   on one background thread and is unchanged.
 
+### Smooth wires (before milestone 11)
+
+✅ **Done (November 2026).**
+
+Wires in the graph and the function editor had stepped edges: the canvas
+draws with MSAA off. Now `smooth::Shapes` builds each wire as a mesh whose
+colour fades to clear across a one-pixel edge (lines, dashes with soft
+ends, the arrowhead, the row dot, the ƒ dot and its ring), and hands it to
+the canvas as its own geometry (`iced_wgpu::Geometry::Live`, cached like a
+canvas `Cache`). The graph's cached layer is now three: grid and the wires'
+words, the wires, then the cards; the overlay's wires (hovered, dragged,
+being drawn, glowing after a run) go under the dragged card. Marching ants
+now move smoothly along the line. The function editor does the same.
+
+Panning a 300-card graph with 565 dashed wires by itself
+(`OBSESSION_DEV_PAN=600`), 2282 × 1500 window at 225 %, Radeon 760M:
+
+| | Frame (display, 40 Hz now) | Frame, no vsync | Cached layer built | GPU memory | Private bytes |
+|---|---|---|---|---|---|
+| Before (aliased) | 25.0 ms | — | 5.6 ms | 104 MB | 122 MB |
+| iced 4× MSAA | 25.0 ms | 10.4 ms (p95 13.0) | 6.4 ms | 222 MB | 242 MB |
+| Smooth meshes | 25.0 ms | 9.9 ms (p95 12.9) | 8.4 ms | 120 MB | 151 MB |
+
+So about 100 frames a second while panning even this graph: the soft edges
+stay on while panning. Idle is unchanged (no app thread runs).
+
 ## Risks
 
 - **iced's editor is not Obsidian's.** Fine for notes and tasks. If it gets in
@@ -1120,8 +1148,8 @@ idle CPU see item 2.
   `shader` widget if measurements say so.
 - **GPU baseline memory on Windows.** Partly outside our control. Measure it in
   milestone 1 and set honest budgets from it.
-- **Anti-aliasing cost.** MSAA can cost more memory than the rest of the app.
-  Measured in milestone 4.
+- **Anti-aliasing cost.** MSAA can cost more memory than the rest of the app
+  (measured: ~120 MB). Wires are smoothed with soft-edged meshes instead.
 - **Several teammates running the app.** Every action is safe to run twice
   (Set Status, Replace Text, Ensure Line, Write Section), so two apps firing the
   same function after a `git pull` produce the same file.
